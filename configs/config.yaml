@@ -1,0 +1,18 @@
+openf1:
+  base_url: "https://api.openf1.org/v1"
+
+  timeout:
+    connect: 5
+    read: 30
+
+  rate_limit:
+    requests_per_second: 3
+    requests_per_minute: 30
+
+  retry:
+    max_attempts: 3
+    backoff_factor: 1
+
+logging:
+  level: "INFO"
+  json_format: true
