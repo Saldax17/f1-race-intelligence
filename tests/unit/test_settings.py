@@ -48,6 +48,53 @@ def test_load_settings_falls_back_to_defaults_when_file_missing(tmp_path: Path) 
     assert settings.openf1.rate_limit.requests_per_minute == 30
 
 
+def test_load_settings_reads_historical_extraction_section(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """
+historical_extraction:
+  years: [2023, 2024]
+  session_types: ["Race", "Sprint"]
+  endpoints: ["laps", "weather"]
+  output_path: "custom/raw"
+  manifest_path: "custom/manifests"
+  overwrite: true
+""",
+        encoding="utf-8",
+    )
+
+    extraction = load_settings(config_file).historical_extraction
+
+    assert extraction.years == [2023, 2024]
+    assert extraction.session_types == ["Race", "Sprint"]
+    assert extraction.endpoints == ["laps", "weather"]
+    assert extraction.output_path == "custom/raw"
+    assert extraction.manifest_path == "custom/manifests"
+    assert extraction.overwrite is True
+
+
+def test_historical_extraction_defaults_to_races_when_section_is_missing(tmp_path: Path) -> None:
+    extraction = load_settings(tmp_path / "does_not_exist.yaml").historical_extraction
+
+    assert extraction.years == []
+    assert extraction.session_types == ["Race"]
+    assert extraction.output_path == "data/raw"
+    assert extraction.overwrite is False
+
+
+def test_historical_extraction_env_overrides(tmp_path: Path, monkeypatch) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("historical_extraction:\n  years: [2023]\n", encoding="utf-8")
+
+    monkeypatch.setenv("F1_EXTRACTION_YEARS", "2024,2025")
+    monkeypatch.setenv("F1_EXTRACTION_OVERWRITE", "true")
+
+    extraction = load_settings(config_file).historical_extraction
+
+    assert extraction.years == [2024, 2025]
+    assert extraction.overwrite is True
+
+
 def test_load_settings_applies_env_overrides(tmp_path: Path, monkeypatch) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text("openf1:\n  base_url: 'https://example.test/v1'\n", encoding="utf-8")

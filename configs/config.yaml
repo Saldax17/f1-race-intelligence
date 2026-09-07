@@ -16,3 +16,69 @@ openf1:
 logging:
   level: "INFO"
   json_format: true
+
+# What the historical extraction pipeline downloads. Change years, session
+# types or endpoints here — never in code.
+historical_extraction:
+  years:
+    - 2023
+    - 2024
+    - 2025
+
+  # Matched case-insensitively against OpenF1's session_name or session_type,
+  # so "Race", "Sprint", "Qualifying" or a coarser "Practice" all work.
+  session_types:
+    - "Race"
+
+  endpoints:
+    - drivers
+    - laps
+    - car_data
+    - position
+    - intervals
+    - stints
+    - pit
+    - weather
+    - race_control
+
+  output_path: "data/raw"
+  manifest_path: "data/manifests"
+
+  # false: raw files already on disk are kept and skipped (idempotent re-runs).
+  # true: everything is fetched again and overwritten.
+  overwrite: false
+
+# How the extracted raw data is judged. What each field may contain lives in
+# validation/specs.py, next to the measurements that justify it.
+validation:
+  raw_path: "data/raw"
+  manifest_path: "data/manifests"
+  report_path: "data/validation"
+
+  # An ERROR finding makes the run FAIL; false downgrades it to WARNING.
+  fail_on_error: true
+
+  # Null ratio above which a nullable field is reported as a WARNING.
+  missing_value_threshold: 0.5
+
+  # null validates every record — the only exhaustive mode, and the default.
+  # A number turns the run into a deterministic quick check and the report
+  # states that its result does not describe the whole dataset.
+  max_records_per_file: null
+
+  # Read the extraction manifest to tell "no data at the source" (HTTP 404)
+  # apart from "the extraction failed and should be re-run".
+  use_manifest: true
+
+  write_csv: false
+
+  enabled_rules:
+    - structure
+    - schema
+    - types
+    - values
+    - missing_values
+    - duplicates
+    - temporal
+    - identifiers
+    - coverage

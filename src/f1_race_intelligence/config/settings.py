@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field
@@ -70,11 +70,85 @@ class LoggingSettings(BaseModel):
     json_format: bool = True
 
 
+class HistoricalExtractionSettings(BaseModel):
+    """What the historical extraction pipeline should download.
+
+    This is *data selection policy*, deliberately kept out of the ingestion
+    layer: ``F1Client`` knows how to call OpenF1, this says what to ask it
+    for. Changing years, session types, endpoints or the output location
+    must never require a code change.
+
+    ``session_types`` is matched (case-insensitively) against OpenF1's
+    ``session_name`` *or* ``session_type`` field, so both ``"Race"`` and
+    coarser values like ``"Practice"`` work. An empty list means "keep
+    every session".
+    """
+
+    years: List[int] = Field(default_factory=list)
+    session_types: List[str] = Field(default_factory=lambda: ["Race"])
+    endpoints: List[str] = Field(default_factory=list)
+    output_path: str = "data/raw"
+    manifest_path: str = "data/manifests"
+    overwrite: bool = False
+
+
+class ValidationSettings(BaseModel):
+    """How the extracted raw data should be judged.
+
+    Only the knobs that change a verdict live here. Everything about *what*
+    a field may contain is described per endpoint in
+    :mod:`f1_race_intelligence.validation.specs`, where it can be justified
+    next to the measurement that produced it.
+    """
+
+    raw_path: str = "data/raw"
+    manifest_path: str = "data/manifests"
+    report_path: str = "data/validation"
+
+    fail_on_error: bool = True
+    """An ERROR finding makes the run FAIL. Turn off to downgrade it to WARNING."""
+
+    missing_value_threshold: float = 0.5
+    """Null ratio above which a nullable field is reported as a WARNING."""
+
+    max_records_per_file: Optional[int] = None
+    """Inspect only the first N records of each file.
+
+    ``None`` — the default — validates everything, and is the only mode
+    whose result describes the dataset as a whole. Setting a value turns
+    the run into a deterministic quick check: the report then says it was
+    sampled, how much was inspected, and that the outcome is not
+    exhaustive.
+    """
+
+    use_manifest: bool = True
+    """Read the extraction manifest to explain why data is missing."""
+
+    write_csv: bool = False
+    """Also write the findings as a flat CSV, for triage in a spreadsheet."""
+
+    enabled_rules: List[str] = Field(
+        default_factory=lambda: [
+            "structure",
+            "schema",
+            "types",
+            "values",
+            "missing_values",
+            "duplicates",
+            "temporal",
+            "identifiers",
+            "coverage",
+        ]
+    )
+
+
 class AppSettings(BaseModel):
     """Top-level application settings."""
 
     openf1: OpenF1Settings = Field(default_factory=OpenF1Settings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    historical_extraction: HistoricalExtractionSettings = Field(default_factory=HistoricalExtractionSettings)
+    validation: ValidationSettings = Field(default_factory=ValidationSettings)
 
 
 # src/f1_race_intelligence/config/settings.py -> parents[3] is the repo root.
@@ -104,6 +178,26 @@ def _apply_env_overrides(raw: dict) -> dict:
     logging_cfg = raw.setdefault("logging", {})
     if log_level := os.getenv("LOG_LEVEL"):
         logging_cfg["level"] = log_level
+
+    extraction = raw.setdefault("historical_extraction", {})
+    if years := os.getenv("F1_EXTRACTION_YEARS"):
+        extraction["years"] = [int(year) for year in years.split(",") if year.strip()]
+
+    if overwrite := os.getenv("F1_EXTRACTION_OVERWRITE"):
+        extraction["overwrite"] = overwrite.strip().lower() in {"1", "true", "yes"}
+
+    if output_path := os.getenv("F1_EXTRACTION_OUTPUT_PATH"):
+        extraction["output_path"] = output_path
+
+    validation = raw.setdefault("validation", {})
+    if raw_path := os.getenv("F1_VALIDATION_RAW_PATH"):
+        validation["raw_path"] = raw_path
+
+    if max_records := os.getenv("F1_VALIDATION_MAX_RECORDS"):
+        validation["max_records_per_file"] = int(max_records)
+
+    if fail_on_error := os.getenv("F1_VALIDATION_FAIL_ON_ERROR"):
+        validation["fail_on_error"] = fail_on_error.strip().lower() in {"1", "true", "yes"}
 
     return raw
 

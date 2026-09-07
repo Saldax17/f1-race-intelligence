@@ -19,6 +19,9 @@ Esta etapa construye únicamente la base de ingeniería de datos del proyecto:
   backoff exponencial, manejo de errores y logging estructurado.
 - Una capa de configuración externa (YAML + variables de entorno).
 - Una abstracción mínima para guardar respuestas raw en disco.
+- Un pipeline de extracción histórica reproducible e idempotente, que
+  descubre meetings y sesiones desde la API y registra cada ejecución en un
+  manifest (ver [Pipeline de extracción histórica](#9-pipeline-de-extracción-histórica)).
 
 No se implementa (todavía) Machine Learning, Deep Learning, feature
 engineering, entrenamiento, MLflow, FastAPI, Docker, Kubernetes, AWS,
@@ -38,6 +41,40 @@ F1Client (ingestion/openf1.py)        -- métodos por endpoint de OpenF1
 RawDataStorage (storage/raw_storage.py)  -- persistencia de respuestas raw
 ```
 
+Sobre esa base, el módulo de pipelines orquesta *qué* se descarga:
+
+```
+config.yaml (historical_extraction)
+        ↓
+HistoricalExtractionPipeline (pipelines/historical_extraction.py)
+        ├── discover_meetings(year)     -- vía F1Client
+        ├── discover_sessions(meeting)  -- vía F1Client
+        ├── filter_sessions()           -- por tipo de sesión configurado
+        ├── extract_endpoint()          -- vía F1Client
+        ├── save / skip                 -- vía RawDataStorage
+        └── ExecutionManifest           -- registro de la ejecución
+```
+
+La frontera es deliberada: `F1Client` responde *cómo* se hace una petición a
+OpenF1; el pipeline responde *qué* datos hacen falta, para qué años y en qué
+orden. El pipeline no reimplementa retries, rate limiting ni manejo de HTTP.
+
+Y sobre los datos ya descargados, la validación juzga sin tocarlos:
+
+```
+data/raw + manifest
+        ↓
+ValidationRunner (validation/runner.py)
+        ├── RawDataCatalog        -- descubrir y leer archivos raw
+        ├── reglas por archivo    -- estructura, tipos, valores, nulos, duplicados, temporal
+        ├── reglas de conjunto    -- identificadores, cobertura
+        └── ValidationReport      -- PASS / WARNING / FAIL
+        ↓
+data/validation/validation_report_<timestamp>.json
+```
+
+`data/raw/` es inmutable: la validación nunca escribe en él.
+
 Ningún otro módulo del proyecto debe hacer `requests.get(...)` /
 `httpx.get(...)` directamente contra OpenF1: todo pasa por `F1Client`. Esto
 mantiene la lógica de negocio (futuros notebooks, feature engineering, etc.)
@@ -55,6 +92,13 @@ completamente desacoplada del transporte HTTP.
 | `ingestion/openf1.py` | `F1Client`: un método por endpoint de OpenF1 | Único lugar que conoce las rutas/parámetros de OpenF1 |
 | `storage/raw_storage.py` | `RawDataStorage.save(...)` a JSON particionado | Punto de extensión para el futuro pipeline de datos |
 | `utils/logging.py` | Formatter JSON + `configure_logging()` | Logs estructurados y parseables sin dependencias externas |
+| `pipelines/historical_extraction.py` | Recorrido año → meeting → session → endpoint | Decide *qué* descargar, sin conocer detalles de HTTP |
+| `pipelines/manifest.py` | `ExecutionManifest`: registro de cada ejecución | Permite responder después "¿qué se descargó exactamente?" |
+| `storage/raw_catalog.py` | Descubrir y leer los archivos de `data/raw` | El formato de rutas y del envelope se describe en un solo paquete |
+| `validation/specs.py` | Qué se espera de cada endpoint, de forma declarativa | Ajustar una regla es editar datos, no lógica |
+| `validation/validators.py` | Las comprobaciones, genéricas sobre las specs | Una sola pasada por archivo, sin importar cuántas reglas haya |
+| `validation/runner.py` | Orquestar la validación y producir el reporte | Streaming: la memoria no depende del tamaño del dataset |
+| `utils/files.py` | Escrituras que no pierden archivos | Ni sobrescritura silenciosa ni archivos a medio escribir |
 
 ### Decisiones respecto a la estructura sugerida
 
@@ -67,6 +111,10 @@ Se mantuvo la estructura propuesta casi intacta, con dos adiciones menores:
 - **`scripts/check_connection.py`**: pequeño script ejecutable para la
   prueba de conexión end-to-end pedida en los entregables (no forma parte
   del paquete instalable).
+- **`pipelines/`**: la orquestación vive en su propio paquete para que
+  `F1Client` no acabe decidiendo qué años o sesiones descargar. Su
+  `__init__.py` no re-exporta nada a propósito: un import ansioso haría que
+  Python cargara dos veces el módulo al ejecutarlo con `python -m`.
 
 ## 3. Estructura del repositorio
 
@@ -84,7 +132,9 @@ f1-race-intelligence/
 ├── data/
 │   ├── raw/
 │   ├── processed/
-│   └── features/
+│   ├── features/
+│   ├── manifests/        # registro JSON de cada ejecución del pipeline
+│   └── validation/       # reporte JSON de cada ejecución de validación
 │
 ├── notebooks/
 │
@@ -107,9 +157,24 @@ f1-race-intelligence/
 │       │   ├── openf1.py          # F1Client
 │       │   └── rate_limiter.py
 │       │
+│       ├── pipelines/
+│       │   ├── __init__.py
+│       │   ├── historical_extraction.py   # HistoricalExtractionPipeline
+│       │   └── manifest.py                # ExecutionManifest
+│       │
 │       ├── storage/
 │       │   ├── __init__.py
-│       │   └── raw_storage.py
+│       │   ├── raw_catalog.py             # lectura del árbol data/raw
+│       │   └── raw_storage.py             # escritura del árbol data/raw
+│       │
+│       ├── validation/
+│       │   ├── __init__.py
+│       │   ├── models.py                  # Severity, ValidationResult, ValidationReport
+│       │   ├── specs.py                   # expectativas por endpoint (medidas, no supuestas)
+│       │   ├── validators.py              # reglas
+│       │   ├── manifest_index.py          # lectura del manifest de M2
+│       │   ├── report.py                  # persistencia del reporte
+│       │   └── runner.py                  # ValidationRunner
 │       │
 │       └── utils/
 │           ├── __init__.py
@@ -285,10 +350,156 @@ except OpenF1Error:
   servidor). Cada reintento vuelve a pasar por el rate limiter — nunca se
   salta su `acquire()`.
 
-## 9. Ejecutar tests
+## 9. Pipeline de extracción histórica
+
+Descarga reproducible de datos históricos, orquestada desde configuración:
 
 ```bash
-# Unit tests (sin red, con mocks vía respx) — se ejecutan por defecto
+python -m f1_race_intelligence.pipelines.historical_extraction
+```
+
+El recorrido es `año → meetings → sessions → (filtro por tipo) → endpoints`,
+y todo lo que descarga se define en `configs/config.yaml`:
+
+```yaml
+historical_extraction:
+  years: [2023, 2024, 2025]
+  session_types: ["Race"]        # también "Sprint", "Qualifying", "Practice"...
+  endpoints: [drivers, laps, car_data, position, intervals, stints, pit, weather, race_control]
+  output_path: "data/raw"
+  manifest_path: "data/manifests"
+  overwrite: false
+```
+
+Overrides por variable de entorno: `F1_EXTRACTION_YEARS` (lista separada por
+comas), `F1_EXTRACTION_OVERWRITE`, `F1_EXTRACTION_OUTPUT_PATH`.
+
+**Filtrado de sesiones.** `session_types` se compara sin distinguir
+mayúsculas contra `session_name` *o* `session_type` de OpenF1, así que tanto
+`"Race"` como `"Sprint Qualifying"` o un `"Practice"` más grueso (que agrupa
+Practice 1/2/3) seleccionan lo esperado. Una lista vacía conserva todas las
+sesiones. Nada en el código está atado a "Race".
+
+**Idempotencia.** Cada archivo raw tiene una ruta determinística
+(`<endpoint>/year=…/meeting_key=…/session_key=…/session_<key>.json`). Con
+`overwrite: false` una segunda ejecución detecta lo ya descargado y lo omite
+*sin* gastar cuota de rate limit; con `overwrite: true` vuelve a descargar
+todo. Los logs registran cada decisión (`raw_file_downloaded`,
+`raw_file_skipped`, `extraction_failed`).
+
+Para que "el archivo existe" signifique de verdad "ese dato ya está
+descargado", `RawDataStorage` escribe primero a un archivo temporal y luego
+lo mueve a su nombre definitivo: una ejecución interrumpida nunca deja un
+archivo truncado que la siguiente daría por bueno.
+
+**Tolerancia a fallos.** Un error en un endpoint no detiene la sesión, uno
+en una sesión no detiene el meeting, y uno en el descubrimiento de un año no
+detiene los demás años. Todo queda registrado en el manifest.
+
+**Manifest.** Cada ejecución escribe `data/manifests/manifest_<timestamp>.json`
+con la configuración usada, meetings y sesiones procesados, una entrada por
+archivo (estado, ruta, número de registros) y la lista de errores:
+
+```json
+{
+  "pipeline_name": "historical_extraction",
+  "pipeline_version": "1.0.0",
+  "duration_seconds": 1.185,
+  "config": { "years": [2023], "session_types": ["Race"], "overwrite": false },
+  "summary": { "downloaded": 4, "skipped": 0, "failed": 0, "meetings": 1, "sessions": 1 },
+  "meetings_processed": [1141],
+  "sessions_processed": [7953],
+  "entries": [
+    { "endpoint": "stints", "status": "downloaded", "year": 2023,
+      "meeting_key": 1141, "session_key": 7953, "record_count": 70,
+      "file_path": "data/raw/stints/year=2023/meeting_key=1141/session_key=7953/session_7953.json" }
+  ],
+  "errors": []
+}
+```
+
+**`car_data` es un caso especial.** `F1Client.get_car_data` rechaza consultas
+sin `driver_number` (una sesión completa son millones de filas), así que el
+pipeline descubre primero los pilotos de la sesión y guarda un archivo por
+piloto (`driver_<n>.json`). Si el archivo raw de `drivers` ya existe, lo lee
+de disco en vez de volver a consultar la API.
+
+## 10. Validación de datos
+
+Comprueba la calidad de lo que M2 descargó. **Nunca modifica `data/raw/`**:
+lee, juzga y escribe un reporte. La limpieza pertenece a etapas posteriores.
+
+```bash
+python -m f1_race_intelligence.validation.runner
+```
+
+El recorrido es: descubrir archivos → analizar cada uno en **una sola pasada**
+→ acumular agregados → reglas entre archivos → reporte en
+`data/validation/validation_report_<timestamp>.json`.
+
+### Reglas
+
+| regla | qué comprueba |
+|---|---|
+| `structure` | JSON válido, payload en forma de lista, archivos vacíos |
+| `schema` | campos obligatorios presentes; campos nuevos no descritos |
+| `types` | tipos reales por campo (un `bool` no pasa como `int`) |
+| `values` | rangos imposibles / implausibles / meramente inesperados |
+| `missing_values` | conteo y proporción de nulos (no elimina nada) |
+| `duplicates` | unicidad sobre la clave natural del endpoint |
+| `temporal` | timestamps parseables y orden esperado |
+| `identifiers` | referencias entre meetings, sessions, drivers y laps |
+| `coverage` | qué falta y **por qué** falta |
+
+### Severidades
+
+Las tres se reparten según lo que los datos permiten afirmar:
+
+- **ERROR** — imposible: velocidad negativa, duplicado sobre una clave
+  natural verificada, JSON inválido. Hace que la ejecución sea `FAIL`.
+- **WARNING** — implausible o incompleto de forma accionable.
+- **INFO** — inesperado pero legítimo; se registra para que sea visible.
+
+Los rangos no son inventados: salen de medir respuestas reales de OpenF1 y
+están justificados junto a cada campo en
+[validation/specs.py](src/f1_race_intelligence/validation/specs.py). Tres
+ejemplos de por qué eso importa:
+
+- `car_data.throttle` y `brake` alcanzan **104** aunque estén documentados
+  como 0–100 → INFO, no error.
+- `car_data.drs` es un **código de estado** (`{0,1,2,3,8,10,12,14}`), no un
+  booleano.
+- `intervals.gap_to_leader` es `float`, `None` **o** texto (`"+1 LAP"`) para
+  los coches doblados: el 10% de los registros de una carrera. Una regla
+  "debe ser numérico" marcaría miles de registros correctos.
+
+### Por qué falta un dato
+
+OpenF1 responde **HTTP 404 con `{"detail": "No results found."}`** cuando un
+endpoint simplemente no tiene datos. M3 lee el manifest de M2 y usa el
+`status_code` para distinguir:
+
+| situación | severidad |
+|---|---|
+| 404 — la fuente no tiene ese dato (p. ej. `pit` en todo 2023) | INFO: `"pit data unavailable for 2023 in source"` |
+| 5xx, 429 o timeout — la extracción falló | WARNING: reejecutar puede recuperarlo |
+| nunca se intentó | WARNING |
+| sesión del catálogo fuera de `session_types` | INFO: no se pidió |
+
+### Muestreo
+
+`max_records_per_file: null` (por defecto) valida **todos** los registros y es
+el único modo cuyo resultado describe el dataset. Al fijar un valor N, la
+ejecución pasa a ser una comprobación rápida determinista y el reporte lo
+declara explícitamente: `sampling.exhaustive: false`, cuántos registros se
+inspeccionaron y un aviso de que el resultado no es exhaustivo. Además se
+emite un WARNING, de modo que **una ejecución muestreada nunca puede
+aparecer como limpia** ni confundirse con la validación oficial.
+
+## 11. Ejecutar tests
+
+```bash
+# Unit tests (sin red, con mocks) — se ejecutan por defecto
 pytest
 
 # Tests de integración (llaman a la API real de OpenF1), excluidos por defecto
@@ -297,19 +508,25 @@ pytest -m integration
 
 Cobertura actual: construcción de URLs/params, rate limiting (ventanas
 por segundo y por minuto), retries con backoff, timeouts, traducción de
-errores HTTP a excepciones propias, y carga/override de configuración.
+errores HTTP a excepciones propias, carga/override de configuración,
+almacenamiento raw, el pipeline de extracción histórica (descubrimiento,
+filtrado, extracción, idempotencia, manifest y manejo de errores) y la
+validación de datos (cada regla, severidades, estado global, reporte,
+muestreo y tolerancia a archivos corruptos).
 
-## 10. Limitaciones actuales
+## 12. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
   devuelven como `list`/`dict` crudos).
 - `RawDataStorage` es una abstracción mínima (un archivo JSON por
   respuesta); no es todavía la estrategia definitiva de almacenamiento.
-- No hay orquestación de pipeline (extracción histórica masiva por
-  año/circuito), solo llamadas puntuales por endpoint.
+- La extracción es secuencial (sin concurrencia): con el límite de 3 req/s
+  de OpenF1, paralelizar aportaría poco y aumentaría el riesgo de `429`.
+- `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
+- La validación no consolida todavía los datos en un dataset: solo los juzga.
 - No hay CI configurado.
 
-## 11. Licencia y uso de datos
+## 13. Licencia y uso de datos
 
 Este proyecto consume la API pública [OpenF1](https://openf1.org/), cuyos
 términos de uso la destinan a fines educativos, proyectos personales de
@@ -318,7 +535,7 @@ Maestría en Ciencia de Datos y Analítica. No se distribuyen ni republican
 los datos crudos obtenidos de OpenF1 fuera de este repositorio; los archivos
 bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
-## 12. Próximos pasos (fuera del alcance de esta etapa)
+## 14. Próximos pasos (fuera del alcance de esta etapa)
 
 - Feature engineering sobre la unidad Piloto × Carrera × Vuelta.
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir

@@ -27,6 +27,10 @@ data/processed/*
 !data/processed/.gitkeep
 data/features/*
 !data/features/.gitkeep
+data/manifests/*
+!data/manifests/.gitkeep
+data/validation/*
+!data/validation/.gitkeep
 
 # IDE
 .vscode/
