@@ -85,6 +85,23 @@ def valid_dataset(write_raw: Callable[..., Path]) -> Callable[..., None]:
 
 
 @pytest.fixture
+def consolidation_settings(raw_root: Path, tmp_path: Path) -> Callable[..., AppSettings]:
+    """Settings for a consolidation run over the temporary raw tree."""
+
+    def _settings(**overrides: Any) -> AppSettings:
+        config: Dict[str, Any] = {
+            "raw_path": str(raw_root),
+            "output_path": str(tmp_path / "processed" / "lap_dataset"),
+            "report_path": str(tmp_path / "consolidation"),
+            "validation_path": str(tmp_path / "validation"),
+        }
+        config.update(overrides)
+        return AppSettings(consolidation=config)
+
+    return _settings
+
+
+@pytest.fixture
 def validation_settings(raw_root: Path, tmp_path: Path) -> Callable[..., AppSettings]:
     """Settings pointing at the temporary raw tree."""
 

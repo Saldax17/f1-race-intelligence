@@ -2,6 +2,8 @@
 
 from f1_race_intelligence.config.settings import (
     AppSettings,
+    ConsolidationSettings,
+    FeatureSettings,
     HistoricalExtractionSettings,
     LoggingSettings,
     OpenF1Settings,
@@ -14,6 +16,8 @@ from f1_race_intelligence.config.settings import (
 
 __all__ = [
     "AppSettings",
+    "ConsolidationSettings",
+    "FeatureSettings",
     "HistoricalExtractionSettings",
     "LoggingSettings",
     "ValidationSettings",
