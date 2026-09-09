@@ -142,6 +142,72 @@ class ValidationSettings(BaseModel):
     )
 
 
+class ConsolidationSettings(BaseModel):
+    """How the validated raw data is assembled into the lap dataset."""
+
+    raw_path: str = "data/raw"
+    output_path: str = "data/processed/lap_dataset"
+    report_path: str = "data/consolidation"
+    validation_path: str = "data/validation"
+
+    years: List[int] = Field(default_factory=list)
+    """Seasons to consolidate. Empty means everything found in the raw tree."""
+
+    session_keys: List[int] = Field(default_factory=list)
+    """Specific sessions to consolidate. Empty means all of them."""
+
+    require_validation_pass: bool = False
+    """Refuse to consolidate unless the latest validation run came back PASS.
+
+    Off by default: a handful of impossible telemetry samples should not
+    block an otherwise sound dataset. The validation verdict is recorded in
+    the consolidation report either way, so a dataset built on data that
+    failed validation always says so.
+    """
+
+    weather_tolerance_seconds: float = 120.0
+    """How far back a lap may reach for the last weather reading.
+
+    Readings arrive every 60 seconds; two cadences leaves room for one
+    missed reading without pulling in conditions from far away.
+    """
+
+    overwrite: bool = False
+    """Rebuild sessions whose output file already exists."""
+
+
+class FeatureSettings(BaseModel):
+    """How the consolidated laps become a modelling dataset.
+
+    Only knobs that change the dataset live here. Which columns are features
+    and why is described in
+    :mod:`f1_race_intelligence.features.selection`, next to the evidence for
+    each decision.
+    """
+
+    input_path: str = "data/processed/lap_dataset"
+    output_path: str = "data/features/lap_features"
+    report_path: str = "data/features/reports"
+
+    years: List[int] = Field(default_factory=list)
+    session_keys: List[int] = Field(default_factory=list)
+
+    rolling_windows: List[int] = Field(default_factory=lambda: [3, 5])
+    """Trailing windows, in laps, ending at the current lap."""
+
+    correlation_alert_threshold: float = 0.99
+    """Report any feature correlating with the target at or above this.
+
+    A diagnostic only: a high correlation is a reason to look, not proof of
+    leakage, so nothing is dropped automatically.
+    """
+
+    fail_on_leakage: bool = True
+    """Refuse to write a session whose anti-leakage checks failed."""
+
+    overwrite: bool = False
+
+
 class AppSettings(BaseModel):
     """Top-level application settings."""
 
@@ -149,6 +215,8 @@ class AppSettings(BaseModel):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     historical_extraction: HistoricalExtractionSettings = Field(default_factory=HistoricalExtractionSettings)
     validation: ValidationSettings = Field(default_factory=ValidationSettings)
+    consolidation: ConsolidationSettings = Field(default_factory=ConsolidationSettings)
+    features: FeatureSettings = Field(default_factory=FeatureSettings)
 
 
 # src/f1_race_intelligence/config/settings.py -> parents[3] is the repo root.

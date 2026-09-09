@@ -496,7 +496,175 @@ inspeccionaron y un aviso de que el resultado no es exhaustivo. Además se
 emite un WARNING, de modo que **una ejecución muestreada nunca puede
 aparecer como limpia** ni confundirse con la validación oficial.
 
-## 11. Ejecutar tests
+## 11. Consolidación del dataset
+
+Convierte los endpoints raw validados en un dataset analítico con una fila
+por **piloto × carrera × vuelta**. No modifica `data/raw/`.
+
+```bash
+python -m f1_race_intelligence.consolidation.runner
+```
+
+Salida: `data/processed/lap_dataset/<año>/session_<key>.parquet`, más un
+reporte de ejecución en `data/consolidation/`.
+
+### El problema y cómo se resuelve
+
+Los endpoints tienen granularidades muy distintas: `laps` da una fila por
+vuelta, pero `car_data` da ~368 muestras por vuelta y `weather` una lectura
+por minuto. Un join directo multiplicaría filas.
+
+La solución se apoya en un hecho **medido**: para un piloto, las vueltas
+teselan el reloj exactamente. Tomando la ventana de la vuelta t como
+`[date_start(t), date_start(t+1))` y contrastándola contra `lap_duration` en
+2.184 vueltas reales, salieron **0 huecos y 0 solapamientos**. Por eso cada
+fuente de alta frecuencia se **reduce a grano de vuelta antes** de unirse, y
+todos los joins son left joins sobre un grano que ya existe. La explosión de
+cardinalidad es imposible por construcción, no por vigilancia.
+
+| fuente | granularidad real | cómo se incorpora |
+|---|---|---|
+| `laps` | driver × lap | **base** |
+| `car_data` | driver × ~3,7 Hz | agregados dentro de la ventana |
+| `intervals` | driver × ~2 s | valor al final de la vuelta |
+| `position` | driver × **cambio** | último valor conocido (solo el 24% de vueltas tiene registro) |
+| `stints` | driver × stint | join por rango de vueltas |
+| `pit` | driver × parada | `lap_number` es la vuelta de **entrada** |
+| `weather` | session × 60 s | `merge_asof` **hacia atrás** |
+| `race_control` | session × evento | conteos por vuelta |
+
+### Regla anti-leakage
+
+**Todo dato de la vuelta t viene de `[date_start(t), date_start(t+1))` o de
+antes.** Nunca de t+1.
+
+Por eso weather usa `merge_asof` hacia atrás y no *nearest*: la lectura más
+cercana puede estar hasta 30 s en el futuro. La columna `weather_age_s` deja
+la decisión auditable — en datos reales va de 0 a 60 s, nunca negativa.
+
+M4 **no construye el target**. Deja `lap_duration` ordenado y `lap_number`
+contiguo para que M5 haga el `shift(-1)` por piloto, y marca
+`is_last_lap_for_driver` para que no genere un target inválido en abandonos.
+
+### Muestras físicamente imposibles
+
+La telemetría real trae valores imposibles (`n_gear` hasta 49, `throttle` y
+`brake` a 104). Se **excluyen del agregado que contaminarían, campo por
+campo**, nunca del archivo raw, y se cuentan en `car_data_invalid_samples` y
+en el reporte. Un sensor de marcha roto no invalida la velocidad registrada
+en la misma muestra.
+
+### Trazabilidad y pérdida de registros
+
+El reporte registra, por sesión y **por etapa**, cuántas filas entraron,
+cuántas salieron y cuántas no encontraron correspondencia:
+
+```
+  stage              in    out  lost  matched  unmatched
+  lap_windows      1058   1058     0     1055          3
+  stints           1058   1058     0     1055          3
+  intervals        1058   1058     0     1054          4
+  car_data         1058   1058     0     1055          3
+```
+
+Las vueltas sin ventana cerrable (la última de quien abandona) **se
+conservan** con los agregados nulos y marcadas: descartarlas sesgaría el
+dataset hacia quienes terminaron.
+
+### Escalabilidad
+
+La telemetría de una sola carrera son ~180 MB y el histórico varios GB, así
+que se procesa **un archivo de piloto a la vez** — la partición que ya
+produjo M2. El pico de memoria medido es de **59 MB** consolidando dos
+carreras completas (1,4 millones de muestras).
+
+## 12. Features y target
+
+Convierte el dataset consolidado en un dataset de modelado, con el target
+`next_lap_time` y las variables históricas del piloto hasta la vuelta actual.
+
+```bash
+python -m f1_race_intelligence.features.runner
+```
+
+Salida: `data/features/lap_features/<año>/session_<key>.parquet` y un reporte
+en `data/features/reports/`.
+
+### Target
+
+```
+next_lap_time = lap_duration(t+1)
+  groupby(session_key, driver_number) → sort by lap_number → shift(-1)
+```
+
+Solo empareja vueltas **realmente consecutivas**: un hueco en la numeración
+no produce target, en vez de emparejar la vuelta 5 con la 7. Las filas sin
+target válido —la última vuelta de cada piloto— **se conservan** con
+`has_target = false`; nada se descarta en silencio.
+
+### Regla de leakage
+
+Ninguna feature puede usar información posterior a t. El único `shift(-1)`
+del módulo construye el target.
+
+**Caso encontrado en los datos reales:** `pit_duration` correlaciona **0,989**
+con el exceso de tiempo de la vuelta t+1. Al revisarlo: de 43 paradas,
+**ninguna** tiene su timestamp dentro de la vuelta t — la mediana está 23,1 s
+*después* de que la vuelta terminara. La parada ocurre durante t+1, así que
+esa columna es prácticamente una medición del target. Está excluida y
+registrada en la lista de columnas prohibidas.
+
+En cambio `pit_in_lap` **sí** es feature: la entrada al pit lane sucede antes
+de cruzar la línea que cierra la vuelta t, por lo que es observable al
+predecir. La diferencia está documentada en el catálogo.
+
+### Catálogo de features
+
+[features/selection.py](src/f1_race_intelligence/features/selection.py) es la
+fuente de verdad: cada columna lleva un rol y la razón de su decisión.
+
+| rol | significado |
+|---|---|
+| `feature` | segura: describe la vuelta t, completa al predecir |
+| `review` | incluida, con reserva (nulos altos, redundancia, poca varianza) |
+| `leaky` | excluida por contener información posterior a t |
+| `excluded` | excluida por otras razones |
+| `identifier` | trazabilidad, nunca feature |
+
+Variables temporales, todas dentro de `(session_key, driver_number)` ordenado
+por `lap_number` y con ventana **trailing que incluye t**: `lap_time_prev_1`,
+`lap_time_delta_1`, `lap_time_roll_{mean,std,min}_{3,5}`,
+`lap_time_vs_roll_mean_5` y `lap_time_expanding_mean`.
+
+En la vuelta 1: `prev`, `delta` y las desviaciones quedan nulas; las medias y
+mínimos valen la propia vuelta. Son nulos estructurales, no imputados.
+
+### Validaciones anti-leakage
+
+Siete guardas, seis bloqueantes. Las dos más importantes **recomputan** el
+valor por un camino distinto al que lo produjo:
+
+| guarda | qué comprueba |
+|---|---|
+| `grain_unique` | una fila por sesión, piloto y vuelta |
+| `target_matches_independent_derivation` | el target reconstruido con un diccionario, no con el shift |
+| `last_lap_has_no_target` | no se inventó target en la última vuelta |
+| `target_does_not_cross_driver_or_session` | el target viene del mismo piloto y carrera |
+| `no_forbidden_columns_among_features` | ninguna columna prohibida llegó al modelo |
+| `rolling_features_use_only_the_past` | cada ventana recalculada solo con vueltas ≤ t |
+| `no_feature_almost_equals_the_target` | **diagnóstico**, no bloquea: avisa si algo correlaciona > 0,99 |
+
+Una sesión que falle una guarda bloqueante **no se escribe**: publicar un
+dataset que se sabe contaminado es peor que no publicarlo.
+
+### Lo que M5 no hace
+
+No escala, no imputa y no codifica categóricas. Todo eso aprende parámetros
+de los datos y debe ajustarse dentro del pipeline de entrenamiento, sobre el
+split de train únicamente. `compound`, `team_name` y `driver_acronym` quedan
+como `category` de pandas.
+
+## 13. Ejecutar tests
 
 ```bash
 # Unit tests (sin red, con mocks) — se ejecutan por defecto
@@ -514,7 +682,7 @@ filtrado, extracción, idempotencia, manifest y manejo de errores) y la
 validación de datos (cada regla, severidades, estado global, reporte,
 muestreo y tolerancia a archivos corruptos).
 
-## 12. Limitaciones actuales
+## 14. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
   devuelven como `list`/`dict` crudos).
@@ -526,7 +694,7 @@ muestreo y tolerancia a archivos corruptos).
 - La validación no consolida todavía los datos en un dataset: solo los juzga.
 - No hay CI configurado.
 
-## 13. Licencia y uso de datos
+## 15. Licencia y uso de datos
 
 Este proyecto consume la API pública [OpenF1](https://openf1.org/), cuyos
 términos de uso la destinan a fines educativos, proyectos personales de
@@ -535,7 +703,7 @@ Maestría en Ciencia de Datos y Analítica. No se distribuyen ni republican
 los datos crudos obtenidos de OpenF1 fuera de este repositorio; los archivos
 bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
-## 14. Próximos pasos (fuera del alcance de esta etapa)
+## 16. Próximos pasos (fuera del alcance de esta etapa)
 
 - Feature engineering sobre la unidad Piloto × Carrera × Vuelta.
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir

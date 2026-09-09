@@ -82,3 +82,47 @@ validation:
     - temporal
     - identifiers
     - coverage
+
+# How the raw data is assembled into the lap dataset (one row per driver,
+# race and lap). Raw data is never modified.
+consolidation:
+  raw_path: "data/raw"
+  output_path: "data/processed/lap_dataset"
+  report_path: "data/consolidation"
+  validation_path: "data/validation"
+
+  # Empty means everything found in the raw tree.
+  years: []
+  session_keys: []
+
+  # false: consolidate even when the latest validation run failed, recording
+  # that fact in the report. true: refuse to run unless validation says PASS.
+  require_validation_pass: false
+
+  # How far back a lap may reach for the last weather reading. Readings come
+  # every 60 s, so two cadences tolerate one missed reading.
+  weather_tolerance_seconds: 120
+
+  overwrite: false
+
+# How the consolidated laps become a modelling dataset. Which columns are
+# features, and why, is described in features/selection.py.
+features:
+  input_path: "data/processed/lap_dataset"
+  output_path: "data/features/lap_features"
+  report_path: "data/features/reports"
+
+  years: []
+  session_keys: []
+
+  # Trailing windows in laps, ending at (and including) the current lap.
+  rolling_windows: [3, 5]
+
+  # Diagnostic only: report features that track the target this closely.
+  # Nothing is dropped automatically — a high correlation is a reason to look.
+  correlation_alert_threshold: 0.99
+
+  # Refuse to write a session whose anti-leakage checks failed.
+  fail_on_leakage: true
+
+  overwrite: false

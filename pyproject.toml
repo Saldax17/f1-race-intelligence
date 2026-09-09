@@ -16,6 +16,10 @@ dependencies = [
     "PyYAML>=6.0",
     "python-dotenv>=1.0",
     "tenacity>=8.2",
+    # Consolidation (M4) onwards: merge_asof implements the backward-in-time
+    # joins the lap dataset needs, and pyarrow writes the Parquet output.
+    "pandas>=2.0",
+    "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]
