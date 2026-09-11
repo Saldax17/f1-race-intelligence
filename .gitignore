@@ -33,6 +33,8 @@ data/validation/*
 !data/validation/.gitkeep
 data/consolidation/*
 !data/consolidation/.gitkeep
+data/modeling/*
+!data/modeling/.gitkeep
 
 # IDE
 .vscode/

@@ -664,7 +664,98 @@ de los datos y debe ajustarse dentro del pipeline de entrenamiento, sobre el
 split de train únicamente. `compound`, `team_name` y `driver_acronym` quedan
 como `category` de pandas.
 
-## 13. Ejecutar tests
+## 13. Dataset de modelado
+
+Convierte el dataset de features en artefactos `train` / `validation` / `test`
+listos para entrenar. **No entrena ningún modelo.**
+
+```bash
+python -m f1_race_intelligence.modeling.runner
+```
+
+Salida en `data/modeling/`, con el reporte en `data/modeling/reports/`.
+
+### Orden de las operaciones
+
+```
+M5 → descartar filas sin target → split cronológico por carrera
+   → ajustar preprocessing SOLO con train → transformar cada split → validar → escribir
+```
+
+Ese orden es el módulo entero. Ajustar el preprocessing **antes** del split,
+sobre todos los datos, es la forma más común de que un modelo de tiempos de
+vuelta parezca mejor de lo que es.
+
+### Split temporal, por carrera
+
+El split respeta el tiempo: entrenar con carreras antiguas y validar con
+posteriores es lo único que dice algo sobre el futuro que se quiere predecir.
+
+Y la unidad es la **carrera completa, nunca la vuelta**. Las vueltas de una
+misma carrera comparten circuito, clima, safety cars y asignación de
+neumáticos; repartirlas entre train y validation filtra la respuesta por las
+circunstancias.
+
+Dos estrategias, ambas configurables sin tocar código:
+
+| estrategia | cómo asigna |
+|---|---|
+| `fraction` | ordena las carreras por fecha y corta por proporción |
+| `years` | asigna temporadas completas a cada split |
+
+### Preprocessing — ajustado solo con train
+
+| paso | estrategia |
+|---|---|
+| imputación numérica | mediana **de train** (resiste los outliers de boxes y safety car) |
+| indicadores de nulo | se conserva una columna que registra que el valor faltaba |
+| escalado | estándar, con media y desviación **de train** (configurable) |
+| categóricas | one-hot con `handle_unknown="ignore"` |
+
+Los nulos aquí significan cosas distintas: un coche doblado no tiene gap
+numérico, una primera vuelta no tiene vuelta anterior, y una trampa de
+velocidad a veces no reporta. Ninguno es un cero, así que se imputan para que
+un modelo pueda consumirlos **y** se conserva el indicador para no borrar el
+hecho de la ausencia.
+
+`handle_unknown="ignore"` importa: un piloto que debuta la temporada
+siguiente aparece en validation sin haber estado en train, y debe codificarse
+como ceros en vez de romper el pipeline.
+
+### Guardas anti-leakage
+
+Doce comprobaciones, once bloqueantes. Las tres centrales funcionan
+**re-ajustando**: se entrena un transformador nuevo solo con train y otro con
+train + validation, y el que está en uso debe coincidir con el primero y
+diferir del segundo. Una guarda que solo inspeccionara nuestra intención
+estaría de acuerdo con nosotros incluso estando equivocados.
+
+Si la comparación no puede distinguir ambos ajustes, se reporta como
+**inconcluyente**, no como aprobada.
+
+Un run que falle una guarda bloqueante **no escribe nada**.
+
+### Salida
+
+```
+data/modeling/
+├── train/dataset.parquet     # filas con trazabilidad, sin transformar
+├── train/features.parquet    # matriz codificada + target + claves key_*
+├── validation/ , test/       # idem
+├── preprocessing/preprocessor.joblib   # el transformador ajustado con train
+└── reports/
+```
+
+Cada split se escribe dos veces: sin transformar, para poder rastrear
+cualquier fila hasta M5 y de ahí al raw, y codificado, que es lo que lee un
+modelo. Las claves llevan prefijo `key_` porque una columna puede ser clave
+**y** feature — `lap_number` lo es, ya que el coche se aligera al consumir
+combustible — y sin el prefijo la clave sobrescribiría a la feature.
+
+Todo en `data/modeling/` está fuera de Git y se reproduce volviendo a
+ejecutar el módulo.
+
+## 14. Ejecutar tests
 
 ```bash
 # Unit tests (sin red, con mocks) — se ejecutan por defecto
@@ -682,7 +773,7 @@ filtrado, extracción, idempotencia, manifest y manejo de errores) y la
 validación de datos (cada regla, severidades, estado global, reporte,
 muestreo y tolerancia a archivos corruptos).
 
-## 14. Limitaciones actuales
+## 15. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
   devuelven como `list`/`dict` crudos).
@@ -694,7 +785,7 @@ muestreo y tolerancia a archivos corruptos).
 - La validación no consolida todavía los datos en un dataset: solo los juzga.
 - No hay CI configurado.
 
-## 15. Licencia y uso de datos
+## 16. Licencia y uso de datos
 
 Este proyecto consume la API pública [OpenF1](https://openf1.org/), cuyos
 términos de uso la destinan a fines educativos, proyectos personales de
@@ -703,7 +794,7 @@ Maestría en Ciencia de Datos y Analítica. No se distribuyen ni republican
 los datos crudos obtenidos de OpenF1 fuera de este repositorio; los archivos
 bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
-## 16. Próximos pasos (fuera del alcance de esta etapa)
+## 17. Próximos pasos (fuera del alcance de esta etapa)
 
 - Feature engineering sobre la unidad Piloto × Carrera × Vuelta.
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir

@@ -208,6 +208,79 @@ class FeatureSettings(BaseModel):
     overwrite: bool = False
 
 
+class ModelingSettings(BaseModel):
+    """How the feature dataset becomes train/validation/test artifacts.
+
+    Everything that decides what a model will see lives here rather than in
+    code, so a different split or a different imputation is a configuration
+    change and the report records exactly which one produced a dataset.
+    """
+
+    input_path: str = "data/features/lap_features"
+    output_path: str = "data/modeling"
+    report_path: str = "data/modeling/reports"
+
+    years: List[int] = Field(default_factory=list)
+    session_keys: List[int] = Field(default_factory=list)
+
+    split_strategy: str = "fraction"
+    """How races are handed to the splits.
+
+    * ``fraction`` cuts the chronological list of races by proportion.
+    * ``years`` assigns whole seasons through the lists below.
+    * ``train_years_then_split`` gives the seasons in ``train_years`` to
+      training and cuts whatever remains into validation and test.
+    """
+
+    validation_share_of_remainder: float = 0.5
+    """For ``train_years_then_split``: how much of what is left goes to validation.
+
+    The rest becomes test, so test always sits after validation in time.
+    With an odd number of races the extra one goes to validation.
+    """
+
+    train_fraction: float = 0.6
+    validation_fraction: float = 0.2
+    """Test takes whatever remains, so the three always sum to the history."""
+
+    train_years: List[int] = Field(default_factory=list)
+    validation_years: List[int] = Field(default_factory=list)
+    test_years: List[int] = Field(default_factory=list)
+
+    min_sessions_per_split: int = 3
+    """Below this a split is reported as too thin to evaluate anything.
+
+    A warning, not an error: the pipeline still runs on a small history so
+    it can be validated technically, but the report says the numbers are
+    not an evaluation.
+    """
+
+    numeric_imputation: str = "median"
+    """Learned from the training races only. The median resists the outliers
+    that pit laps and safety cars put into lap times."""
+
+    add_missing_indicators: bool = True
+    """Keep a column recording that a value was absent.
+
+    Missing here carries meaning — a lapped car has no gap, a first lap has
+    no previous lap — and imputing without a marker would erase it.
+    """
+
+    scale_numeric: bool = True
+    """Standardize numeric features using training statistics only.
+
+    Needed by distance- and gradient-based models and harmless to trees,
+    which is why it is on by default; turn it off if the chosen model makes
+    it pointless.
+    """
+
+    random_seed: int = 42
+    """Recorded for reproducibility. Nothing in this stage is random today."""
+
+    fail_on_leakage: bool = True
+    """Refuse to write anything when a blocking guard fails."""
+
+
 class AppSettings(BaseModel):
     """Top-level application settings."""
 
@@ -217,6 +290,7 @@ class AppSettings(BaseModel):
     validation: ValidationSettings = Field(default_factory=ValidationSettings)
     consolidation: ConsolidationSettings = Field(default_factory=ConsolidationSettings)
     features: FeatureSettings = Field(default_factory=FeatureSettings)
+    modeling: ModelingSettings = Field(default_factory=ModelingSettings)
 
 
 # src/f1_race_intelligence/config/settings.py -> parents[3] is the repo root.

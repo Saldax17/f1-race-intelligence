@@ -126,3 +126,48 @@ features:
   fail_on_leakage: true
 
   overwrite: false
+
+# How the feature dataset becomes train/validation/test artifacts.
+# Preprocessing is always fitted on the training races alone.
+modeling:
+  input_path: "data/features/lap_features"
+  output_path: "data/modeling"
+  report_path: "data/modeling/reports"
+
+  # The official dataset is 2023-2025. 2026 is still being run, so it is not
+  # a stable history; it may later serve as an external check, not as part of
+  # this evaluation.
+  years: [2023, 2024, 2025]
+  session_keys: []
+
+  # "fraction":                order races by date and cut by proportion.
+  # "years":                   assign whole seasons through the lists below.
+  # "train_years_then_split":  whole seasons to train, then cut the rest.
+  # Either way the unit is a whole race, never a lap.
+  split_strategy: "train_years_then_split"
+  train_years: [2023, 2024]
+
+  # Of what remains after the training seasons (2025), the earlier half goes
+  # to validation and the later half to test, so test sits after validation
+  # in time. An odd race count leaves the extra race in validation.
+  validation_share_of_remainder: 0.5
+
+  # Used only by the other strategies.
+  train_fraction: 0.6
+  validation_fraction: 0.2
+  validation_years: []
+  test_years: []
+
+  # Below this, a split is reported as too thin to evaluate anything.
+  # A warning, not an error: the pipeline still runs on a small history.
+  min_sessions_per_split: 3
+
+  # All learned from the training races only.
+  numeric_imputation: "median"
+  add_missing_indicators: true
+  scale_numeric: true
+
+  random_seed: 42
+
+  # Refuse to write anything when a leakage guard fails.
+  fail_on_leakage: true

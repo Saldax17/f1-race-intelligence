@@ -20,6 +20,11 @@ dependencies = [
     # joins the lap dataset needs, and pyarrow writes the Parquet output.
     "pandas>=2.0",
     "pyarrow>=14.0",
+    # Modeling datasets (M6): the split-aware preprocessing is built from
+    # ColumnTransformer, SimpleImputer, StandardScaler and OneHotEncoder, and
+    # joblib persists the transformer fitted on the training races.
+    "scikit-learn>=1.4",
+    "joblib>=1.3",
 ]
 
 [project.optional-dependencies]
