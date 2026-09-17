@@ -9,19 +9,29 @@ same way and lets a full history be processed race by race.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import List, Optional, Union
 
 import pandas as pd
 
+from f1_race_intelligence.storage.layout import Layer
+from f1_race_intelligence.storage.store import DataStore
+
 
 @dataclass(frozen=True)
 class SessionFile:
-    """One consolidated session on disk."""
+    """One consolidated session in storage."""
 
-    path: Path
+    key: str
     session_key: int
     year: Optional[int] = None
+    uri: str = ""
+
+    @property
+    def path(self) -> PurePath:
+        """A local path on disk; a pure path of the key on object storage."""
+        location = self.uri or self.key
+        return PurePosixPath(self.key) if "://" in location else Path(location)
 
     @property
     def sort_key(self) -> tuple:
@@ -31,12 +41,24 @@ class SessionFile:
 class LapDatasetLoader:
     """Finds and reads the Parquet files M4 wrote."""
 
-    def __init__(self, input_path: Union[str, Path] = "data/processed/lap_dataset") -> None:
-        self._input_path = Path(input_path)
+    def __init__(
+        self,
+        input_path: Union[str, Path] = "data/processed/lap_dataset",
+        *,
+        store: Optional[DataStore] = None,
+    ) -> None:
+        self._configured = str(input_path)
+        self._store = store or DataStore.local()
+        self._root = self._store.root(Layer.CONSOLIDATED, self._configured)
 
     @property
     def input_path(self) -> Path:
-        return self._input_path
+        """The configured root, as a path. Prefer :attr:`location` for display."""
+        return Path(self._configured)
+
+    @property
+    def location(self) -> str:
+        return self._store.backend.uri(self._root)
 
     def discover(
         self,
@@ -44,26 +66,26 @@ class LapDatasetLoader:
         session_keys: Optional[List[int]] = None,
     ) -> List[SessionFile]:
         """List consolidated sessions, in a stable chronological order."""
-        if not self._input_path.is_dir():
-            return []
+        backend, layout = self._store.backend, self._store.layout
+        season = years[0] if years and len(years) == 1 else None
 
         found: List[SessionFile] = []
-        for path in self._input_path.rglob("session_*.parquet"):
-            session_key = _session_key_from_name(path.name)
-            if session_key is None:
+        for key in backend.list(layout.session_dataset_listing_prefix(self._root, season)):
+            parsed = layout.parse_session_dataset_key(self._root, key)
+            if parsed is None:
                 continue
-            year = _year_from_parent(path.parent.name)
+            year, session_key = parsed
             if years and year not in years:
                 continue
             if session_keys and session_key not in session_keys:
                 continue
-            found.append(SessionFile(path=path, session_key=session_key, year=year))
+            found.append(SessionFile(key=key, session_key=session_key, year=year, uri=backend.uri(key)))
 
         return sorted(found, key=lambda item: item.sort_key)
 
     def load(self, session_file: SessionFile) -> pd.DataFrame:
         """Read one session and add the columns M5 needs for ordering."""
-        frame = pd.read_parquet(session_file.path, engine="pyarrow")
+        frame = self._store.backend.read_parquet(session_file.key)
         return add_session_date(frame)
 
 
@@ -81,21 +103,3 @@ def add_session_date(frame: pd.DataFrame) -> pd.DataFrame:
     else:
         frame["session_date"] = pd.NaT
     return frame
-
-
-def _session_key_from_name(file_name: str) -> Optional[int]:
-    stem = Path(file_name).stem
-    prefix, separator, value = stem.partition("_")
-    if prefix != "session" or not separator:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
-def _year_from_parent(directory_name: str) -> Optional[int]:
-    try:
-        return int(directory_name)
-    except ValueError:
-        return None

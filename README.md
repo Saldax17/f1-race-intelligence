@@ -27,6 +27,12 @@ No se implementa (todavía) Machine Learning, Deep Learning, feature
 engineering, entrenamiento, MLflow, FastAPI, Docker, Kubernetes, AWS,
 CI/CD ni dashboards.
 
+> **Actualización (preparación cloud):** M1–M6 ya son *cloud-ready*: el
+> almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
+> job batch independiente (por sesión) y existe una imagen Docker. **AWS
+> todavía NO está desplegado**: no hay bucket, roles ni infraestructura
+> creados. Ver [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
+
 ## 2. Arquitectura
 
 Flujo de dependencias, de arriba hacia abajo:
@@ -125,9 +131,15 @@ f1-race-intelligence/
 ├── pyproject.toml
 ├── .gitignore
 ├── .env.example
+├── Dockerfile                 # imagen batch M2–M6 (usuario sin privilegios)
+├── .dockerignore
 │
 ├── configs/
-│   └── config.yaml
+│   ├── config.yaml            # base (entorno local)
+│   └── config.aws.yaml        # overlay para environment=aws (solo diferencias)
+│
+├── requirements/
+│   └── runtime-lock.txt       # versiones exactas para la imagen Docker
 │
 ├── data/
 │   ├── raw/
@@ -144,6 +156,9 @@ f1-race-intelligence/
 ├── src/
 │   └── f1_race_intelligence/
 │       ├── __init__.py
+│       ├── __main__.py            # python -m f1_race_intelligence (CLI batch)
+│       ├── cli.py                 # --stage plan|m2|m3|m4|m5|m6|copy-raw
+│       ├── scope.py               # SessionScope: unidad de trabajo (sesión)
 │       │
 │       ├── config/
 │       │   ├── __init__.py
@@ -164,8 +179,15 @@ f1-race-intelligence/
 │       │
 │       ├── storage/
 │       │   ├── __init__.py
-│       │   ├── raw_catalog.py             # lectura del árbol data/raw
-│       │   └── raw_storage.py             # escritura del árbol data/raw
+│       │   ├── backends/
+│       │   │   ├── base.py                # StorageBackend (interfaz) + JSON/Parquet/joblib
+│       │   │   ├── local.py               # LocalStorageBackend
+│       │   │   └── s3.py                  # S3StorageBackend (boto3 opcional)
+│       │   ├── layout.py                  # contrato de rutas: legacy | lake
+│       │   ├── store.py                   # DataStore = backend + layout
+│       │   ├── migration.py               # copia raw entre stores sin re-descargar
+│       │   ├── raw_catalog.py             # lectura del árbol raw
+│       │   └── raw_storage.py             # escritura del árbol raw
 │       │
 │       ├── validation/
 │       │   ├── __init__.py
@@ -176,9 +198,12 @@ f1-race-intelligence/
 │       │   ├── report.py                  # persistencia del reporte
 │       │   └── runner.py                  # ValidationRunner
 │       │
+│       ├── consolidation/ features/ modeling/   # M4, M5, M6
+│       │
 │       └── utils/
 │           ├── __init__.py
-│           └── logging.py
+│           ├── files.py
+│           └── logging.py                 # JSON a stdout + log_context(stage, year, session…)
 │
 └── tests/
     ├── unit/
@@ -229,11 +254,21 @@ logging:
 Se carga con `f1_race_intelligence.config.settings.load_settings()`, que:
 
 1. Lee `configs/config.yaml` (o la ruta indicada por `F1_CONFIG_PATH`).
-2. Carga un `.env` local si existe (ver [.env.example](.env.example)).
-3. Aplica overrides puntuales por variable de entorno
+2. Si `environment` no es `local`, fusiona encima el overlay
+   `configs/config.<environment>.yaml` (hoy: `config.aws.yaml`).
+3. Carga un `.env` local si existe (ver [.env.example](.env.example)).
+4. Aplica overrides puntuales por variable de entorno
    (`OPENF1_BASE_URL`, `OPENF1_RATE_LIMIT_RPS`, `OPENF1_RATE_LIMIT_RPM`,
-   `OPENF1_RETRY_MAX_ATTEMPTS`, `LOG_LEVEL`).
-4. Valida todo con `pydantic` y devuelve un `AppSettings` tipado.
+   `OPENF1_RETRY_MAX_ATTEMPTS`, `LOG_LEVEL`, `F1_LOG_FILE`,
+   `F1_ENVIRONMENT`, `F1_STORAGE_BACKEND`, `F1_STORAGE_LAYOUT`,
+   `F1_STORAGE_LOCAL_ROOT`, `F1_STORAGE_BUCKET`, `F1_STORAGE_PREFIX`,
+   `F1_STORAGE_REGION`, `F1_STORAGE_ENDPOINT_URL`).
+5. Aplica los flags de la CLI (máxima prioridad).
+6. Valida todo con `pydantic` y devuelve un `AppSettings` tipado.
+
+Las secciones `environment` y `storage` se describen en
+[Preparación para la nube](#14-preparación-para-la-nube-aws-ready). Sin
+tocarlas, todo funciona exactamente como antes: archivos locales bajo `data/`.
 
 ```python
 from f1_race_intelligence.config.settings import load_settings
@@ -755,7 +790,222 @@ combustible — y sin el prefijo la clave sobrescribiría a la feature.
 Todo en `data/modeling/` está fuera de Git y se reproduce volviendo a
 ejecutar el módulo.
 
-## 14. Ejecutar tests
+## 14. Preparación para la nube (AWS-ready)
+
+> **AWS todavía NO está desplegado.** No existe bucket, rol IAM, imagen en
+> ECR ni ninguna otra infraestructura. Esta sección describe cómo quedó
+> preparado el código para que un despliegue posterior (CloudFormation/SAM)
+> no requiera tocar la lógica de M1–M6.
+
+La lógica funcional, estadística y anti-leakage de M4/M5/M6 **no cambió**.
+Se verificó ejecutando el pipeline nuevo sobre los datos locales y
+comparando contra las salidas generadas por el código anterior: los Parquet
+de M4, M5 y M6 son idénticos, y el reporte de M3 coincide hallazgo por
+hallazgo.
+
+### 14.1 Arquitectura local (sin cambios de comportamiento)
+
+```
+configs/config.yaml ──► load_settings() ──► AppSettings
+                                               │
+      M2 extracción ─► M3 validación ─► M4 consolidación ─► M5 features ─► M6 modelado
+             │               │                 │                 │              │
+             └───────────────┴──── DataStore (backend + layout) ─┴──────────────┘
+                                               │
+                              LocalStorageBackend + layout "legacy"
+                                               │
+                        data/raw, data/processed, data/features, data/modeling…
+```
+
+`python -m f1_race_intelligence.<stage>.runner` sigue funcionando igual, con
+las mismas rutas bajo `data/`.
+
+### 14.2 Abstracción de storage
+
+Ningún stage conoce el filesystem ni boto3; dependen de una interfaz:
+
+```
+Pipeline (M2–M6)
+      ↓
+DataStore ── layout: qué clave recibe cada dato (legacy | lake)
+      ↓
+StorageBackend ── exists · read/write bytes · list · write_if_absent
+   ├── LocalStorageBackend   (archivos; escritura atómica tmp + replace)
+   └── S3StorageBackend      (objetos; PutObject atómico, If-None-Match)
+```
+
+Sobre esas primitivas la interfaz ofrece JSON, Parquet, joblib y nombres
+únicos para manifests/reportes. Garantías idénticas en ambos backends:
+
+- Un objeto que existe está completo (la idempotencia depende de eso).
+- Un manifest o reporte nunca sobrescribe a otro, ni con dos escritores
+  simultáneos (local: creación exclusiva; S3: escritura condicional).
+- Clave inexistente → `FileNotFoundError`; otro fallo → `StorageError`.
+  Ambos son `OSError`, así que los manejadores existentes siguen valiendo.
+- Parquet se lee siempre desde un buffer: pyarrow no puede inventar columnas
+  a partir de directorios `year=…`.
+
+`boto3` es opcional (`pip install ".[aws]"`, ≥ 1.35.2 por las escrituras
+condicionales) y solo se importa al crear un cliente S3.
+
+### 14.3 Contrato de rutas del Data Lake (layout `lake`)
+
+```
+s3://<bucket>/<prefix>/
+├── raw/year=<y>/endpoint=meetings/meetings.json
+├── raw/year=<y>/meeting=<m>/endpoint=sessions/sessions.json
+├── raw/year=<y>/meeting=<m>/session=<s>/endpoint=<endpoint>/session_<s>.json
+│                                         endpoint=car_data/driver_<n>.json
+├── validated/year=<y>/session=<s>/validation_report_<ts>.json   (M3 por sesión)
+├── validated/validation_report_<ts>.json                        (M3 global)
+├── consolidated/year=<y>/session=<s>/session_<s>.parquet        (M4)
+├── features/year=<y>/session=<s>/session_<s>.parquet            (M5)
+├── modeling/split=<train|validation|test>/{dataset,features}.parquet   (M6)
+├── modeling/preprocessing/{preprocessor.joblib, feature_schema.json}
+├── manifests/extraction/[year=<y>/session=<s>/]manifest_<ts>.json
+├── manifests/{consolidation,features,modeling}/<stage>_report_<ts>.json
+├── models/   (reservado para M7)
+└── logs/     (reservado; los logs van a stdout)
+```
+
+Todo lo de una sesión comparte un prefijo: es la unidad de trabajo, de
+permisos y de reproceso. `bucket` y `prefix` son configurables; los nombres
+de capa son el contrato (ver `storage/layout.py`).
+
+El layout se elige con `storage.layout`: `auto` (por defecto) usa `legacy`
+en local —las rutas por stage de `config.yaml`, como siempre— y `lake` en
+S3. También puede usarse `lake` sobre disco local para ensayar el árbol de
+S3 sin AWS (`F1_STORAGE_LAYOUT=lake`, por defecto bajo `data/lake/`).
+
+### 14.4 Configuración
+
+```yaml
+environment: local        # local | aws  (F1_ENVIRONMENT)
+
+storage:
+  backend: local          # local | s3   (F1_STORAGE_BACKEND)
+  layout: auto            # auto | legacy | lake
+  local_root: null
+  bucket: null            # F1_STORAGE_BUCKET
+  prefix: ""              # F1_STORAGE_PREFIX
+  region: null
+  endpoint_url: null      # solo LocalStack/MinIO
+```
+
+`environment: aws` fusiona [configs/config.aws.yaml](configs/config.aws.yaml)
+(solo lo que cambia: `backend: s3`, `layout: lake`) y exige S3. El bucket
+no está en ningún YAML: lo inyecta el job como `F1_STORAGE_BUCKET`.
+**Las credenciales nunca van en YAML ni en `.env`**: en AWS se usa el rol
+IAM de la tarea; en local, la cadena estándar de credenciales de AWS.
+
+### 14.5 Ejecución batch por stage y por sesión
+
+Un único entrypoint ejecuta cualquier stage, sobre todo lo configurado o
+sobre una sesión:
+
+```bash
+# Listar las unidades de trabajo (sesiones) de una temporada
+python -m f1_race_intelligence --stage plan --year 2024 --plan-output plan.json
+
+# Una sesión, de extremo a extremo (M6 es global: necesita toda la historia)
+python -m f1_race_intelligence --stage m2 --year 2024 --meeting-key 1229 --session-key 9472
+python -m f1_race_intelligence --stage m3,m4,m5 --year 2024 --meeting-key 1229 --session-key 9472
+python -m f1_race_intelligence --stage m6
+
+# Mismo job contra S3 (cuando exista el bucket)
+python -m f1_race_intelligence --stage m4 --year 2024 --session-key 9472 \
+    --storage-backend s3 --bucket <bucket> --prefix dev
+
+# Leer de un sitio y escribir en otro
+python -m f1_race_intelligence --stage m4 --session-key 9472 \
+    --input-storage s3://<bucket>/dev --output-storage ./data/smoke --output-layout lake
+
+# Subir lo ya extraído al layout lake SIN volver a descargar de OpenF1
+python -m f1_race_intelligence --stage copy-raw --input-layout legacy \
+    --output-storage s3://<bucket>/dev
+```
+
+| stage | por sesión | notas |
+|---|---|---|
+| `plan` | — | descubre meetings/sesiones (catálogos persistidos) y lista unidades |
+| `m2` | sí | idempotente; el meeting sale del catálogo guardado, sin llamadas extra |
+| `m3` | sí | valida la sesión + catálogos; guarda el alcance en `source.filter` |
+| `m4` | sí | lista solo el prefijo de la sesión; lee telemetría piloto a piloto |
+| `m5` | sí | |
+| `m6` | no | batch global; split 2023+2024 / 1.ª mitad 2025 / 2.ª mitad 2025 intacto |
+| `copy-raw` | opcional | copia byte a byte raw y manifests entre stores |
+
+Códigos de salida: `0` éxito · `1` stage fallido (reintentable: todo es
+idempotente) · `2` argumentos o configuración inválidos. Un `404` de OpenF1
+(dato inexistente en la fuente) no hace fallar M2; un 5xx/timeout sí.
+`--strict` hace que un M3 con estado `FAIL` devuelva `1`.
+
+Con jobs por sesión, cada stage elige los registros correctos: M3 usa el
+manifest más reciente que procesó esa sesión (o combina los manifests por
+sesión si no hay una ejecución global), y M4 solo acepta reportes de
+validación globales o de su misma sesión.
+
+### 14.6 Logging
+
+JSON por línea a **stdout** (lo que recoge CloudWatch). Cada línea dentro de
+un stage lleva `stage`, `year`, `meeting_key`, `session_key` cuando aplican;
+los eventos añaden `endpoint`, `record_count`, `elapsed_ms`/`elapsed_seconds`,
+`status`, `error_type` y, en Linux, `peak_memory_mb`. El archivo local es
+opcional (`logging.file_path` / `F1_LOG_FILE`) y nada depende de él.
+
+### 14.7 Docker
+
+```bash
+docker build -t f1-race-intelligence:dev .
+
+# Prueba local sobre los datos del repo, escribiendo en data/smoke (layout lake)
+docker run --rm -v "$PWD/data:/app/data" f1-race-intelligence:dev \
+    --stage copy-raw --input-layout legacy --output-storage /app/data/smoke --output-layout lake
+docker run --rm -v "$PWD/data:/app/data" \
+    -e F1_STORAGE_LAYOUT=lake -e F1_STORAGE_LOCAL_ROOT=/app/data/smoke \
+    f1-race-intelligence:dev --stage m3,m4,m5 --year 2024 --meeting-key 1229 --session-key 9472
+```
+
+- `python:3.12-slim`, dependencias exactas desde `requirements/runtime-lock.txt`
+  + `pip check`, proyecto instalado con `--no-deps`.
+- Usuario sin privilegios (`uid 10001`); solo `/app/data` es escribible. Con
+  un volumen montado en Linux, añadir `--user "$(id -u):$(id -g)"` si el
+  directorio del host no es escribible para ese uid.
+- Sin datasets, `.env` ni credenciales (`.dockerignore`).
+- Configuración por variables de entorno (`F1_ENVIRONMENT`, `F1_STORAGE_*`).
+- `F1_CONFIG_PATH` es explícito: el paquete instalado no puede ubicar
+  `configs/` por su propia ruta.
+
+> La imagen no se ha construido en el entorno de desarrollo (Docker no está
+> instalado ahí). Sí se verificó el mismo modo de ejecución: paquete
+> instalado de forma no editable, fuera del repositorio, con
+> `F1_CONFIG_PATH` explícito.
+
+### 14.8 Infraestructura como código
+
+La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
+Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
+[infra/](infra/README.md). **No está desplegada.** M2–M6 figuran en la state
+machine como estados placeholder y el paso al pipeline está desactivado
+(`PipelineEnabled=false`).
+
+### 14.9 Arquitectura AWS propuesta (futura, no desplegada)
+
+```
+EventBridge Scheduler
+        │
+Step Functions (orquestación)
+  ├─ plan (Fargate task)  ──► lista de sesiones
+  ├─ Map sesiones  (concurrencia M2 = 1–2: límite de OpenF1)
+  │     └─ M2 (Fargate) ─► M3 ─► M4 ─► M5     reintentos por sesión
+  └─ M6 (Fargate / Batch, más memoria)
+        │
+S3 data lake (versionado, cifrado SSE, lifecycle)   ECR (imagen)
+CloudWatch Logs + alarmas                            IAM role por tarea (mínimo privilegio)
+Glue Data Catalog / Athena (opcional, partition projection)
+```
+
+## 15. Ejecutar tests
 
 ```bash
 # Unit tests (sin red, con mocks) — se ejecutan por defecto
@@ -773,19 +1023,26 @@ filtrado, extracción, idempotencia, manifest y manejo de errores) y la
 validación de datos (cada regla, severidades, estado global, reporte,
 muestreo y tolerancia a archivos corruptos).
 
-## 15. Limitaciones actuales
+Preparación cloud: el contrato de `StorageBackend` se ejecuta idéntico sobre
+disco y sobre un S3 simulado en memoria (sin boto3, red ni credenciales);
+layouts `legacy`/`lake`; configuración local/AWS; M2–M6 sobre S3 comparados
+contra su ejecución local; idempotencia; jobs por sesión; CLI y códigos de
+salida; contexto de logging.
+
+## 16. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
   devuelven como `list`/`dict` crudos).
-- `RawDataStorage` es una abstracción mínima (un archivo JSON por
-  respuesta); no es todavía la estrategia definitiva de almacenamiento.
-- La extracción es secuencial (sin concurrencia): con el límite de 3 req/s
-  de OpenF1, paralelizar aportaría poco y aumentaría el riesgo de `429`.
+- Raw sigue siendo un archivo JSON por respuesta (envelope); no hay todavía
+  compresión ni formato columnar para la capa raw.
+- La extracción respeta el límite de OpenF1 por cliente: varios jobs M2 en
+  paralelo comparten ese límite, así que M2 no escala con más contenedores.
 - `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
-- La validación no consolida todavía los datos en un dataset: solo los juzga.
+- **AWS no está desplegado**; el backend S3 solo se ha probado contra un
+  cliente simulado.
 - No hay CI configurado.
 
-## 16. Licencia y uso de datos
+## 17. Licencia y uso de datos
 
 Este proyecto consume la API pública [OpenF1](https://openf1.org/), cuyos
 términos de uso la destinan a fines educativos, proyectos personales de
@@ -794,13 +1051,15 @@ Maestría en Ciencia de Datos y Analítica. No se distribuyen ni republican
 los datos crudos obtenidos de OpenF1 fuera de este repositorio; los archivos
 bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
-## 17. Próximos pasos (fuera del alcance de esta etapa)
+## 18. Próximos pasos (fuera del alcance de esta etapa)
 
 - Feature engineering sobre la unidad Piloto × Carrera × Vuelta.
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir
   `next_lap_time`.
 - Tracking de experimentos con MLflow y model registry.
 - Servir el modelo vía FastAPI.
-- Containerización (Docker) y despliegue (Kubernetes / AWS).
+- Despliegue en AWS (CloudFormation/SAM) de la arquitectura propuesta en la
+  sección 14.9 (la base ya está definida en `infra/`); construir y publicar
+  la imagen Docker en ECR.
 - CI/CD.
 - Dashboard y monitoreo de drift.

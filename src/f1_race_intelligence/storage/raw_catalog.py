@@ -1,12 +1,12 @@
 """Reading side of the raw data layout.
 
 :class:`~f1_race_intelligence.storage.raw_storage.RawDataStorage` decides
-where a response is written; this module is the inverse — it walks that
-tree and hands back what is there. Both live in ``storage`` so the
-``<endpoint>/year=…/meeting_key=…/session_key=…`` convention and the
+where a response is written; this module is the inverse — it lists that
+tree and hands back what is there. Both live in ``storage`` so the path
+contract (see :mod:`f1_race_intelligence.storage.layout`) and the
 ``{endpoint, parameters, retrieved_at, data}`` envelope are described in
-exactly one package. A consumer (validation today, dataset building
-later) should never have to parse a path or an envelope itself.
+exactly one package. A consumer (validation, consolidation) should never
+have to parse a key or an envelope itself.
 
 Nothing here writes: raw data is immutable once extracted.
 """
@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
-# Partition keys RawDataStorage encodes as "key=value" directory names,
-# in the order it nests them.
-_PARTITION_KEYS = ("year", "meeting_key", "session_key")
+from f1_race_intelligence.storage.backends.base import key_name
+from f1_race_intelligence.storage.layout import Layer
+from f1_race_intelligence.storage.store import DataStore
 
 
 class RawFileError(Exception):
@@ -33,14 +33,30 @@ class RawFileError(Exception):
 
 @dataclass(frozen=True)
 class RawFile:
-    """A raw JSON file on disk, described by where it sits in the tree."""
+    """A raw JSON file in storage, described by where it sits in the tree."""
 
-    path: Path
+    key: str
     endpoint: str
     year: Optional[int] = None
     meeting_key: Optional[int] = None
     session_key: Optional[int] = None
     driver_number: Optional[int] = None
+    uri: str = ""
+    """Where the file is, as reports record it: a filesystem path or ``s3://…``."""
+
+    @property
+    def name(self) -> str:
+        return key_name(self.key)
+
+    @property
+    def path(self) -> PurePath:
+        """A local :class:`~pathlib.Path` on disk; a pure path of the key on object storage.
+
+        Kept for code written before storage backends existed. Use
+        :attr:`uri` to display a location and the catalog to read it.
+        """
+        location = self.uri or self.key
+        return PurePosixPath(self.key) if "://" in location else Path(location)
 
     @property
     def partition(self) -> Dict[str, Any]:
@@ -62,7 +78,7 @@ class RawFile:
             self.meeting_key if self.meeting_key is not None else -1,
             self.session_key if self.session_key is not None else -1,
             self.driver_number if self.driver_number is not None else -1,
-            self.path.name,
+            self.name,
         )
 
 
@@ -84,23 +100,54 @@ class RawEnvelope:
 class RawDataCatalog:
     """Discovers and reads the raw files produced by the extraction pipeline."""
 
-    def __init__(self, base_path: Union[str, Path] = "data/raw") -> None:
-        self._base_path = Path(base_path)
+    def __init__(self, base_path: Union[str, Path] = "data/raw", *, store: Optional[DataStore] = None) -> None:
+        """Create a catalog.
+
+        Args:
+            base_path: Root of the raw tree for the legacy layout; the lake
+                layout has a fixed ``raw/`` root and ignores it.
+            store: Backend and layout to read through. Defaults to local
+                files in the historical layout.
+        """
+        self._configured = str(base_path)
+        self._store = store or DataStore.local()
+        self._root = self._store.root(Layer.RAW, self._configured)
 
     @property
     def base_path(self) -> Path:
-        return self._base_path
+        """The configured root, as a path. Prefer :attr:`location` for display."""
+        return Path(self._configured)
+
+    @property
+    def location(self) -> str:
+        """Where the raw tree is, as reports record it."""
+        return self._store.backend.uri(self._root)
+
+    @property
+    def store(self) -> DataStore:
+        return self._store
 
     def exists(self) -> bool:
-        return self._base_path.is_dir()
+        return self._store.backend.has_prefix(self._root)
 
-    def discover(self, endpoints: Optional[Iterable[str]] = None) -> List[RawFile]:
-        """List every raw file under the tree, in a stable order.
+    def discover(
+        self,
+        endpoints: Optional[Iterable[str]] = None,
+        *,
+        year: Optional[int] = None,
+        meeting_key: Optional[int] = None,
+        session_key: Optional[int] = None,
+    ) -> List[RawFile]:
+        """List raw files, in a stable order.
 
         Args:
-            endpoints: Optional allow-list of endpoint names. ``None`` walks
-                everything that is on disk, which is what lets validation
+            endpoints: Optional allow-list of endpoint names. ``None`` lists
+                everything that is stored, which is what lets validation
                 notice data nobody asked for as well as data that is missing.
+            year, meeting_key, session_key: Keep only files carrying exactly
+                these partition values. On the lake layout they also narrow
+                what is listed, so a single-session job does not enumerate
+                the whole history.
 
         Returns:
             Files sorted by endpoint and partition keys. Hidden files and
@@ -110,41 +157,64 @@ class RawDataCatalog:
             return []
 
         wanted = set(endpoints) if endpoints is not None else None
-        files: List[RawFile] = []
+        backend, layout = self._store.backend, self._store.layout
+        prefix = layout.raw_listing_prefix(self._root, year=year, meeting_key=meeting_key, session_key=session_key)
 
-        for path in self._base_path.rglob("*.json"):
-            if not path.is_file() or path.name.startswith("."):
+        files: List[RawFile] = []
+        for key in backend.list(prefix):
+            name = key_name(key)
+            if not name.endswith(".json") or name.startswith("."):
                 continue
-            raw_file = self._describe(path)
-            if raw_file is None:
+            parsed = layout.parse_raw_key(self._root, key)
+            if parsed is None:
                 continue
-            if wanted is not None and raw_file.endpoint not in wanted:
+            if wanted is not None and parsed.endpoint not in wanted:
                 continue
-            files.append(raw_file)
+            if (
+                (year is not None and parsed.year != year)
+                or (meeting_key is not None and parsed.meeting_key != meeting_key)
+                or (session_key is not None and parsed.session_key != session_key)
+            ):
+                continue
+            files.append(
+                RawFile(
+                    key=key,
+                    endpoint=parsed.endpoint,
+                    year=parsed.year,
+                    meeting_key=parsed.meeting_key,
+                    session_key=parsed.session_key,
+                    driver_number=_driver_number_from_name(name),
+                    uri=backend.uri(key),
+                )
+            )
 
         return sorted(files, key=lambda item: item.sort_key)
 
-    def load(self, raw_file: Union[RawFile, Path]) -> RawEnvelope:
+    def load(self, raw_file: Union[RawFile, Path, str]) -> RawEnvelope:
         """Read one raw file.
+
+        Args:
+            raw_file: A discovered file, or the key/path of one.
 
         Raises:
             RawFileError: if the file cannot be read, is not valid JSON, or
                 does not carry an envelope object.
         """
-        path = raw_file.path if isinstance(raw_file, RawFile) else Path(raw_file)
+        key = raw_file.key if isinstance(raw_file, RawFile) else str(raw_file)
+        backend = self._store.backend
+        location = backend.uri(key)
 
         try:
-            with path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
+            payload = json.loads(backend.read_bytes(key).decode("utf-8"))
         except OSError as exc:
-            raise RawFileError(f"Cannot read {path}: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise RawFileError(f"Invalid JSON in {path}: {exc}") from exc
+            raise RawFileError(f"Cannot read {location}: {exc}") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RawFileError(f"Invalid JSON in {location}: {exc}") from exc
 
         if not isinstance(payload, dict):
-            raise RawFileError(f"{path} does not contain a raw data envelope (found {type(payload).__name__})")
+            raise RawFileError(f"{location} does not contain a raw data envelope (found {type(payload).__name__})")
         if "data" not in payload:
-            raise RawFileError(f"{path} has no 'data' key; not a raw data envelope")
+            raise RawFileError(f"{location} has no 'data' key; not a raw data envelope")
 
         parameters = payload.get("parameters")
         return RawEnvelope(
@@ -154,40 +224,10 @@ class RawDataCatalog:
             data=payload.get("data"),
         )
 
-    def _describe(self, path: Path) -> Optional[RawFile]:
-        """Turn a path back into the partition keys that produced it."""
-        try:
-            relative = path.relative_to(self._base_path)
-        except ValueError:  # pragma: no cover - rglob only yields children
-            return None
-
-        parts = relative.parts
-        if len(parts) < 2:  # an endpoint directory plus a file name at minimum
-            return None
-
-        endpoint = parts[0]
-        partition: Dict[str, int] = {}
-        for part in parts[1:-1]:
-            key, separator, value = part.partition("=")
-            if separator and key in _PARTITION_KEYS:
-                try:
-                    partition[key] = int(value)
-                except ValueError:
-                    continue
-
-        return RawFile(
-            path=path,
-            endpoint=endpoint,
-            year=partition.get("year"),
-            meeting_key=partition.get("meeting_key"),
-            session_key=partition.get("session_key"),
-            driver_number=_driver_number_from_name(path.name),
-        )
-
 
 def _driver_number_from_name(file_name: str) -> Optional[int]:
     """Recover the driver from a per-driver file name (``driver_44.json``)."""
-    stem = Path(file_name).stem
+    stem = file_name.rsplit(".", 1)[0]
     prefix, separator, value = stem.partition("_")
     if prefix != "driver" or not separator:
         return None

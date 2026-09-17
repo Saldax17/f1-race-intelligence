@@ -5,7 +5,8 @@ never learns the raw layout or the envelope format. The one asymmetry is
 ``car_data``: its files are handed back as *paths to iterate*, not as
 loaded records, because a single session holds around 180 MB of telemetry
 and the whole point of the design is that only one driver's file is in
-memory at a time.
+memory at a time. That holds on any storage backend: each file is fetched
+when it is aggregated, never before.
 """
 
 from __future__ import annotations
@@ -59,19 +60,30 @@ class SessionLoader:
 
     def __init__(self, catalog: RawDataCatalog) -> None:
         self._catalog = catalog
+        # Where each discovered session sits, so loading it can list only its
+        # own prefix instead of the whole raw tree.
+        self._locations: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
 
     def discover_sessions(
         self,
         years: Optional[List[int]] = None,
         session_keys: Optional[List[int]] = None,
+        *,
+        meeting_key: Optional[int] = None,
     ) -> List[int]:
         """Session keys present in the raw tree, in a stable order.
 
         A session counts as present when it has a ``laps`` file: laps is the
         base of the dataset, and without it there is nothing to consolidate.
         """
+        # A single season, meeting or session narrows the listing itself.
+        year = years[0] if years and len(years) == 1 else None
+        session = session_keys[0] if session_keys and len(session_keys) == 1 else None
+
         found = set()
-        for raw_file in self._catalog.discover(endpoints=["laps"]):
+        for raw_file in self._catalog.discover(
+            endpoints=["laps"], year=year, meeting_key=meeting_key, session_key=session
+        ):
             if raw_file.session_key is None:
                 continue
             if years and raw_file.year not in years:
@@ -79,16 +91,23 @@ class SessionLoader:
             if session_keys and raw_file.session_key not in session_keys:
                 continue
             found.add(raw_file.session_key)
+            self._locations.setdefault(raw_file.session_key, (raw_file.year, raw_file.meeting_key))
         return sorted(found)
 
-    def load(self, session_key: int) -> SessionSources:
-        """Load one session: everything but telemetry, which stays on disk."""
+    def load(
+        self,
+        session_key: int,
+        *,
+        year: Optional[int] = None,
+        meeting_key: Optional[int] = None,
+    ) -> SessionSources:
+        """Load one session: everything but telemetry, which stays in storage."""
         by_endpoint: Dict[str, List[RawFile]] = defaultdict(list)
-        year = meeting_key = None
+        known_year, known_meeting = self._locations.get(session_key, (None, None))
+        year = year if year is not None else known_year
+        meeting_key = meeting_key if meeting_key is not None else known_meeting
 
-        for raw_file in self._catalog.discover():
-            if raw_file.session_key != session_key:
-                continue
+        for raw_file in self._catalog.discover(year=year, meeting_key=meeting_key, session_key=session_key):
             by_endpoint[raw_file.endpoint].append(raw_file)
             year = year or raw_file.year
             meeting_key = meeting_key or raw_file.meeting_key
@@ -103,7 +122,7 @@ class SessionLoader:
                 except RawFileError as exc:
                     # One damaged file must not sink the session; the caller
                     # reports it and consolidates what is readable.
-                    sources.unreadable.append(f"{raw_file.path}: {exc}")
+                    sources.unreadable.append(f"{raw_file.uri}: {exc}")
             sources.records[endpoint] = rows
 
         sources.car_data_files = sorted(by_endpoint.get(CAR_DATA, []), key=lambda item: item.sort_key)

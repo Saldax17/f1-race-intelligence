@@ -12,6 +12,12 @@ season costs the same memory as validating one file.
 Raw data is never written to. A file that cannot be read is reported and
 the pass continues, the same way the extraction pipeline steps over a
 failing endpoint instead of abandoning the run.
+
+A run can be scoped to one session (:class:`~f1_race_intelligence.scope.SessionScope`):
+it then validates that session's files plus the meetings and sessions
+catalogues they refer to, judges coverage for that session alone, and
+records the scope in ``source.filter`` so a later stage can tell its
+verdict apart from a full run's. The rules themselves do not change.
 """
 
 from __future__ import annotations
@@ -20,7 +26,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from f1_race_intelligence.config.settings import AppSettings, load_settings
+from f1_race_intelligence.scope import SessionScope
+from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.raw_catalog import RawDataCatalog, RawFile, RawFileError
+from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 from f1_race_intelligence.validation import validators
 from f1_race_intelligence.validation.manifest_index import ManifestIndex
@@ -64,23 +73,30 @@ class ValidationRunner:
         *,
         catalog: Optional[RawDataCatalog] = None,
         manifest: Optional[ManifestIndex] = None,
+        store: Optional[DataStore] = None,
+        scope: Optional[SessionScope] = None,
     ) -> None:
         """Create a runner.
 
         Args:
             settings: Application settings; loaded from config when omitted.
             catalog: Reader over the raw tree; defaults to the configured
-                ``raw_path``.
+                ``raw_path`` in ``store``.
             manifest: Extraction manifest to explain missing data with. When
-                omitted the most recent one is loaded, unless configuration
+                omitted the most relevant one is loaded, unless configuration
                 turns manifest use off.
+            store: Where raw data, manifests and reports live; defaults to
+                the configured ``storage`` section.
+            scope: Validate one session (or season) instead of everything.
 
         Raises:
             ValueError: if configuration enables an unknown rule.
         """
         self._settings = settings or load_settings()
         self._config = self._settings.validation
-        self._catalog = catalog or RawDataCatalog(base_path=self._config.raw_path)
+        self._store = store or (catalog.store if catalog is not None else DataStore.from_settings(self._settings))
+        self._catalog = catalog or RawDataCatalog(base_path=self._config.raw_path, store=self._store)
+        self._scope = scope or SessionScope()
 
         unknown = [rule for rule in self._config.enabled_rules if rule not in validators.ALL_RULES]
         if unknown:
@@ -91,7 +107,13 @@ class ValidationRunner:
 
         self._manifest = manifest
         if manifest is None and self._config.use_manifest:
-            self._manifest = ManifestIndex.load_latest(self._config.manifest_path)
+            manifest_root = self._store.root(Layer.EXTRACTION_MANIFESTS, self._config.manifest_path)
+            self._manifest = ManifestIndex.load_latest(
+                manifest_root,
+                backend=self._store.backend,
+                session_key=self._scope.session_key,
+                search_prefixes=[self._records_prefix(manifest_root)] if self._scope.is_session else None,
+            )
 
     # -- orchestration ----------------------------------------------------
 
@@ -103,17 +125,18 @@ class ValidationRunner:
             fail_on_error=self._config.fail_on_error,
             config=self._config_snapshot(),
             source={
-                "raw_path": str(self._catalog.base_path),
+                "raw_path": self._catalog.location,
                 "manifest": self._manifest.describe() if self._manifest else None,
+                "filter": None if self._scope.is_empty else self._scope.to_dict(),
             },
         )
 
-        files = self._catalog.discover()
+        files = self._discover_files()
         logger.info(
             "validation_start",
             extra={
                 "pipeline": PIPELINE_NAME,
-                "raw_path": str(self._catalog.base_path),
+                "raw_path": self._catalog.location,
                 "files": len(files),
                 "rules": list(self._config.enabled_rules),
             },
@@ -147,7 +170,13 @@ class ValidationRunner:
         self._add_sampling_disclosure(report, files_sampled, records_inspected, records_available)
 
         report.finished_at = datetime.now(timezone.utc)
-        written = save_report(report, self._config.report_path, write_csv=self._config.write_csv)
+        report_root = self._store.root(Layer.VALIDATION_REPORTS, self._config.report_path)
+        written = save_report(
+            report,
+            self._records_prefix(report_root),
+            write_csv=self._config.write_csv,
+            backend=self._store.backend,
+        )
 
         logger.info(
             "validation_summary",
@@ -160,6 +189,29 @@ class ValidationRunner:
             },
         )
         return report
+
+    def _discover_files(self) -> List[RawFile]:
+        """Everything in scope, plus the catalogues a scoped run needs to check identifiers."""
+        scope = self._scope
+        if scope.is_empty:
+            return self._catalog.discover()
+
+        files = {
+            item.key: item
+            for item in self._catalog.discover(
+                year=scope.year, meeting_key=scope.meeting_key, session_key=scope.session_key
+            )
+        }
+        if scope.is_session:
+            # A session's files never carry the catalogues, which sit a level
+            # up. Without them the identifier rule could not check anything.
+            for item in self._catalog.discover(endpoints=["meetings", "sessions"], year=scope.year):
+                if item.endpoint == "meetings" or scope.meeting_key is None or item.meeting_key == scope.meeting_key:
+                    files.setdefault(item.key, item)
+        return sorted(files.values(), key=lambda item: item.sort_key)
+
+    def _records_prefix(self, root: str) -> str:
+        return self._store.layout.records_prefix(root, year=self._scope.year, session_key=self._scope.session_key)
 
     # -- per-file ---------------------------------------------------------
 
@@ -177,7 +229,7 @@ class ValidationRunner:
         except RawFileError as exc:
             logger.error(
                 "raw_file_unreadable",
-                extra={"endpoint": raw_file.endpoint, "path": str(raw_file.path), "error": str(exc)},
+                extra={"endpoint": raw_file.endpoint, "path": raw_file.uri, "error": str(exc)},
             )
             executed.add((raw_file.endpoint, RULE_STRUCTURE))
             flagged.add((raw_file.endpoint, RULE_STRUCTURE))
@@ -188,7 +240,7 @@ class ValidationRunner:
                     severity=Severity.ERROR,
                     status=RuleStatus.FAIL,
                     endpoint=raw_file.endpoint,
-                    file=str(raw_file.path),
+                    file=raw_file.uri,
                     details={"error": str(exc), **raw_file.partition},
                 )
             )
@@ -201,7 +253,7 @@ class ValidationRunner:
 
         context = FileContext(
             endpoint=raw_file.endpoint,
-            path=raw_file.path,
+            path=raw_file.uri,
             partition=raw_file.partition,
             spec=get_spec(raw_file.endpoint),
             records=records,
@@ -218,7 +270,7 @@ class ValidationRunner:
                     severity=Severity.INFO,
                     status=RuleStatus.SKIPPED,
                     endpoint=raw_file.endpoint,
-                    file=str(raw_file.path),
+                    file=raw_file.uri,
                 )
             )
 
@@ -239,7 +291,7 @@ class ValidationRunner:
             "file_validated",
             extra={
                 "endpoint": raw_file.endpoint,
-                "path": str(raw_file.path),
+                "path": raw_file.uri,
                 "records": len(records),
                 **raw_file.partition,
             },
@@ -281,6 +333,10 @@ class ValidationRunner:
         Falling back to ``None`` lets the coverage rule work from the files
         on disk, which is all we can know without a manifest.
         """
+        if self._scope.is_session:
+            # A session job answers for its own session, whatever else the
+            # manifest or the catalogue list.
+            return [self._scope.session_key]
         if self._manifest is None:
             return None
         processed = self._manifest.sessions_processed
@@ -374,6 +430,7 @@ class ValidationRunner:
             "max_records_per_file": self._config.max_records_per_file,
             "use_manifest": self._config.use_manifest,
             "enabled_rules": list(self._config.enabled_rules),
+            "storage": self._store.describe(),
         }
 
 
@@ -391,7 +448,11 @@ class _FileOutcome:
 def main() -> None:
     """Entry point for ``python -m f1_race_intelligence.validation.runner``."""
     settings = load_settings()
-    configure_logging(level=settings.logging.level, json_format=settings.logging.json_format)
+    configure_logging(
+        level=settings.logging.level,
+        json_format=settings.logging.json_format,
+        file_path=settings.logging.file_path,
+    )
 
     report = ValidationRunner(settings).run()
     summary = report.summary()

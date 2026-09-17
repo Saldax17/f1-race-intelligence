@@ -17,6 +17,8 @@ import pandas as pd
 
 from f1_race_intelligence.features import selection
 from f1_race_intelligence.features.selection import TARGET_COLUMN
+from f1_race_intelligence.storage.layout import Layer
+from f1_race_intelligence.storage.store import DataStore
 
 
 @dataclass
@@ -46,12 +48,24 @@ class LoadedDataset:
 class FeatureDatasetLoader:
     """Finds and reads the Parquet files written by M5."""
 
-    def __init__(self, input_path: Union[str, Path] = "data/features/lap_features") -> None:
-        self._input_path = Path(input_path)
+    def __init__(
+        self,
+        input_path: Union[str, Path] = "data/features/lap_features",
+        *,
+        store: Optional[DataStore] = None,
+    ) -> None:
+        self._configured = str(input_path)
+        self._store = store or DataStore.local()
+        self._root = self._store.root(Layer.FEATURES, self._configured)
 
     @property
     def input_path(self) -> Path:
-        return self._input_path
+        """The configured root, as a path. Prefer :attr:`location` for display."""
+        return Path(self._configured)
+
+    @property
+    def location(self) -> str:
+        return self._store.backend.uri(self._root)
 
     def load(
         self,
@@ -65,11 +79,16 @@ class FeatureDatasetLoader:
         purpose; dropping it is a modelling decision, made once, in the
         open.
         """
-        files = sorted(self._input_path.rglob("session_*.parquet")) if self._input_path.is_dir() else []
+        backend, layout = self._store.backend, self._store.layout
+        files = [
+            key
+            for key in backend.list(layout.session_dataset_listing_prefix(self._root))
+            if layout.parse_session_dataset_key(self._root, key) is not None
+        ]
         if not files:
             return LoadedDataset(frame=_empty_frame())
 
-        frames = [pd.read_parquet(path, engine="pyarrow") for path in files]
+        frames = [backend.read_parquet(key) for key in files]
         combined = pd.concat(frames, ignore_index=True)
 
         if years:
@@ -90,7 +109,7 @@ class FeatureDatasetLoader:
             rows_in=rows_in,
             rows_without_target=rows_in - len(modelling),
             sessions=int(modelling["session_key"].nunique()) if not modelling.empty else 0,
-            files=[str(path) for path in files],
+            files=[backend.uri(key) for key in files],
         )
 
 

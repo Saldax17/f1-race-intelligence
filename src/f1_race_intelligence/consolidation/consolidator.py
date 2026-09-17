@@ -279,7 +279,7 @@ class SessionConsolidator:
                 totals["files_unreadable"] += 1
                 logger.error(
                     "car_data_file_unreadable",
-                    extra={"path": str(raw_file.path), "error": str(exc), "session_key": sources.session_key},
+                    extra={"path": raw_file.uri, "error": str(exc), "session_key": sources.session_key},
                 )
                 continue
 

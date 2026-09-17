@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 try:
     from dotenv import load_dotenv
@@ -64,10 +64,56 @@ class OpenF1Settings(BaseModel):
 
 
 class LoggingSettings(BaseModel):
-    """Logging configuration."""
+    """Logging configuration.
+
+    Logs always go to stdout, which is what a container runtime collects.
+    ``file_path`` adds a local log file for development; nothing in the
+    pipeline depends on it existing.
+    """
 
     level: str = "INFO"
     json_format: bool = True
+    file_path: Optional[str] = None
+
+
+class StorageSettings(BaseModel):
+    """Where the pipeline's data lives.
+
+    Credentials never belong here. On AWS the S3 client resolves them from
+    the IAM role of the task or job running the container; locally, from
+    the standard AWS credential chain.
+    """
+
+    backend: Literal["local", "s3"] = "local"
+    """``local`` writes files; ``s3`` writes objects to ``bucket``."""
+
+    layout: Literal["auto", "legacy", "lake"] = "auto"
+    """Which path contract to use (see :mod:`f1_race_intelligence.storage.layout`).
+
+    ``auto`` keeps the historical tree (``legacy``) on local storage and uses
+    the data lake contract (``lake``) on S3. The legacy layout honours the
+    per-stage paths below; the lake layout has fixed layer names.
+    """
+
+    local_root: Optional[str] = None
+    """Directory local keys are resolved against. Defaults to the working
+    directory for the legacy layout and to ``data/lake`` for the lake layout."""
+
+    bucket: Optional[str] = None
+    prefix: str = ""
+    """Key prefix inside the bucket, so one bucket can hold several environments."""
+
+    region: Optional[str] = None
+    endpoint_url: Optional[str] = None
+    """Only for S3-compatible endpoints such as LocalStack or MinIO."""
+
+    @model_validator(mode="after")
+    def _s3_needs_a_bucket(self) -> "StorageSettings":
+        if self.backend == "s3" and not self.bucket:
+            raise ValueError("storage.backend is 's3' but storage.bucket is empty (set F1_STORAGE_BUCKET)")
+        if self.bucket and ("/" in self.bucket or self.bucket.startswith("s3:")):
+            raise ValueError(f"storage.bucket must be a bare bucket name, got {self.bucket!r}")
+        return self
 
 
 class HistoricalExtractionSettings(BaseModel):
@@ -284,6 +330,12 @@ class ModelingSettings(BaseModel):
 class AppSettings(BaseModel):
     """Top-level application settings."""
 
+    environment: Literal["local", "aws"] = "local"
+    """Where the pipeline runs. ``aws`` loads ``config.aws.yaml`` on top of the
+    base file and requires S3 storage, because a container's disk does not
+    outlive the job."""
+
+    storage: StorageSettings = Field(default_factory=StorageSettings)
     openf1: OpenF1Settings = Field(default_factory=OpenF1Settings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     historical_extraction: HistoricalExtractionSettings = Field(default_factory=HistoricalExtractionSettings)
@@ -292,9 +344,41 @@ class AppSettings(BaseModel):
     features: FeatureSettings = Field(default_factory=FeatureSettings)
     modeling: ModelingSettings = Field(default_factory=ModelingSettings)
 
+    @model_validator(mode="after")
+    def _aws_runs_on_object_storage(self) -> "AppSettings":
+        if self.environment == "aws" and self.storage.backend != "s3":
+            raise ValueError("environment 'aws' requires storage.backend 's3'")
+        return self
+
 
 # src/f1_race_intelligence/config/settings.py -> parents[3] is the repo root.
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "configs" / "config.yaml"
+
+
+_TRUE_VALUES = {"1", "true", "yes"}
+
+
+def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str, Any]:
+    """Merge ``overlay`` into ``base``: nested sections merge, everything else is replaced."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def overlay_path(config_path: Path, environment: str) -> Path:
+    """``configs/config.yaml`` + ``aws`` -> ``configs/config.aws.yaml``."""
+    return config_path.with_name(f"{config_path.stem}.{environment}{config_path.suffix}")
 
 
 def _apply_env_overrides(raw: dict) -> dict:
@@ -321,12 +405,31 @@ def _apply_env_overrides(raw: dict) -> dict:
     if log_level := os.getenv("LOG_LEVEL"):
         logging_cfg["level"] = log_level
 
+    if log_file := os.getenv("F1_LOG_FILE"):
+        logging_cfg["file_path"] = log_file
+
+    if environment := os.getenv("F1_ENVIRONMENT"):
+        raw["environment"] = environment.strip().lower()
+
+    storage = raw.setdefault("storage", {})
+    for variable, key in (
+        ("F1_STORAGE_BACKEND", "backend"),
+        ("F1_STORAGE_LAYOUT", "layout"),
+        ("F1_STORAGE_LOCAL_ROOT", "local_root"),
+        ("F1_STORAGE_BUCKET", "bucket"),
+        ("F1_STORAGE_PREFIX", "prefix"),
+        ("F1_STORAGE_REGION", "region"),
+        ("F1_STORAGE_ENDPOINT_URL", "endpoint_url"),
+    ):
+        if (value := os.getenv(variable)) and value.strip():
+            storage[key] = value.strip()
+
     extraction = raw.setdefault("historical_extraction", {})
     if years := os.getenv("F1_EXTRACTION_YEARS"):
         extraction["years"] = [int(year) for year in years.split(",") if year.strip()]
 
     if overwrite := os.getenv("F1_EXTRACTION_OVERWRITE"):
-        extraction["overwrite"] = overwrite.strip().lower() in {"1", "true", "yes"}
+        extraction["overwrite"] = overwrite.strip().lower() in _TRUE_VALUES
 
     if output_path := os.getenv("F1_EXTRACTION_OUTPUT_PATH"):
         extraction["output_path"] = output_path
@@ -339,18 +442,30 @@ def _apply_env_overrides(raw: dict) -> dict:
         validation["max_records_per_file"] = int(max_records)
 
     if fail_on_error := os.getenv("F1_VALIDATION_FAIL_ON_ERROR"):
-        validation["fail_on_error"] = fail_on_error.strip().lower() in {"1", "true", "yes"}
+        validation["fail_on_error"] = fail_on_error.strip().lower() in _TRUE_VALUES
 
     return raw
 
 
-def load_settings(config_path: Optional[Union[str, Path]] = None) -> AppSettings:
+def load_settings(
+    config_path: Optional[Union[str, Path]] = None,
+    *,
+    overrides: Optional[Mapping[str, Any]] = None,
+) -> AppSettings:
     """Load and validate application settings.
+
+    Layers, lowest priority first: model defaults, the base YAML file, the
+    environment overlay (``config.<environment>.yaml`` next to it, when the
+    environment is not ``local`` and that file exists), environment
+    variables, and finally ``overrides`` — which is how a command-line flag
+    wins over everything else.
 
     Args:
         config_path: Optional explicit path to a YAML config file. If not
             given, uses ``F1_CONFIG_PATH`` if set, otherwise
             ``configs/config.yaml`` at the repo root.
+        overrides: Nested values applied last, e.g.
+            ``{"storage": {"backend": "s3", "bucket": "my-bucket"}}``.
 
     Returns:
         A validated :class:`AppSettings` instance.
@@ -359,11 +474,15 @@ def load_settings(config_path: Optional[Union[str, Path]] = None) -> AppSettings
         load_dotenv()
 
     path = Path(config_path) if config_path else Path(os.getenv("F1_CONFIG_PATH", DEFAULT_CONFIG_PATH))
+    raw = _read_yaml(path)
 
-    raw: dict = {}
-    if path.exists():
-        with path.open("r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+    # The environment decides which overlay to read, so resolve it first.
+    environment = (overrides or {}).get("environment") or os.getenv("F1_ENVIRONMENT") or raw.get("environment") or "local"
+    environment = str(environment).strip().lower()
+    if environment != "local":
+        raw = _deep_merge(raw, _read_yaml(overlay_path(path, environment)))
 
     raw = _apply_env_overrides(raw)
+    if overrides:
+        raw = _deep_merge(raw, overrides)
     return AppSettings.model_validate(raw)

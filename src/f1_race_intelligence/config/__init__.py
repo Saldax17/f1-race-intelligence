@@ -10,6 +10,7 @@ from f1_race_intelligence.config.settings import (
     OpenF1Settings,
     RateLimitSettings,
     RetrySettings,
+    StorageSettings,
     TimeoutSettings,
     ValidationSettings,
     load_settings,
@@ -26,6 +27,7 @@ __all__ = [
     "OpenF1Settings",
     "RateLimitSettings",
     "RetrySettings",
+    "StorageSettings",
     "TimeoutSettings",
     "load_settings",
 ]

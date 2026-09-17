@@ -7,13 +7,20 @@ never replacing an earlier one.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from f1_race_intelligence.modeling.models import ModelingReport
-from f1_race_intelligence.utils.files import write_json_unique
+from f1_race_intelligence.storage.backends.base import StorageBackend
+from f1_race_intelligence.storage.backends.local import LocalStorageBackend
 
 
-def save_report(report: ModelingReport, directory: Union[str, Path]) -> Path:
-    """Write the report as JSON and return its path."""
+def save_report(
+    report: ModelingReport,
+    directory: Union[str, Path],
+    *,
+    backend: Optional[StorageBackend] = None,
+) -> Union[Path, str]:
+    """Write the report as JSON and return where it went."""
+    backend = backend or LocalStorageBackend()
     stem = f"modeling_report_{report.started_at.strftime('%Y%m%dT%H%M%S%f')}Z"
-    return write_json_unique(directory, stem, report.to_dict())
+    return backend.location(backend.write_json_unique(str(directory), stem, report.to_dict()))
