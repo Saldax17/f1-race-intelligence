@@ -1,0 +1,175 @@
+{
+  "Comment": "F1 Race Intelligence pipeline orchestration (${Environment}). Input: the OpenF1 availability checker result. M2-M6 are placeholders (Pass states) until the batch jobs are deployed; with PipelineEnabled=false they are never reached.",
+  "StartAt": "LoadContext",
+  "States": {
+    "LoadContext": {
+      "Type": "Pass",
+      "Comment": "Keep the availability verdict and the deployment switches side by side.",
+      "Parameters": {
+        "availability.$": "$",
+        "config": {
+          "environment": "${Environment}",
+          "pipeline_enabled": "${PipelineEnabled}",
+          "data_bucket": "${DataBucketName}"
+        },
+        "execution_id.$": "$$.Execution.Id"
+      },
+      "Next": "IsAvailabilityResultValid"
+    },
+    "IsAvailabilityResultValid": {
+      "Type": "Choice",
+      "Comment": "An execution started by hand or by a malformed event must not be mistaken for 'unavailable'.",
+      "Choices": [
+        {
+          "Variable": "$.availability.available",
+          "IsBoolean": true,
+          "Next": "IsOpenF1Available"
+        }
+      ],
+      "Default": "InvalidAvailabilityResult"
+    },
+    "InvalidAvailabilityResult": {
+      "Type": "Fail",
+      "Error": "InvalidAvailabilityResult",
+      "Cause": "The execution input does not contain a boolean 'available' field produced by the OpenF1 availability checker."
+    },
+    "IsOpenF1Available": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.availability.available",
+          "BooleanEquals": true,
+          "Next": "IsPipelineEnabled"
+        }
+      ],
+      "Default": "OpenF1Unavailable"
+    },
+    "OpenF1Unavailable": {
+      "Type": "Succeed",
+      "Comment": "Expected outcome (live-session restriction, rate limit, OpenF1 error): end cleanly, run nothing, try again at the next scheduled check."
+    },
+    "IsPipelineEnabled": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.config.pipeline_enabled",
+          "StringEquals": "true",
+          "Next": "PlanSessions"
+        }
+      ],
+      "Default": "PipelineDisabled"
+    },
+    "PipelineDisabled": {
+      "Type": "Succeed",
+      "Comment": "OpenF1 is available but the data-processing jobs are not enabled in this deployment (PipelineEnabled=false)."
+    },
+    "PlanSessions": {
+      "Type": "Pass",
+      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) of the batch image with '--stage plan --plan-output', reading the session work units from S3. Until then it yields no sessions, so nothing downstream does any work.",
+      "Result": {
+        "stage": "plan",
+        "status": "not_implemented",
+        "sessions": []
+      },
+      "ResultPath": "$.plan",
+      "Next": "PerSessionPipeline",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ]
+    },
+    "PerSessionPipeline": {
+      "Type": "Map",
+      "Comment": "One iteration per session: M2 -> M3 -> M4 -> M5. MaxConcurrency stays low because every M2 shares OpenF1's per-client rate limit.",
+      "ItemsPath": "$.plan.sessions",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "session.$": "$$.Map.Item.Value",
+        "data_bucket.$": "$.config.data_bucket",
+        "environment.$": "$.config.environment"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "M2_Extraction",
+        "States": {
+          "M2_Extraction": {
+            "Type": "Pass",
+            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m2 --year <y> --meeting-key <m> --session-key <s>'. Retry on task failure (exit code 1 is retryable).",
+            "Result": {"stage": "m2", "status": "not_implemented"},
+            "ResultPath": "$.m2",
+            "Next": "M3_Validation"
+          },
+          "M3_Validation": {
+            "Type": "Pass",
+            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m3' for the same session.",
+            "Result": {"stage": "m3", "status": "not_implemented"},
+            "ResultPath": "$.m3",
+            "Next": "M4_Consolidation"
+          },
+          "M4_Consolidation": {
+            "Type": "Pass",
+            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m4' for the same session.",
+            "Result": {"stage": "m4", "status": "not_implemented"},
+            "ResultPath": "$.m4",
+            "Next": "M5_Features"
+          },
+          "M5_Features": {
+            "Type": "Pass",
+            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m5' for the same session.",
+            "Result": {"stage": "m5", "status": "not_implemented"},
+            "ResultPath": "$.m5",
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.sessions",
+      "Next": "M6_ModelingDataset",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ]
+    },
+    "M6_ModelingDataset": {
+      "Type": "Pass",
+      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m6' once every session has been processed (global batch: the temporal split needs the whole history).",
+      "Result": {"stage": "m6", "status": "not_implemented"},
+      "ResultPath": "$.m6",
+      "Next": "PipelineSucceeded",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ]
+    },
+    "PipelineSucceeded": {
+      "Type": "Succeed"
+    },
+    "NotifyPipelineFailure": {
+      "Type": "Task",
+      "Comment": "Critical: a pipeline stage failed after its retries.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "[${Environment}] F1 Race Intelligence pipeline failed",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": "$.notification",
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "A pipeline stage failed; details were published to the alert topic."
+    }
+  }
+}
