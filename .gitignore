@@ -35,6 +35,17 @@ data/consolidation/*
 !data/consolidation/.gitkeep
 data/modeling/*
 !data/modeling/.gitkeep
+# Local rehearsal of the S3 data lake layout, and ad-hoc run outputs
+data/lake/
+data/smoke/
+
+# Development log files (logs always go to stdout as well)
+logs/
+*.log
+
+# Cloud credentials must never be committed
+.aws/
+*.pem
 
 # IDE
 .vscode/
@@ -42,3 +53,6 @@ data/modeling/*
 
 # Stray PowerShell cache (created accidentally in this directory)
 /Microsoft/
+
+# SAM build output
+.aws-sam/

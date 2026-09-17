@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from f1_race_intelligence.validation.models import RuleStatus, Severity, ValidationResult
 from f1_race_intelligence.validation.specs import EndpointSpec, FieldSpec
@@ -294,7 +294,7 @@ class FileContext:
     """One raw file, ready to be validated."""
 
     endpoint: str
-    path: Path
+    path: Union[str, Path]
     partition: Mapping[str, Any]
     spec: Optional[EndpointSpec]
     records: Sequence[Any]

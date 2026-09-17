@@ -1,0 +1,785 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  F1 Race Intelligence - base infrastructure and availability-gated orchestration.
+  Creates the data lake bucket, the OpenF1 availability checker, the pipeline state
+  machine (M2-M6 as placeholders), alerting, logs, ECR and least-privilege IAM roles.
+  It does not run any extraction, train or deploy any model.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Project }
+        Parameters: [ProjectName, Environment]
+      - Label: { default: Storage }
+        Parameters: [S3BucketName, NoncurrentVersionExpirationDays]
+      - Label: { default: Orchestration }
+        Parameters: [AvailabilitySchedule, AvailabilityScheduleState, PipelineEnabled, OpenF1BaseUrl]
+      - Label: { default: Observability }
+        Parameters: [LogRetentionDays, AlertEmail]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: f1-race-intelligence
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+    ConstraintDescription: 3-25 characters, lowercase letters, digits and hyphens, starting with a letter.
+    Description: Prefix for resource names and the Project tag.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment; part of every resource name.
+
+  S3BucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Empty, or a valid S3 bucket name.
+    Description: >-
+      Name of the data lake bucket. Leave empty to use
+      <ProjectName>-<Environment>-<AccountId>-<Region>, which is globally unique.
+
+  NoncurrentVersionExpirationDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 3650
+    Description: Days an overwritten or deleted object version is kept before it expires.
+
+  AvailabilitySchedule:
+    Type: String
+    Default: rate(15 minutes)
+    AllowedValues:
+      - rate(15 minutes)
+      - rate(30 minutes)
+      - rate(1 hour)
+      - rate(3 hours)
+      - rate(6 hours)
+      - rate(12 hours)
+      - rate(1 day)
+    Description: >-
+      How often the OpenF1 availability checker runs. Limited to non-aggressive
+      frequencies on purpose: the check itself is one request, but OpenF1 is a shared
+      public API.
+
+  AvailabilityScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Turn the periodic availability check on or off without deleting it.
+
+  PipelineEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether an available OpenF1 lets the state machine continue into M2-M6. Keep
+      "false" until the batch jobs are deployed and verified; today M2-M6 are
+      placeholders either way.
+
+  OpenF1BaseUrl:
+    Type: String
+    Default: https://api.openf1.org/v1
+    AllowedPattern: "^https://.+[^/]$"
+    Description: OpenF1 API base URL (HTTPS, no trailing slash).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention of every CloudWatch log group created by this stack.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Optional e-mail subscribed to critical alerts (must be confirmed from the inbox).
+
+Conditions:
+  UseGeneratedBucketName: !Equals [!Ref S3BucketName, ""]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 128
+    Timeout: 15
+    Tags:
+      Project: !Ref ProjectName
+      Environment: !Ref Environment
+      ManagedBy: sam
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Storage: the data lake
+  # ---------------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    # Data outlives the stack: deleting the stack must never delete the lake.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - UseGeneratedBucketName
+        - !Sub "${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}"
+        - !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionExpirationDays
+          - Id: remove-expired-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+          # Raw OpenF1 responses are rarely read after consolidation but are the
+          # expensive part to rebuild: keep them, let S3 tier them by access.
+          - Id: raw-intelligent-tiering
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+          - Id: manifests-intelligent-tiering
+            Status: Enabled
+            Prefix: manifests/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 90
+          # Reserved prefix for run logs: operational data, not a dataset.
+          - Id: expire-logs
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 365
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+        - { Key: DataClassification, Value: public-source-derived }
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # Container registry for the batch image (M2-M6)
+  # ---------------------------------------------------------------------------
+  PipelineImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-${Environment}-pipeline"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7},
+                "action": {"type": "expire"}
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the 30 most recent images",
+                "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+                "action": {"type": "expire"}
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  # ---------------------------------------------------------------------------
+  # Alerting
+  # ---------------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-critical-alerts"
+      DisplayName: !Sub "F1 Race Intelligence ${Environment} alerts"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarmsFromThisAccount
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------------------
+  # Log groups (created explicitly so retention is always applied)
+  # ---------------------------------------------------------------------------
+  AvailabilityCheckerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-openf1-availability"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # The /aws/vendedlogs/ prefix keeps Step Functions from growing the
+      # account-wide CloudWatch Logs resource policy.
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ProjectName}-${Environment}-pipeline"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DataProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # For the future M2-M6 container tasks.
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-pipeline"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---------------------------------------------------------------------------
+  # IAM (least privilege, one role per responsibility)
+  # ---------------------------------------------------------------------------
+  AvailabilityCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-availability-lambda"
+      Description: Execution role of the OpenF1 availability checker. No S3 access.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: write-own-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${AvailabilityCheckerLogGroup.Arn}"
+        - PolicyName: publish-invocation-results
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OnSuccessDestination
+                Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt OrchestrationEventBus.Arn
+              - Sid: OnFailureDestination
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-pipeline-states"
+      Description: >-
+        Execution role of the pipeline state machine. Today it can only publish alerts and
+        write its logs; ECS RunTask and PassRole are added when the M2-M6 jobs exist.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: publish-critical-alerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+        - PolicyName: deliver-execution-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Step Functions log delivery is configured through these
+              # account-level APIs, which do not support resource-level
+              # permissions (AWS documents Resource "*").
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  AvailabilityResultRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-availability-to-states"
+      Description: Lets EventBridge start the pipeline state machine with an availability result.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref PipelineStateMachine
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # Future data-processing roles (M2-M6 container tasks). Created now so their
+  # permissions are reviewed together with the rest; nothing assumes them yet.
+  DataProcessingTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-data-processing"
+      Description: >-
+        Future task role of the M2-M6 batch jobs: read/write the pipeline prefixes of the
+        data lake. No delete, no access to models/.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: data-lake-pipeline-prefixes
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Deliberately not narrowed with an s3:prefix condition. Without
+              # ListBucket on the bucket, HeadObject/GetObject on a missing key
+              # return 403 instead of 404, and the pipeline's idempotency
+              # checks ("does this file already exist?") would fail. HeadObject
+              # requests carry no s3:prefix, so a prefix condition cannot grant
+              # it. Listing exposes key names of this project bucket only.
+              - Sid: ListProjectBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: ReadWritePipelineObjects
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - !Sub "${DataBucket.Arn}/raw/*"
+                  - !Sub "${DataBucket.Arn}/validated/*"
+                  - !Sub "${DataBucket.Arn}/consolidated/*"
+                  - !Sub "${DataBucket.Arn}/features/*"
+                  - !Sub "${DataBucket.Arn}/modeling/*"
+                  - !Sub "${DataBucket.Arn}/manifests/*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DataProcessingExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-data-processing-exec"
+      Description: Future ECS task execution role - pull the pipeline image and write container logs.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: pull-pipeline-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"  # this action has no resource-level permissions
+              - Sid: PullImage
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: !GetAtt PipelineImageRepository.Arn
+        - PolicyName: write-container-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${DataProcessingLogGroup.Arn}"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---------------------------------------------------------------------------
+  # Availability checker
+  # ---------------------------------------------------------------------------
+  AvailabilityCheckerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: AvailabilityCheckerLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-openf1-availability"
+      Description: Probes a lightweight historical OpenF1 endpoint and returns a structured availability verdict.
+      CodeUri: functions/availability_checker/
+      Handler: app.handler
+      Role: !GetAtt AvailabilityCheckerRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          OPENF1_BASE_URL: !Ref OpenF1BaseUrl
+          OPENF1_PROBE_PATH: /sessions?session_key=7953
+          OPENF1_TIMEOUT_SECONDS: "5"
+          METRICS_NAMESPACE: !Sub "${ProjectName}/${Environment}"
+      EventInvokeConfig:
+        # A missed check is harmless (the next one is minutes away); retrying
+        # would only add load on OpenF1.
+        MaximumRetryAttempts: 0
+        MaximumEventAgeInSeconds: 900
+        DestinationConfig:
+          OnSuccess:
+            Type: EventBridge
+            Destination: !GetAtt OrchestrationEventBus.Arn
+          OnFailure:
+            Type: SNS
+            Destination: !Ref AlertTopic
+
+  AvailabilityScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-openf1-availability-schedule"
+      Description: Periodically checks whether historical OpenF1 data can be requested.
+      ScheduleExpression: !Ref AvailabilitySchedule
+      State: !Ref AvailabilityScheduleState
+      Targets:
+        - Id: availability-checker
+          Arn: !GetAtt AvailabilityCheckerFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 600
+
+  AvailabilityScheduleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AvailabilityCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AvailabilityScheduleRule.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Availability result -> pipeline
+  # ---------------------------------------------------------------------------
+  OrchestrationEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-orchestration"
+
+  AvailabilityResultRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-availability-result"
+      Description: >-
+        Every successful availability check starts the pipeline state machine with the
+        checker's JSON result; the state machine decides whether anything runs.
+      EventBusName: !Ref OrchestrationEventBus
+      EventPattern:
+        source: [lambda]
+        detail-type: [Lambda Function Invocation Result - Success]
+        resources:
+          - prefix: !GetAtt AvailabilityCheckerFunction.Arn
+      State: ENABLED
+      Targets:
+        - Id: pipeline-state-machine
+          Arn: !Ref PipelineStateMachine
+          RoleArn: !GetAtt AvailabilityResultRuleRole.Arn
+          InputPath: $.detail.responsePayload
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAgeInSeconds: 900
+
+  # ---------------------------------------------------------------------------
+  # Pipeline orchestration
+  # ---------------------------------------------------------------------------
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-pipeline"
+      Type: STANDARD
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        Environment: !Ref Environment
+        PipelineEnabled: !Ref PipelineEnabled
+        DataBucketName: !Ref DataBucket
+        AlertTopicArn: !Ref AlertTopic
+      Role: !GetAtt PipelineStateMachineRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineStateMachineLogGroup.Arn
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: sam
+
+  # ---------------------------------------------------------------------------
+  # Alarms on critical infrastructure failures
+  # ---------------------------------------------------------------------------
+  AvailabilityCheckerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-availability-checker-errors"
+      AlarmDescription: The availability checker crashed or timed out (HTTP problems are not errors).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref AvailabilityCheckerFunction }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  PipelineExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-pipeline-executions-failed"
+      AlarmDescription: A pipeline state machine execution failed, timed out or was aborted.
+      Metrics:
+        - Id: failed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsFailed
+              Dimensions:
+                - { Name: StateMachineArn, Value: !Ref PipelineStateMachine }
+            Period: 3600
+            Stat: Sum
+        - Id: timedout
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsTimedOut
+              Dimensions:
+                - { Name: StateMachineArn, Value: !Ref PipelineStateMachine }
+            Period: 3600
+            Stat: Sum
+        - Id: aborted
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsAborted
+              Dimensions:
+                - { Name: StateMachineArn, Value: !Ref PipelineStateMachine }
+            Period: 3600
+            Stat: Sum
+        - Id: total
+          Expression: FILL(failed, 0) + FILL(timedout, 0) + FILL(aborted, 0)
+          Label: Unsuccessful executions
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OrchestrationRulesFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-orchestration-rules-failed"
+      AlarmDescription: EventBridge could not invoke the availability checker or start the state machine.
+      Metrics:
+        - Id: schedule
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Events
+              MetricName: FailedInvocations
+              Dimensions:
+                - { Name: RuleName, Value: !Ref AvailabilityScheduleRule }
+            Period: 3600
+            Stat: Sum
+        - Id: result
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Events
+              MetricName: FailedInvocations
+              Dimensions:
+                - { Name: EventBusName, Value: !Ref OrchestrationEventBus }
+                - { Name: RuleName, Value: !Select [1, !Split ["|", !Ref AvailabilityResultRule]] }
+            Period: 3600
+            Stat: Sum
+        - Id: total
+          Expression: FILL(schedule, 0) + FILL(result, 0)
+          Label: Failed rule invocations
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OpenF1UnavailableSustainedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-openf1-unavailable-sustained"
+      AlarmDescription: >-
+        Every availability check in the last 6 hours reported OpenF1 as unavailable.
+        Short outages (live sessions, rate limits) are expected and do not alarm.
+      Namespace: !Sub "${ProjectName}/${Environment}"
+      MetricName: OpenF1Available
+      Dimensions:
+        - { Name: Environment, Value: !Ref Environment }
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 6
+      DatapointsToAlarm: 6
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+Outputs:
+  DataBucketName:
+    Description: Data lake bucket (raw/, validated/, consolidated/, features/, modeling/, models/, manifests/).
+    Value: !Ref DataBucket
+    Export: { Name: !Sub "${AWS::StackName}-DataBucketName" }
+  AvailabilityCheckerFunctionArn:
+    Description: OpenF1 availability checker Lambda ARN.
+    Value: !GetAtt AvailabilityCheckerFunction.Arn
+    Export: { Name: !Sub "${AWS::StackName}-AvailabilityCheckerFunctionArn" }
+  PipelineStateMachineArn:
+    Description: Pipeline state machine ARN (STANDARD).
+    Value: !Ref PipelineStateMachine
+    Export: { Name: !Sub "${AWS::StackName}-PipelineStateMachineArn" }
+  AvailabilityScheduleRuleName:
+    Description: EventBridge scheduled rule that runs the availability checker.
+    Value: !Ref AvailabilityScheduleRule
+  AvailabilityResultRuleName:
+    Description: EventBridge rule (on the orchestration bus) that starts the state machine.
+    Value: !Select [1, !Split ["|", !Ref AvailabilityResultRule]]
+  OrchestrationEventBusName:
+    Description: Custom event bus receiving availability results.
+    Value: !Ref OrchestrationEventBus
+  AlertTopicArn:
+    Description: SNS topic for critical infrastructure alerts.
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub "${AWS::StackName}-AlertTopicArn" }
+  PipelineImageRepositoryUri:
+    Description: ECR repository for the M2-M6 batch image.
+    Value: !GetAtt PipelineImageRepository.RepositoryUri
+  DataProcessingTaskRoleArn:
+    Description: Future task role for the M2-M6 container jobs.
+    Value: !GetAtt DataProcessingTaskRole.Arn
+  DataProcessingExecutionRoleArn:
+    Description: Future ECS task execution role (image pull, container logs).
+    Value: !GetAtt DataProcessingExecutionRole.Arn

@@ -9,24 +9,30 @@ each, partitioned by season. That keeps memory bounded, makes re-runs
 idempotent per session, and lets a later stage read one race or all of
 them with the same call.
 
-``data/raw`` is never written to.
+Raw data is read from an input store and the dataset written to an output
+store, which may differ (raw on S3, output on local disk, for instance).
+Given a :class:`~f1_race_intelligence.scope.SessionScope` the run touches
+one session only, which is how it is executed as an independent batch job.
+
+Raw data is never written to.
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import pandas as pd
 
 from f1_race_intelligence.config.settings import AppSettings, load_settings
 from f1_race_intelligence.consolidation.consolidator import SessionConsolidator
 from f1_race_intelligence.consolidation.loaders import SessionLoader
 from f1_race_intelligence.consolidation.models import ConsolidationReport, SessionResult
 from f1_race_intelligence.consolidation.report import save_report
+from f1_race_intelligence.scope import SessionScope
+from f1_race_intelligence.storage.backends.base import key_name
+from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.raw_catalog import RawDataCatalog
+from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -48,10 +54,29 @@ class ConsolidationRunner:
         settings: Optional[AppSettings] = None,
         *,
         catalog: Optional[RawDataCatalog] = None,
+        store: Optional[DataStore] = None,
+        output_store: Optional[DataStore] = None,
+        scope: Optional[SessionScope] = None,
     ) -> None:
+        """Create a runner.
+
+        Args:
+            settings: Application settings; loaded from config when omitted.
+            catalog: Reader over the raw tree; defaults to ``raw_path`` in ``store``.
+            store: Where raw data and validation reports are read from;
+                defaults to the configured ``storage`` section.
+            output_store: Where the dataset and the report are written;
+                defaults to ``store``.
+            scope: Consolidate one session (or season) only. Takes precedence
+                over ``years`` and ``session_keys`` in configuration.
+        """
         self._settings = settings or load_settings()
         self._config = self._settings.consolidation
-        self._catalog = catalog or RawDataCatalog(base_path=self._config.raw_path)
+        self._store = store or (catalog.store if catalog is not None else DataStore.from_settings(self._settings))
+        self._output_store = output_store or self._store
+        self._scope = scope or SessionScope()
+        self._catalog = catalog or RawDataCatalog(base_path=self._config.raw_path, store=self._store)
+        self._output_root = self._output_store.root(Layer.CONSOLIDATED, self._config.output_path)
         self._loader = SessionLoader(self._catalog)
         self._consolidator = SessionConsolidator(
             self._loader,
@@ -68,8 +93,11 @@ class ConsolidationRunner:
         )
 
         sessions = self._loader.discover_sessions(
-            years=list(self._config.years) or None,
-            session_keys=list(self._config.session_keys) or None,
+            years=[self._scope.year] if self._scope.year is not None else (list(self._config.years) or None),
+            session_keys=(
+                [self._scope.session_key] if self._scope.is_session else (list(self._config.session_keys) or None)
+            ),
+            meeting_key=self._scope.meeting_key,
         )
 
         logger.info(
@@ -77,22 +105,22 @@ class ConsolidationRunner:
             extra={
                 "pipeline": PIPELINE_NAME,
                 "sessions": len(sessions),
-                "raw_path": self._config.raw_path,
-                "output_path": self._config.output_path,
+                "raw_path": self._catalog.location,
+                "output_path": self._output_store.backend.uri(self._output_root),
                 "validation_status": report.source_validation.get("status"),
             },
         )
 
         if not self._validation_allows_run(report):
             report.finished_at = datetime.now(timezone.utc)
-            save_report(report, self._config.report_path)
+            self._save_report(report)
             return report
 
         for session_key in sessions:
             self._consolidate_session(session_key, report)
 
         report.finished_at = datetime.now(timezone.utc)
-        report_path = save_report(report, self._config.report_path)
+        report_path = self._save_report(report)
 
         logger.info(
             "consolidation_summary",
@@ -107,17 +135,23 @@ class ConsolidationRunner:
 
     # -- per session ------------------------------------------------------
 
+    def _save_report(self, report: ConsolidationReport):
+        root = self._output_store.root(Layer.CONSOLIDATION_REPORTS, self._config.report_path)
+        return save_report(report, root, backend=self._output_store.backend)
+
     def _consolidate_session(self, session_key: int, report: ConsolidationReport) -> None:
+        backend = self._output_store.backend
         destination = self._destination(session_key)
-        if destination.exists() and not self._config.overwrite:
+        if not self._config.overwrite and backend.exists(destination):
+            location = backend.uri(destination)
             logger.info(
                 "session_skipped",
-                extra={"session_key": session_key, "path": str(destination), "reason": "already consolidated"},
+                extra={"session_key": session_key, "path": location, "reason": "already consolidated"},
             )
-            report.add(SessionResult(session_key=session_key, skipped=True, output_path=str(destination)))
+            report.add(SessionResult(session_key=session_key, skipped=True, output_path=location))
             return
 
-        sources = self._loader.load(session_key)
+        sources = self._loader.load(session_key, year=self._scope.year, meeting_key=self._scope.meeting_key)
         logger.info(
             "session_consolidating",
             extra={
@@ -138,11 +172,8 @@ class ConsolidationRunner:
             return
 
         destination = self._destination(session_key, year=result.year)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(destination, engine="pyarrow", index=False)
-
-        result.output_path = str(destination)
-        result.output_bytes = destination.stat().st_size
+        result.output_bytes = backend.write_parquet(destination, frame)
+        result.output_path = backend.uri(destination)
         report.add(result)
 
         logger.info(
@@ -152,53 +183,83 @@ class ConsolidationRunner:
                 "rows_in": result.rows_in,
                 "rows_out": result.rows_out,
                 "drivers": result.drivers,
-                "path": str(destination),
+                "path": result.output_path,
                 "bytes": result.output_bytes,
                 "duration_seconds": result.duration_seconds,
             },
         )
 
-    def _destination(self, session_key: int, year: Optional[int] = None) -> Path:
-        """Where one session's Parquet file lives.
+    def _destination(self, session_key: int, year: Optional[int] = None) -> str:
+        """Key of one session's Parquet file.
 
-        Seasons are plain directories, not ``year=2023`` — that spelling is
-        Hive partitioning, and pyarrow would then synthesise a ``year``
-        column that collides with the real one stored in the file. The year
-        belongs inside the data, so that a single file read on its own is
-        still traceable.
+        In the local tree seasons are plain directories, not ``year=2023`` —
+        that spelling is Hive partitioning, and pyarrow reading the directory
+        would synthesise a ``year`` column that collides with the real one
+        stored in the file. The lake layout does use ``year=``, and is only
+        ever read file by file through a buffer (see
+        ``StorageBackend.read_parquet``). Either way the year belongs inside
+        the data, so a single file read on its own is still traceable.
         """
-        base = Path(self._config.output_path)
+        layout = self._output_store.layout
         if year is None:
-            existing = sorted(base.glob(f"*/session_{session_key}.parquet"))
-            if existing:
-                return existing[0]
-            return base / f"session_{session_key}.parquet"
-        return base / str(year) / f"session_{session_key}.parquet"
+            if self._scope.year is not None:
+                return layout.session_dataset_key(self._output_root, self._scope.year, session_key)
+            listing = layout.session_dataset_listing_prefix(self._output_root)
+            for key in self._output_store.backend.list(listing):
+                parsed = layout.parse_session_dataset_key(self._output_root, key)
+                if parsed is not None and parsed[1] == session_key and parsed[0] is not None:
+                    return key
+        return layout.session_dataset_key(self._output_root, year, session_key)
 
     # -- validation gate --------------------------------------------------
 
     def _read_validation_status(self) -> Dict[str, Any]:
-        """What the latest validation run concluded about this raw data."""
-        directory = Path(self._config.validation_path)
+        """What the latest relevant validation run concluded about this raw data.
+
+        A session job takes the newest report that covered its session: a
+        full run, or a validation job scoped to that same session. A full
+        run takes the newest full validation. Reports written before scoped
+        runs existed carry no filter and count as full runs.
+        """
+        backend, layout = self._store.backend, self._store.layout
+        root = self._store.root(Layer.VALIDATION_REPORTS, self._config.validation_path)
         status: Dict[str, Any] = {
             "status": None,
             "report": None,
             "require_validation_pass": self._config.require_validation_pass,
         }
-        if not directory.is_dir():
-            return status
 
-        for path in reversed(sorted(directory.glob("validation_report_*.json"))):
-            try:
-                with path.open("r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                continue
-            status["status"] = payload.get("global_status")
-            status["report"] = str(path)
-            status["summary"] = payload.get("summary")
-            break
+        prefixes = [root]
+        if self._scope.is_session:
+            prefixes.insert(0, layout.records_prefix(root, year=self._scope.year, session_key=self._scope.session_key))
+
+        seen = set()
+        for prefix in prefixes:
+            keys = [
+                key
+                for key in backend.list(prefix)
+                if key not in seen and key_name(key).startswith("validation_report_") and key.endswith(".json")
+            ]
+            seen.update(keys)
+            for key in sorted(keys, key=lambda item: (key_name(item), item), reverse=True):
+                try:
+                    payload = backend.read_json(key)
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(payload, dict) or not self._report_applies(payload):
+                    continue
+                status["status"] = payload.get("global_status")
+                status["report"] = backend.uri(key)
+                status["summary"] = payload.get("summary")
+                return status
         return status
+
+    def _report_applies(self, payload: Dict[str, Any]) -> bool:
+        source = payload.get("source")
+        report_filter = source.get("filter") if isinstance(source, dict) else None
+        if not report_filter:
+            return True
+        return self._scope.is_session and report_filter.get("session_key") == self._scope.session_key
 
     def _validation_allows_run(self, report: ConsolidationReport) -> bool:
         """Decide whether to consolidate given the validation verdict."""
@@ -225,7 +286,7 @@ class ConsolidationRunner:
         return False
 
     def _config_snapshot(self) -> Dict[str, Any]:
-        return {
+        snapshot = {
             "raw_path": self._config.raw_path,
             "output_path": self._config.output_path,
             "years": list(self._config.years),
@@ -233,13 +294,22 @@ class ConsolidationRunner:
             "require_validation_pass": self._config.require_validation_pass,
             "weather_tolerance_seconds": self._config.weather_tolerance_seconds,
             "overwrite": self._config.overwrite,
+            "input_storage": self._store.describe(),
+            "output_storage": self._output_store.describe(),
         }
+        if not self._scope.is_empty:
+            snapshot["scope"] = self._scope.to_dict()
+        return snapshot
 
 
 def main() -> None:
     """Entry point for ``python -m f1_race_intelligence.consolidation.runner``."""
     settings = load_settings()
-    configure_logging(level=settings.logging.level, json_format=settings.logging.json_format)
+    configure_logging(
+        level=settings.logging.level,
+        json_format=settings.logging.json_format,
+        file_path=settings.logging.file_path,
+    )
 
     report = ConsolidationRunner(settings).run()
     summary = report.summary()

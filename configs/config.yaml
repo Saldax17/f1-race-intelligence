@@ -1,3 +1,25 @@
+# Where the pipeline runs. "aws" merges config.aws.yaml over this file and
+# requires S3 storage. Override with F1_ENVIRONMENT.
+environment: local
+
+# Where data lives. Credentials never go here: on AWS the S3 client uses the
+# IAM role of the task/job; locally, the standard AWS credential chain.
+# Every key can be overridden with F1_STORAGE_<KEY> (F1_STORAGE_BUCKET, ...).
+storage:
+  # local | s3
+  backend: local
+  # auto | legacy | lake. auto = legacy on local (the per-stage paths below,
+  # exactly as always) and lake on S3 (raw/, validated/, consolidated/, ...).
+  layout: auto
+  # Local directory keys resolve against. null = working directory for the
+  # legacy layout, data/lake for the lake layout.
+  local_root: null
+  bucket: null
+  prefix: ""
+  region: null
+  # Only for S3-compatible endpoints (LocalStack, MinIO).
+  endpoint_url: null
+
 openf1:
   base_url: "https://api.openf1.org/v1"
 
@@ -16,6 +38,8 @@ openf1:
 logging:
   level: "INFO"
   json_format: true
+  # Logs always go to stdout. Optional extra log file for development only.
+  file_path: null
 
 # What the historical extraction pipeline downloads. Change years, session
 # types or endpoints here — never in code.

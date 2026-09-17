@@ -1,0 +1,56 @@
+# SAM CLI defaults per environment. Nothing here is a secret: credentials come
+# from the AWS credential chain (profile/SSO), never from this file.
+#
+#   sam build
+#   sam deploy --config-env dev        # always shows the change set and asks first
+#
+# confirm_changeset stays true on purpose: no deploy happens without a human
+# reading the change set.
+
+version = 0.1
+
+[default.global.parameters]
+beta_features = false
+
+[default.validate.parameters]
+lint = true
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[dev.deploy.parameters]
+stack_name = "f1-race-intelligence-dev"
+region = "us-east-1"
+resolve_s3 = true
+s3_prefix = "f1-race-intelligence-dev"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+parameter_overrides = [
+  "ProjectName=f1-race-intelligence",
+  "Environment=dev",
+  "AvailabilitySchedule=rate(15 minutes)",
+  "AvailabilityScheduleState=ENABLED",
+  "PipelineEnabled=false",
+  "LogRetentionDays=30",
+]
+tags = "Project=f1-race-intelligence Environment=dev ManagedBy=sam"
+
+[prod.deploy.parameters]
+stack_name = "f1-race-intelligence-prod"
+region = "us-east-1"
+resolve_s3 = true
+s3_prefix = "f1-race-intelligence-prod"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+parameter_overrides = [
+  "ProjectName=f1-race-intelligence",
+  "Environment=prod",
+  "AvailabilitySchedule=rate(15 minutes)",
+  "AvailabilityScheduleState=ENABLED",
+  "PipelineEnabled=false",
+  "LogRetentionDays=90",
+]
+tags = "Project=f1-race-intelligence Environment=prod ManagedBy=sam"

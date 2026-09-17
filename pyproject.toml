@@ -28,11 +28,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# S3 storage backend. Optional: local runs never import boto3. Conditional
+# writes (If-None-Match), which keep execution records from overwriting each
+# other on S3, need boto3/botocore 1.35.2 or newer.
+aws = [
+    "boto3>=1.35.2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.14",
     "respx>=0.21",
 ]
+
+[project.scripts]
+f1-pipeline = "f1_race_intelligence.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

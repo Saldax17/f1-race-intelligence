@@ -13,13 +13,16 @@ leak is worse than publishing none.
 M5 learns nothing from the data. No scaling, no imputation, no encoding
 fitted on the rows: anything that estimates parameters belongs inside a
 training pipeline, where it can be fitted on the training split alone.
+
+The consolidated dataset is read from an input store and the features
+written to an output store; a :class:`~f1_race_intelligence.scope.SessionScope`
+restricts the run to one session, the unit a batch job processes.
 """
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -32,6 +35,9 @@ from f1_race_intelligence.features.report import save_report
 from f1_race_intelligence.features.selection import TARGET_COLUMN
 from f1_race_intelligence.features.target import add_target
 from f1_race_intelligence.features.temporal import add_temporal_features, window_settings
+from f1_race_intelligence.scope import SessionScope
+from f1_race_intelligence.storage.layout import Layer
+from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -55,10 +61,30 @@ class FeatureRunner:
         settings: Optional[AppSettings] = None,
         *,
         loader: Optional[LapDatasetLoader] = None,
+        store: Optional[DataStore] = None,
+        output_store: Optional[DataStore] = None,
+        scope: Optional[SessionScope] = None,
     ) -> None:
+        """Create a runner.
+
+        Args:
+            settings: Application settings; loaded from config when omitted.
+            loader: Reader over the consolidated dataset; defaults to
+                ``input_path`` in ``store``.
+            store: Where the consolidated dataset is read from; defaults to
+                the configured ``storage`` section.
+            output_store: Where features and the report are written;
+                defaults to ``store``.
+            scope: Build one session (or season) only. Takes precedence over
+                ``years`` and ``session_keys`` in configuration.
+        """
         self._settings = settings or load_settings()
         self._config = self._settings.features
-        self._loader = loader or LapDatasetLoader(input_path=self._config.input_path)
+        self._store = store or DataStore.from_settings(self._settings)
+        self._output_store = output_store or self._store
+        self._scope = scope or SessionScope()
+        self._loader = loader or LapDatasetLoader(input_path=self._config.input_path, store=self._store)
+        self._output_root = self._output_store.root(Layer.FEATURES, self._config.output_path)
         self._windows = tuple(self._config.rolling_windows)
 
     def run(self) -> FeatureReport:
@@ -75,15 +101,17 @@ class FeatureRunner:
         )
 
         sessions = self._loader.discover(
-            years=list(self._config.years) or None,
-            session_keys=list(self._config.session_keys) or None,
+            years=[self._scope.year] if self._scope.year is not None else (list(self._config.years) or None),
+            session_keys=(
+                [self._scope.session_key] if self._scope.is_session else (list(self._config.session_keys) or None)
+            ),
         )
         logger.info(
             "feature_engineering_start",
             extra={
                 "pipeline": PIPELINE_NAME,
                 "sessions": len(sessions),
-                "input_path": str(self._loader.input_path),
+                "input_path": self._loader.location,
                 "features": report.features["count"],
                 "windows": list(self._windows),
             },
@@ -99,7 +127,11 @@ class FeatureRunner:
             report.missing_values = self._missing_value_summary(pd.concat(frames, ignore_index=True))
 
         report.finished_at = datetime.now(timezone.utc)
-        report_path = save_report(report, self._config.report_path)
+        report_path = save_report(
+            report,
+            self._output_store.root(Layer.FEATURE_REPORTS, self._config.report_path),
+            backend=self._output_store.backend,
+        )
 
         logger.info(
             "feature_engineering_summary",
@@ -116,9 +148,10 @@ class FeatureRunner:
 
     def _process_session(self, session_file: SessionFile, report: FeatureReport) -> Optional[pd.DataFrame]:
         started = time.monotonic()
+        backend = self._output_store.backend
         destination = self._destination(session_file)
 
-        if destination.exists() and not self._config.overwrite:
+        if not self._config.overwrite and backend.exists(destination):
             logger.info(
                 "session_skipped",
                 extra={"session_key": session_file.session_key, "reason": "features already built"},
@@ -128,7 +161,7 @@ class FeatureRunner:
                     session_key=session_file.session_key,
                     year=session_file.year,
                     skipped=True,
-                    output_path=str(destination),
+                    output_path=backend.uri(destination),
                 )
             )
             return None
@@ -169,10 +202,8 @@ class FeatureRunner:
             report.add(result)
             return None
 
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(destination, engine="pyarrow", index=False)
-        result.output_path = str(destination)
-        result.output_bytes = destination.stat().st_size
+        result.output_bytes = backend.write_parquet(destination, frame)
+        result.output_path = backend.uri(destination)
         report.add(result)
 
         logger.info(
@@ -182,7 +213,7 @@ class FeatureRunner:
                 "rows": result.rows_out,
                 "rows_with_target": result.rows_with_target,
                 "features": len(feature_names),
-                "path": str(destination),
+                "path": result.output_path,
                 "duration_seconds": result.duration_seconds,
             },
         )
@@ -200,11 +231,10 @@ class FeatureRunner:
         selected["has_target"] = selected["has_target"].astype("boolean")
         return selected.sort_values(list(selection.GRAIN), kind="stable").reset_index(drop=True)
 
-    def _destination(self, session_file: SessionFile) -> Path:
-        base = Path(self._config.output_path)
-        if session_file.year is None:
-            return base / f"session_{session_file.session_key}.parquet"
-        return base / str(session_file.year) / f"session_{session_file.session_key}.parquet"
+    def _destination(self, session_file: SessionFile) -> str:
+        return self._output_store.layout.session_dataset_key(
+            self._output_root, session_file.year, session_file.session_key
+        )
 
     # -- report material --------------------------------------------------
 
@@ -255,13 +285,20 @@ class FeatureRunner:
             "years": list(self._config.years),
             "session_keys": list(self._config.session_keys),
             "overwrite": self._config.overwrite,
+            "input_storage": self._store.describe(),
+            "output_storage": self._output_store.describe(),
+            **({"scope": self._scope.to_dict()} if not self._scope.is_empty else {}),
         }
 
 
 def main() -> None:
     """Entry point for ``python -m f1_race_intelligence.features.runner``."""
     settings = load_settings()
-    configure_logging(level=settings.logging.level, json_format=settings.logging.json_format)
+    configure_logging(
+        level=settings.logging.level,
+        json_format=settings.logging.json_format,
+        file_path=settings.logging.file_path,
+    )
 
     report = FeatureRunner(settings).run()
     summary = report.summary()

@@ -18,7 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from f1_race_intelligence.utils.files import write_json_unique
+from f1_race_intelligence.storage.backends.base import StorageBackend
+from f1_race_intelligence.storage.backends.local import LocalStorageBackend
 
 
 class ExtractionStatus(str, Enum):
@@ -133,12 +134,21 @@ class ExecutionManifest:
             "errors": [entry.to_dict() for entry in self.errors],
         }
 
-    def save(self, directory: Union[str, Path]) -> Path:
-        """Write the manifest as JSON and return its path.
+    def save(self, directory: Union[str, Path], *, backend: Optional[StorageBackend] = None) -> Union[Path, str]:
+        """Write the manifest as JSON and return where it went.
 
         Two runs that start within the same clock tick get distinct files:
         an execution record that quietly replaced an earlier one would lose
         the very history this exists to keep.
+
+        Args:
+            directory: Prefix to write under.
+            backend: Storage to write to; local files when omitted.
+
+        Returns:
+            A local path, or a URI on object storage.
         """
+        backend = backend or LocalStorageBackend()
         stem = f"manifest_{self.started_at.strftime('%Y%m%dT%H%M%S%f')}Z"
-        return write_json_unique(directory, stem, self.to_dict())
+        key = backend.write_json_unique(str(directory), stem, self.to_dict())
+        return backend.location(key)

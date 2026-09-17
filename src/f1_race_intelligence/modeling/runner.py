@@ -16,17 +16,18 @@ looking better than it is.
 Nothing is written when a blocking guard fails: a modelling dataset that
 is known to leak is worse than none, because the score it produces is
 believable.
+
+This stage is a single batch over the whole history — the split needs to see
+every race at once — reading features from an input store and writing the
+artifacts to an output store.
 """
 
 from __future__ import annotations
 
-import json
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import joblib
 import pandas as pd
 
 from f1_race_intelligence.config.settings import AppSettings, load_settings
@@ -36,7 +37,9 @@ from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader, feature_
 from f1_race_intelligence.modeling.models import ModelingReport, SplitArtifacts
 from f1_race_intelligence.modeling.report import save_report
 from f1_race_intelligence.modeling.split import SPLITS, TEST, TRAIN, VALIDATION, SplitStrategy
-from f1_race_intelligence.utils.files import write_json_unique
+from f1_race_intelligence.storage.backends.base import join_key
+from f1_race_intelligence.storage.layout import Layer
+from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -61,10 +64,25 @@ class ModelingRunner:
         settings: Optional[AppSettings] = None,
         *,
         loader: Optional[FeatureDatasetLoader] = None,
+        store: Optional[DataStore] = None,
+        output_store: Optional[DataStore] = None,
     ) -> None:
+        """Create a runner.
+
+        Args:
+            settings: Application settings; loaded from config when omitted.
+            loader: Reader over the feature dataset; defaults to
+                ``input_path`` in ``store``.
+            store: Where features are read from; defaults to the configured
+                ``storage`` section.
+            output_store: Where artifacts and the report are written;
+                defaults to ``store``.
+        """
         self._settings = settings or load_settings()
         self._config = self._settings.modeling
-        self._loader = loader or FeatureDatasetLoader(input_path=self._config.input_path)
+        self._store = store or DataStore.from_settings(self._settings)
+        self._output_store = output_store or self._store
+        self._loader = loader or FeatureDatasetLoader(input_path=self._config.input_path, store=self._store)
 
     def run(self) -> ModelingReport:
         """Build the modelling datasets and return the run's report."""
@@ -80,7 +98,7 @@ class ModelingRunner:
             years=list(self._config.years) or None,
             session_keys=list(self._config.session_keys) or None,
         )
-        report.source = {**dataset.to_dict(), "input_path": str(self._loader.input_path)}
+        report.source = {**dataset.to_dict(), "input_path": self._loader.location}
 
         logger.info(
             "modeling_start",
@@ -211,18 +229,18 @@ class ModelingRunner:
         matrix is what a model reads. Keeping both means an odd prediction
         can be traced to a lap without re-running anything.
         """
-        base = Path(self._config.output_path)
+        backend, layout = self._output_store.backend, self._output_store.layout
+        base = self._output_store.root(Layer.MODELING, self._config.output_path)
         artifacts: List[SplitArtifacts] = []
 
         for name in SPLITS:
             frame = splits[name]
-            directory = base / name
-            directory.mkdir(parents=True, exist_ok=True)
+            directory = layout.split_prefix(base, name)
 
-            dataset_path = directory / "dataset.parquet"
-            matrix_path = directory / "features.parquet"
+            dataset_path = join_key(directory, "dataset.parquet")
+            matrix_path = join_key(directory, "features.parquet")
 
-            frame.to_parquet(dataset_path, engine="pyarrow", index=False)
+            bytes_written = backend.write_parquet(dataset_path, frame)
 
             matrix = transformed[name].copy()
             matrix[TARGET_COLUMN] = targets[name].to_numpy() if not frame.empty else pd.Series(dtype="float64")
@@ -234,7 +252,7 @@ class ModelingRunner:
                     matrix[f"{KEY_PREFIX}{column}"] = (
                         frame[column].to_numpy() if not frame.empty else pd.Series(dtype="Int64")
                     )
-            matrix.to_parquet(matrix_path, engine="pyarrow", index=False)
+            bytes_written += backend.write_parquet(matrix_path, matrix)
 
             artifacts.append(
                 SplitArtifacts(
@@ -242,18 +260,17 @@ class ModelingRunner:
                     rows=len(frame),
                     sessions=int(frame["session_key"].nunique()) if not frame.empty else 0,
                     years=sorted({int(y) for y in frame["year"].dropna().unique()}) if not frame.empty else [],
-                    dataset_path=str(dataset_path),
-                    matrix_path=str(matrix_path),
-                    bytes_written=dataset_path.stat().st_size + matrix_path.stat().st_size,
+                    dataset_path=backend.uri(dataset_path),
+                    matrix_path=backend.uri(matrix_path),
+                    bytes_written=bytes_written,
                     missing_before=self._missing_share(frame, report.features["numeric"] + report.features["categorical"]),
                     missing_after=self._missing_share(transformed[name], list(transformed[name].columns)),
                 )
             )
 
-        preprocessing_dir = base / "preprocessing"
-        preprocessing_dir.mkdir(parents=True, exist_ok=True)
-        joblib.dump(preprocessor, preprocessing_dir / PREPROCESSOR_FILE)
-        write_json_unique(
+        preprocessing_dir = layout.preprocessing_prefix(base)
+        backend.write_joblib(join_key(preprocessing_dir, PREPROCESSOR_FILE), preprocessor)
+        backend.write_json_unique(
             preprocessing_dir,
             "feature_schema",
             {
@@ -318,11 +335,17 @@ class ModelingRunner:
             "add_missing_indicators": config.add_missing_indicators,
             "random_seed": config.random_seed,
             "fail_on_leakage": config.fail_on_leakage,
+            "input_storage": self._store.describe(),
+            "output_storage": self._output_store.describe(),
         }
 
     def _finish(self, report: ModelingReport, started: float) -> ModelingReport:
         report.finished_at = datetime.now(timezone.utc)
-        path = save_report(report, self._config.report_path)
+        path = save_report(
+            report,
+            self._output_store.root(Layer.MODELING_REPORTS, self._config.report_path),
+            backend=self._output_store.backend,
+        )
         logger.info(
             "modeling_summary",
             extra={
@@ -339,7 +362,11 @@ class ModelingRunner:
 def main() -> None:
     """Entry point for ``python -m f1_race_intelligence.modeling.runner``."""
     settings = load_settings()
-    configure_logging(level=settings.logging.level, json_format=settings.logging.json_format)
+    configure_logging(
+        level=settings.logging.level,
+        json_format=settings.logging.json_format,
+        file_path=settings.logging.file_path,
+    )
 
     report = ModelingRunner(settings).run()
     summary = report.summary()

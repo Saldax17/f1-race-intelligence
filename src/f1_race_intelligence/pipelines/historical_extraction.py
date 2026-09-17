@@ -15,24 +15,34 @@ The traversal is::
 
     year -> meetings -> sessions -> (filtered by session type) -> endpoints
 
-Every raw file maps to a deterministic path, so a second run with the same
+Every raw file maps to a deterministic key, so a second run with the same
 configuration skips what it already has (unless ``overwrite`` is set) and
 a failure on one session/endpoint never stops the rest of the run.
+
+Besides the full traversal, two entry points exist for batch execution:
+:meth:`HistoricalExtractionPipeline.plan` lists the sessions to extract (one
+work unit each), and :meth:`HistoricalExtractionPipeline.run_session`
+extracts exactly one of them. Session runs are independent, so they can be
+distributed — within the rate limit OpenF1 allows per client.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from f1_race_intelligence.config.settings import AppSettings, load_settings
 from f1_race_intelligence.ingestion.exceptions import OpenF1Error
 from f1_race_intelligence.ingestion.openf1 import F1Client
 from f1_race_intelligence.pipelines.manifest import ExecutionManifest, ExtractionStatus, ManifestEntry
+from f1_race_intelligence.scope import SessionScope
+from f1_race_intelligence.storage.layout import Layer
+from f1_race_intelligence.storage.raw_catalog import RawDataCatalog, RawFileError
 from f1_race_intelligence.storage.raw_storage import RawDataStorage
+from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -96,16 +106,13 @@ def _driver_numbers(context: SessionContext) -> List[int]:
     historical session.
     """
     drivers: Any = None
-    path = context.storage.resolve_path(
-        "drivers", context.partition, file_name=f"session_{context.session_key}.json"
-    )
-    if path.exists():
+    file_name = f"session_{context.session_key}.json"
+    if context.storage.exists("drivers", context.partition, file_name=file_name):
         try:
-            drivers = context.storage.load(
-                "drivers", context.partition, file_name=f"session_{context.session_key}.json"
-            )
+            drivers = context.storage.load("drivers", context.partition, file_name=file_name)
         except (OSError, ValueError):
-            logger.warning("raw_file_unreadable", extra={"endpoint": "drivers", "path": str(path)})
+            location = context.storage.uri("drivers", context.partition, file_name=file_name)
+            logger.warning("raw_file_unreadable", extra={"endpoint": "drivers", "path": location})
             drivers = None
 
     if drivers is None:
@@ -169,6 +176,7 @@ class HistoricalExtractionPipeline:
         *,
         client: Optional[F1Client] = None,
         storage: Optional[RawDataStorage] = None,
+        store: Optional[DataStore] = None,
     ) -> None:
         """Create a pipeline.
 
@@ -177,7 +185,9 @@ class HistoricalExtractionPipeline:
             client: An OpenF1 client. When omitted one is built from
                 ``settings`` and closed by :meth:`close`.
             storage: Raw data storage; defaults to the configured
-                ``output_path``.
+                ``output_path`` in ``store``.
+            store: Where raw files and manifests go; defaults to the
+                configured ``storage`` section.
 
         Raises:
             ValueError: if the configuration names an unknown endpoint. This
@@ -185,9 +195,11 @@ class HistoricalExtractionPipeline:
         """
         self._settings = settings or load_settings()
         self._config = self._settings.historical_extraction
+        self._store = store or (storage.store if storage is not None else DataStore.from_settings(self._settings))
+        self._storage = storage or RawDataStorage(base_path=self._config.output_path, store=self._store)
+        self._manifest_root = self._store.root(Layer.EXTRACTION_MANIFESTS, self._config.manifest_path)
         self._owns_client = client is None
         self._client = client or F1Client(settings=self._settings)
-        self._storage = storage or RawDataStorage(base_path=self._config.output_path)
 
         unknown = [name for name in self._config.endpoints if name not in ENDPOINT_PLANNERS]
         if unknown:
@@ -232,8 +244,127 @@ class HistoricalExtractionPipeline:
         for year in self._config.years:
             self._process_year(year, manifest)
 
+        return self._finish(manifest)
+
+    def run_session(self, year: int, session_key: int, meeting_key: Optional[int] = None) -> ExecutionManifest:
+        """Extract every configured endpoint of one session: the batch unit of work.
+
+        The meeting is taken from the argument, else from a sessions
+        catalogue already in storage (written by :meth:`plan` or an earlier
+        run), and only as a last resort from one ``/sessions`` lookup. The
+        session is extracted even if its type is not in ``session_types``:
+        asking for it by key is an explicit choice, so it is logged, not refused.
+
+        The manifest is written under a per-session prefix on the lake
+        layout, and records the scope in ``config.scope``.
+        """
+        scope = SessionScope(year=year, meeting_key=meeting_key, session_key=session_key)
+        manifest = ExecutionManifest(
+            pipeline_name=PIPELINE_NAME,
+            pipeline_version=PIPELINE_VERSION,
+            config=self._config_snapshot(scope=scope),
+        )
+        logger.info(
+            "pipeline_start",
+            extra={
+                "pipeline": PIPELINE_NAME,
+                "version": PIPELINE_VERSION,
+                "mode": "session",
+                **scope.log_fields(),
+                "endpoints": list(self._config.endpoints),
+                "overwrite": self._config.overwrite,
+            },
+        )
+
+        meeting_key = meeting_key if meeting_key is not None else self._meeting_for_session(year, session_key)
+        if meeting_key is None:
+            self._record_failure(
+                "sessions",
+                {"year": year, "session_key": session_key},
+                LookupError(f"session {session_key} was not found for {year}"),
+                manifest,
+            )
+            return self._finish(manifest, scope=scope)
+
+        manifest.config["scope"]["meeting_key"] = meeting_key
+        manifest.record_meeting(meeting_key)
+        sessions = self.discover_sessions(year, meeting_key, manifest)
+        session = next((item for item in sessions if item.get("session_key") == session_key), None)
+        resolved = SessionScope(year=year, meeting_key=meeting_key, session_key=session_key)
+        if session is None and sessions:
+            # The meeting's catalogue is there and does not list this session:
+            # extracting would file the data under the wrong meeting.
+            self._record_failure(
+                "sessions",
+                {"year": year, "meeting_key": meeting_key, "session_key": session_key},
+                LookupError(f"session {session_key} is not part of meeting {meeting_key} in {year}"),
+                manifest,
+            )
+            return self._finish(manifest, scope=resolved)
+        if session is None:
+            # The catalogue itself could not be fetched (recorded as a failure);
+            # a bare record still lets the endpoints be extracted.
+            session = {"session_key": session_key}
+        elif not self.filter_sessions([session]):
+            logger.warning(
+                "session_outside_configured_types",
+                extra={"year": year, "session_key": session_key, "session_name": session.get("session_name")},
+            )
+
+        self._process_session(year, meeting_key, session, manifest)
+        return self._finish(manifest, scope=resolved)
+
+    def plan(self, years: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:
+        """List the sessions a run would extract, one work unit per session.
+
+        Discovery is the only thing downloaded: the meetings and sessions
+        catalogues, which are persisted (and reused on a re-run) like any
+        other raw data, so the session jobs that follow need no discovery
+        calls of their own. A manifest of the discovery is written too.
+
+        Returns:
+            ``[{"year": …, "meeting_key": …, "session_key": …, "session_name": …}, …]``
+            in a stable order.
+        """
+        years = list(years) if years is not None else list(self._config.years)
+        manifest = ExecutionManifest(
+            pipeline_name=PIPELINE_NAME,
+            pipeline_version=PIPELINE_VERSION,
+            config={**self._config_snapshot(), "years": years, "scope": {"mode": "plan"}},
+        )
+
+        units: List[Dict[str, Any]] = []
+        for year in years:
+            for meeting in self.discover_meetings(year, manifest):
+                meeting_key = meeting.get("meeting_key")
+                if meeting_key is None:
+                    continue
+                manifest.record_meeting(meeting_key)
+                for session in self.filter_sessions(self.discover_sessions(year, meeting_key, manifest)):
+                    if session.get("session_key") is None:
+                        continue
+                    units.append(
+                        {
+                            "year": year,
+                            "meeting_key": meeting_key,
+                            "session_key": session["session_key"],
+                            "session_name": session.get("session_name"),
+                        }
+                    )
+
+        self._finish(manifest)
+        logger.info("pipeline_plan", extra={"pipeline": PIPELINE_NAME, "years": years, "work_units": len(units)})
+        return units
+
+    def _finish(self, manifest: ExecutionManifest, scope: Optional[SessionScope] = None) -> ExecutionManifest:
+        """Close the manifest, store it, and log the run summary."""
         manifest.finished_at = datetime.now(timezone.utc)
-        manifest_path = manifest.save(self._config.manifest_path)
+        prefix = self._store.layout.records_prefix(
+            self._manifest_root,
+            year=scope.year if scope else None,
+            session_key=scope.session_key if scope else None,
+        )
+        manifest_path = manifest.save(prefix, backend=self._store.backend)
 
         logger.info(
             "pipeline_summary",
@@ -245,6 +376,38 @@ class HistoricalExtractionPipeline:
             },
         )
         return manifest
+
+    def _meeting_for_session(self, year: int, session_key: int) -> Optional[int]:
+        """Find a session's meeting, preferring catalogues already in storage."""
+        catalog = RawDataCatalog(base_path=self._config.output_path, store=self._store)
+        for raw_file in catalog.discover(endpoints=["sessions"], year=year):
+            try:
+                records = catalog.load(raw_file).records
+            except RawFileError:  # an unreadable catalogue is just not a source here
+                continue
+            for record in records:
+                if isinstance(record, Mapping) and record.get("session_key") == session_key:
+                    return record.get("meeting_key") or raw_file.meeting_key
+
+        try:
+            records = self._client.get_sessions(session_key=session_key)
+        except _RECOVERABLE_ERRORS as exc:
+            logger.error(
+                "session_lookup_failed",
+                extra={"year": year, "session_key": session_key, "error": str(exc), "error_type": type(exc).__name__},
+            )
+            return None
+        for record in records or []:
+            if isinstance(record, Mapping) and record.get("session_key") == session_key:
+                if record.get("year") not in (None, year):
+                    # Storing it under the requested year would misfile the data.
+                    logger.error(
+                        "session_year_mismatch",
+                        extra={"session_key": session_key, "requested_year": year, "actual_year": record.get("year")},
+                    )
+                    return None
+                return record.get("meeting_key")
+        return None
 
     def _process_year(self, year: int, manifest: ExecutionManifest) -> None:
         logger.info("year_processing", extra={"year": year})
@@ -407,10 +570,10 @@ class HistoricalExtractionPipeline:
                 Discovery needs the data to keep traversing; endpoint
                 extraction does not, and avoids the read.
         """
-        path = self._storage.resolve_path(endpoint, parameters, file_name=file_name)
-        context = {"endpoint": endpoint, **_clean(parameters), "path": str(path)}
+        path = self._storage.uri(endpoint, parameters, file_name=file_name)
+        context = {"endpoint": endpoint, **_clean(parameters), "path": path}
 
-        if path.exists() and not self._config.overwrite:
+        if not self._config.overwrite and self._storage.exists(endpoint, parameters, file_name=file_name):
             data, readable = self._read_existing(endpoint, parameters, file_name, path, load_existing)
             if readable:
                 logger.info("raw_file_skipped", extra={**context, "status": ExtractionStatus.SKIPPED.value})
@@ -419,13 +582,14 @@ class HistoricalExtractionPipeline:
                         endpoint,
                         parameters,
                         status=ExtractionStatus.SKIPPED,
-                        file_path=str(path),
+                        file_path=path,
                         record_count=_record_count(data),
                     )
                 )
                 return _UnitResult(ExtractionStatus.SKIPPED, data)
             # An unreadable file is treated as missing: fall through and refetch.
 
+        started = time.monotonic()
         try:
             data = fetch()
         except _RECOVERABLE_ERRORS as exc:
@@ -440,6 +604,7 @@ class HistoricalExtractionPipeline:
                 **context,
                 "path": str(saved_path),
                 "record_count": record_count,
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
                 "status": ExtractionStatus.DOWNLOADED.value,
             },
         )
@@ -459,16 +624,16 @@ class HistoricalExtractionPipeline:
         endpoint: str,
         parameters: Mapping[str, Any],
         file_name: str,
-        path: Path,
+        path: str,
         load_existing: bool,
     ) -> Tuple[Any, bool]:
-        """Return ``(data, readable)`` for a file that is already on disk."""
+        """Return ``(data, readable)`` for a file that is already stored."""
         if not load_existing:
             return None, True
         try:
             return self._storage.load(endpoint, parameters, file_name=file_name), True
         except (OSError, ValueError):
-            logger.warning("raw_file_unreadable", extra={"endpoint": endpoint, "path": str(path)})
+            logger.warning("raw_file_unreadable", extra={"endpoint": endpoint, "path": path})
             return None, False
 
     def _record_failure(
@@ -477,14 +642,14 @@ class HistoricalExtractionPipeline:
         parameters: Mapping[str, Any],
         exc: Exception,
         manifest: ExecutionManifest,
-        path: Optional[Path] = None,
+        path: Optional[str] = None,
     ) -> None:
         logger.error(
             "extraction_failed",
             extra={
                 "endpoint": endpoint,
                 **_clean(parameters),
-                "path": str(path) if path else None,
+                "path": path,
                 "error": str(exc),
                 "error_type": type(exc).__name__,
                 "status": ExtractionStatus.FAILED.value,
@@ -502,15 +667,23 @@ class HistoricalExtractionPipeline:
             )
         )
 
-    def _config_snapshot(self) -> Dict[str, Any]:
-        """The configuration this run used, embedded in the manifest."""
-        return {
-            "years": list(self._config.years),
+    def _config_snapshot(self, scope: Optional[SessionScope] = None) -> Dict[str, Any]:
+        """The configuration this run used, embedded in the manifest.
+
+        A session run records its scope; a full run has no ``scope`` key,
+        which is how a reader tells the two apart.
+        """
+        snapshot: Dict[str, Any] = {
+            "years": [scope.year] if scope else list(self._config.years),
             "session_types": list(self._config.session_types),
             "endpoints": list(self._config.endpoints),
             "output_path": self._config.output_path,
             "overwrite": self._config.overwrite,
         }
+        if scope is not None:
+            snapshot["scope"] = {"mode": "session", **scope.to_dict()}
+            snapshot["storage"] = self._store.describe()
+        return snapshot
 
 
 def _entry(
@@ -558,7 +731,11 @@ def _sorted_by(items: Any, key: str) -> List[Mapping[str, Any]]:
 def main() -> None:
     """Entry point for ``python -m f1_race_intelligence.pipelines.historical_extraction``."""
     settings = load_settings()
-    configure_logging(level=settings.logging.level, json_format=settings.logging.json_format)
+    configure_logging(
+        level=settings.logging.level,
+        json_format=settings.logging.json_format,
+        file_path=settings.logging.file_path,
+    )
 
     with HistoricalExtractionPipeline(settings) as pipeline:
         manifest = pipeline.run()
