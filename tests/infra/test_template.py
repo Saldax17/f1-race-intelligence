@@ -56,7 +56,8 @@ def test_bucket_is_versioned_encrypted_private_retained_and_tagged(template) -> 
     bucket = template["Resources"]["DataBucket"]
     properties = bucket["Properties"]
 
-    assert bucket["DeletionPolicy"] == "Retain"
+    assert bucket["DeletionPolicy"] == "RetainExceptOnCreate"
+    assert bucket["UpdateReplacePolicy"] == "Retain"
     assert properties["VersioningConfiguration"]["Status"] == "Enabled"
     assert properties["BucketEncryption"]["ServerSideEncryptionConfiguration"][0]["ServerSideEncryptionByDefault"]["SSEAlgorithm"]
     assert all(properties["PublicAccessBlockConfiguration"].values())
@@ -67,6 +68,16 @@ def test_bucket_is_versioned_encrypted_private_retained_and_tagged(template) -> 
         if "ExpirationInDays" in rule:
             assert rule["Prefix"] == "logs/"
     assert {tag["Key"] for tag in properties["Tags"]} >= {"Project", "Environment"}
+
+
+def test_image_repository_is_retained_immutable_and_scanned(template) -> None:
+    repository = template["Resources"]["PipelineImageRepository"]
+    properties = repository["Properties"]
+
+    assert repository["DeletionPolicy"] == "RetainExceptOnCreate"
+    assert repository["UpdateReplacePolicy"] == "Retain"
+    assert properties["ImageTagMutability"] == "IMMUTABLE"
+    assert properties["ImageScanningConfiguration"]["ScanOnPush"] is True
 
 
 def test_bucket_policy_denies_insecure_transport(template) -> None:
@@ -91,6 +102,18 @@ def test_roles_are_separated(template) -> None:
     assert principals["DataProcessingTaskRole"] == "ecs-tasks.amazonaws.com"
     assert template["Resources"]["AvailabilityCheckerFunction"]["Properties"]["Role"] == {"Fn::GetAtt": "AvailabilityCheckerRole.Arn"}
     assert template["Resources"]["PipelineStateMachine"]["Properties"]["Role"] == {"Fn::GetAtt": "PipelineStateMachineRole.Arn"}
+
+
+def test_lambda_role_uses_the_standard_trust_and_the_others_keep_source_account(template) -> None:
+    roles = resources_of(template, "AWS::IAM::Role")
+
+    for name, role in roles.items():
+        statements = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
+        assert len(statements) == 1 and statements[0]["Action"] == "sts:AssumeRole", name
+        if name == "AvailabilityCheckerRole":
+            assert statements[0] == {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
+        else:
+            assert statements[0]["Condition"]["StringEquals"]["aws:SourceAccount"] == {"Ref": "AWS::AccountId"}, name
 
 
 def test_no_administrator_access_or_wildcard_actions(template) -> None:

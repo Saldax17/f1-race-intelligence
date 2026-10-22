@@ -119,7 +119,9 @@ Resources:
   DataBucket:
     Type: AWS::S3::Bucket
     # Data outlives the stack: deleting the stack must never delete the lake.
-    DeletionPolicy: Retain
+    # RetainExceptOnCreate: a failed first create rolls the (still empty) bucket
+    # back, so a retry is not blocked by the fixed name.
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !If
@@ -201,7 +203,9 @@ Resources:
   # ---------------------------------------------------------------------------
   PipelineImageRepository:
     Type: AWS::ECR::Repository
-    DeletionPolicy: Retain
+    # Same reasoning as DataBucket: kept on stack deletion, removed only when the
+    # very first create rolls back.
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       RepositoryName: !Sub "${ProjectName}-${Environment}-pipeline"
@@ -319,15 +323,15 @@ Resources:
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-availability-lambda"
       Description: Execution role of the OpenF1 availability checker. No S3 access.
+      # Standard Lambda execution-role trust, without aws:SourceAccount: support for
+      # that condition on Lambda execution roles could not be verified, and an
+      # unsupported condition could make CreateFunction fail. The other roles keep it.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
         - PolicyName: write-own-logs
           PolicyDocument:

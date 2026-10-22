@@ -44,7 +44,7 @@ tests/infra/                               # tests de la Lambda, la state machin
         PerSessionPipeline  Map, concurrencia 1
           M2_Extraction → M3_Validation → M4_Consolidation → M5_Features   (placeholders)
         M6_ModelingDataset                    (placeholder)
-        Catch ─► NotifyPipelineFailure ─┘ ─► PipelineFailed
+        Catch (solo en el Map) ─► NotifyPipelineFailure ─┘ ─► PipelineFailed
 
   S3 data lake <p>-<env>-<account>-<region>      ECR <p>-<env>-pipeline      CloudWatch Logs (retención parametrizada)
   raw/ validated/ consolidated/ features/        (imagen batch M2–M6)        /aws/lambda/…  /aws/vendedlogs/states/…
@@ -61,12 +61,12 @@ explícitamente si termina (`available == false`) o sigue.
 
 | Recurso | Configuración |
 |---|---|
-| S3 `DataBucket` | versionado; SSE-S3; bloqueo total de acceso público; `BucketOwnerEnforced`; política que niega tráfico sin TLS; lifecycle: aborta multipart a 7 d, expira versiones no actuales (parámetro, 90 d), limpia delete markers, `raw/` a Intelligent-Tiering a 30 d, `manifests/` a 90 d, `logs/` expira a 365 d; **nunca expira datasets actuales**; `DeletionPolicy: Retain` |
+| S3 `DataBucket` | versionado; SSE-S3; bloqueo total de acceso público; `BucketOwnerEnforced`; política que niega tráfico sin TLS; lifecycle: aborta multipart a 7 d, expira versiones no actuales (parámetro, 90 d), limpia delete markers, `raw/` a Intelligent-Tiering a 30 d, `manifests/` a 90 d, `logs/` expira a 365 d; **nunca expira datasets actuales**; `DeletionPolicy: RetainExceptOnCreate`, `UpdateReplacePolicy: Retain` |
 | Lambda `openf1-availability` | Python 3.12 arm64, 128 MB, 15 s; sin VPC; sin reintentos asíncronos; destinos OnSuccess→bus, OnFailure→SNS; métricas EMF `OpenF1Available`, `OpenF1LatencyMs` |
 | EventBridge | regla programada (parámetros `AvailabilitySchedule`, `AvailabilityScheduleState`); bus propio + regla de resultados |
 | Step Functions | STANDARD; logs `ALL` a CloudWatch; M2–M6 como `Pass` |
 | SNS | topic de alertas críticas; política para CloudWatch de la misma cuenta; suscripción e-mail opcional |
-| ECR | tags inmutables, escaneo al subir, expira sin tag a 7 d, conserva 30 imágenes; `Retain` |
+| ECR | tags inmutables, escaneo al subir, expira sin tag a 7 d, conserva 30 imágenes; `RetainExceptOnCreate` |
 | CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas |
 
 ## IAM (mínimo privilegio)
@@ -79,8 +79,16 @@ explícitamente si termina (`available == false`) o sigue.
 | `…-data-processing` (futuro) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` en `raw/ validated/ consolidated/ features/ modeling/ manifests/`. Sin `Delete*`, sin `models/`. |
 | `…-data-processing-exec` (futuro) | `ecs-tasks.amazonaws.com` | pull de la imagen del repositorio ECR (`GetAuthorizationToken` requiere `*`); escribir en `/aws/ecs/…` |
 
-Todas las relaciones de confianza llevan `aws:SourceAccount`. No hay políticas
-administradas de AWS ni `AdministratorAccess`.
+Todas las relaciones de confianza llevan `aws:SourceAccount`, salvo la del rol
+de la Lambda, que usa la confianza estándar de `lambda.amazonaws.com`: no se
+pudo verificar que Lambda admita esa condición en roles de ejecución, y si no la
+admite `CreateFunction` podría fallar. No hay políticas administradas de AWS ni
+`AdministratorAccess`.
+
+`PlanSessions` y `M6_ModelingDataset` son estados `Pass` y Step Functions no
+admite `Retry`/`Catch` en ellos; hoy solo el `Map` captura errores. Al
+convertirlos en `Task` de ECS hay que añadirles `Retry` y `Catch` hacia
+`NotifyPipelineFailure`.
 
 `s3:ListBucket` no se restringe por `s3:prefix` a propósito: sin ese permiso,
 `HeadObject` sobre una clave inexistente devuelve 403 en vez de 404 y la
@@ -169,8 +177,10 @@ docker push "$REPO:$(git rev-parse --short HEAD)"
 ## Eliminar
 
 `sam delete --stack-name f1-race-intelligence-dev` borra el stack pero
-**conserva** el bucket y el repositorio ECR (`DeletionPolicy: Retain`); se
-eliminan a mano si realmente se quiere perder los datos.
+**conserva** el bucket y el repositorio ECR (`DeletionPolicy: RetainExceptOnCreate`); se
+eliminan a mano si realmente se quiere perder los datos. La única excepción es
+el rollback de la primera creación del stack: ahí se borran (aún vacíos) para
+que el reintento no choque con sus nombres fijos.
 
 ## Riesgos conocidos
 
