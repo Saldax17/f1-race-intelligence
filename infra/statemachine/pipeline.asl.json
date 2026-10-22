@@ -65,21 +65,14 @@
     },
     "PlanSessions": {
       "Type": "Pass",
-      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) of the batch image with '--stage plan --plan-output', reading the session work units from S3. Until then it yields no sessions, so nothing downstream does any work.",
+      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) of the batch image with '--stage plan --plan-output', reading the session work units from S3. Until then it yields no sessions, so nothing downstream does any work. Pass states cannot Catch: when this becomes the ECS Task, add Retry/Catch -> NotifyPipelineFailure.",
       "Result": {
         "stage": "plan",
         "status": "not_implemented",
         "sessions": []
       },
       "ResultPath": "$.plan",
-      "Next": "PerSessionPipeline",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "NotifyPipelineFailure"
-        }
-      ]
+      "Next": "PerSessionPipeline"
     },
     "PerSessionPipeline": {
       "Type": "Map",
@@ -139,17 +132,10 @@
     },
     "M6_ModelingDataset": {
       "Type": "Pass",
-      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m6' once every session has been processed (global batch: the temporal split needs the whole history).",
+      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m6' once every session has been processed (global batch: the temporal split needs the whole history). Pass states cannot Catch: when this becomes the ECS Task, add Retry/Catch -> NotifyPipelineFailure.",
       "Result": {"stage": "m6", "status": "not_implemented"},
       "ResultPath": "$.m6",
-      "Next": "PipelineSucceeded",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "NotifyPipelineFailure"
-        }
-      ]
+      "Next": "PipelineSucceeded"
     },
     "PipelineSucceeded": {
       "Type": "Succeed"

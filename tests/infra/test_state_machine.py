@@ -190,7 +190,27 @@ def test_a_malformed_input_fails_instead_of_passing_as_unavailable(asl_text, bad
 def test_failures_in_the_pipeline_are_caught_and_alerted(asl_text) -> None:
     states = definition(asl_text)["States"]
 
+    # Only states that can fail may Catch; PlanSessions and M6 are Pass placeholders
+    # today and get their Catch when they become ECS Tasks.
     for name in ("PlanSessions", "PerSessionPipeline", "M6_ModelingDataset"):
-        assert states[name]["Catch"][0]["Next"] == "NotifyPipelineFailure"
+        if states[name]["Type"] != "Pass":
+            assert states[name]["Catch"][0]["Next"] == "NotifyPipelineFailure", name
+    assert states["PerSessionPipeline"]["Catch"][0]["Next"] == "NotifyPipelineFailure"
     assert states["NotifyPipelineFailure"]["Next"] == "PipelineFailed"
     assert states["PerSessionPipeline"]["MaxConcurrency"] == 1
+
+
+# Step Functions rejects Retry/Catch on any other state type (SCHEMA_VALIDATION_FAILED).
+ERROR_HANDLING_STATE_TYPES = {"Task", "Map", "Parallel"}
+
+
+def test_retry_and_catch_only_appear_where_step_functions_allows_them(asl_text) -> None:
+    def check(states: Dict[str, Any]) -> None:
+        for name, state in states.items():
+            if state["Type"] not in ERROR_HANDLING_STATE_TYPES:
+                assert "Catch" not in state, f"{name} ({state['Type']}) cannot have Catch"
+                assert "Retry" not in state, f"{name} ({state['Type']}) cannot have Retry"
+            if state["Type"] == "Map":
+                check(state["ItemProcessor"]["States"])
+
+    check(definition(asl_text)["States"])
