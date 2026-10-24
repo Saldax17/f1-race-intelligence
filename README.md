@@ -253,7 +253,13 @@ logging:
 
 Se carga con `f1_race_intelligence.config.settings.load_settings()`, que:
 
-1. Lee `configs/config.yaml` (o la ruta indicada por `F1_CONFIG_PATH`).
+1. Lee `configs/config.yaml` (o la ruta indicada por `F1_CONFIG_PATH` o
+   `--config`). **El archivo tiene que existir**: si falta, se detiene con
+   `ConfigFileNotFoundError` (la CLI sale con código 2) indicando la ruta y
+   cómo fijar `F1_CONFIG_PATH`, en vez de seguir con una configuración vacía.
+   Un archivo vacío sí es válido y significa "todo por defecto". Además, `m2`
+   y `plan` se niegan a arrancar (código 2) si no hay endpoints o temporada
+   que procesar.
 2. Si `environment` no es `local`, fusiona encima el overlay
    `configs/config.<environment>.yaml` (hoy: `config.aws.yaml`).
 3. Carga un `.env` local si existe (ver [.env.example](.env.example)).
@@ -974,12 +980,14 @@ docker run --rm -v "$PWD/data:/app/data" \
 - Sin datasets, `.env` ni credenciales (`.dockerignore`).
 - Configuración por variables de entorno (`F1_ENVIRONMENT`, `F1_STORAGE_*`).
 - `F1_CONFIG_PATH` es explícito: el paquete instalado no puede ubicar
-  `configs/` por su propia ruta.
+  `configs/` por su propia ruta. Si se borra o apunta a un archivo que no
+  existe, el contenedor sale con código 2 en lugar de "terminar bien" sin
+  procesar nada.
 
-> La imagen no se ha construido en el entorno de desarrollo (Docker no está
-> instalado ahí). Sí se verificó el mismo modo de ejecución: paquete
-> instalado de forma no editable, fuera del repositorio, con
-> `F1_CONFIG_PATH` explícito.
+> Imagen construida y probada en local con Docker Engine (WSL, `linux/amd64`):
+> `--help`, `pip check`, uid 10001, rutas de configuración inexistentes
+> (código 2), configuración AWS/S3 sin red, y `copy-raw` + M3→M5 de una sesión
+> sin red con `--memory 512m --cpus 0.5`. Todavía no se ha subido a ECR.
 
 ### 14.8 Infraestructura como código
 

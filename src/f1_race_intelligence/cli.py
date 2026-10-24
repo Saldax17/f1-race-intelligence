@@ -21,7 +21,8 @@ variables) and can be overridden per run. ``--input-storage`` and
 stage that reads from one place and writes to another.
 
 Exit codes: 0 success, 1 a stage failed (safe to retry: every stage is
-idempotent), 2 invalid arguments or configuration.
+idempotent), 2 invalid arguments or configuration — including a missing
+configuration file, or an extraction that would have nothing to do.
 
 This module only parses arguments and wires components together. What a
 stage does is unchanged from running its own module with ``python -m``.
@@ -117,6 +118,21 @@ def parse_stages(value: str) -> List[str]:
     if not stages or unknown:
         raise ValueError(f"Unknown stage(s) {unknown or value!r}. Supported: {', '.join(STAGES)}")
     return stages
+
+
+def check_stage_inputs(stages: Sequence[str], settings: AppSettings, year: Optional[int]) -> None:
+    """Refuse a run that would end successfully without doing any work.
+
+    Extraction with no endpoints, or with no season from either ``--year`` or
+    configuration, writes a manifest and exits 0 having fetched nothing — the
+    signature of a missing or wrong configuration file, not a real result.
+    """
+    extraction = settings.historical_extraction
+    if "m2" in stages and not extraction.endpoints:
+        raise ValueError("m2 has nothing to extract: historical_extraction.endpoints is empty in the configuration")
+    for stage in ("plan", "m2"):
+        if stage in stages and year is None and not extraction.years:
+            raise ValueError(f"{stage} has no season to process: pass --year or set historical_extraction.years")
 
 
 def settings_overrides(args: argparse.Namespace) -> Dict[str, Any]:
@@ -358,6 +374,7 @@ def main(
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
         settings = load_settings(args.config, overrides=settings_overrides(args))
+        check_stage_inputs(stages, settings, args.year)
         input_store = resolve_store(settings, args.input_storage, args.input_layout)
         output_store = resolve_store(settings, args.output_storage, args.output_layout)
     except (ValueError, OSError) as exc:

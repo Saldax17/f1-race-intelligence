@@ -102,12 +102,12 @@ idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
 | `Environment` | `dev` | `dev` · `staging` · `prod` |
 | `S3BucketName` | vacío | vacío ⇒ `<project>-<env>-<account>-<region>` |
 | `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min |
-| `AvailabilityScheduleState` | `ENABLED` | apagar el chequeo sin borrar nada |
+| `AvailabilityScheduleState` | `DISABLED` | `samconfig.toml` también lo fija en `DISABLED` (dev y prod); activarlo es una decisión explícita |
 | `PipelineEnabled` | `false` | dejar en `false` hasta desplegar los jobs |
 | `LogRetentionDays` | `30` | valores válidos de CloudWatch |
 | `NoncurrentVersionExpirationDays` | `90` | |
 | `OpenF1BaseUrl` | `https://api.openf1.org/v1` | |
-| `AlertEmail` | vacío | requiere confirmar la suscripción |
+| `AlertEmail` | vacío | vacío ⇒ **sin suscripción: nadie recibe las alertas**; ver "Alertas por correo" |
 
 ## Validar (sin tocar AWS)
 
@@ -136,13 +136,11 @@ aws cloudformation validate-template --template-body file://infra/template.yaml 
 aws sts get-caller-identity
 aws configure get region
 
-# 1. Construir y desplegar dev (muestra el change set y pide confirmación)
+# 1. Construir y desplegar dev (muestra el change set y pide confirmación).
+#    Los parámetros salen de samconfig.toml: calendario DISABLED, pipeline false.
 cd infra
 sam build
 sam deploy --config-env dev
-# opcional, alertas por correo:
-sam deploy --config-env dev --parameter-overrides \
-  ProjectName=f1-race-intelligence Environment=dev PipelineEnabled=false AlertEmail=tu-correo@ejemplo.com
 
 # 2. Ver outputs
 aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
@@ -174,6 +172,108 @@ docker build -t "$REPO:$(git rev-parse --short HEAD)" .
 docker push "$REPO:$(git rev-parse --short HEAD)"
 ```
 
+## Alertas por correo (`AlertEmail`)
+
+El topic `…-critical-alerts` recibe las alarmas de CloudWatch y los fallos de la
+Lambda (`OnFailure`). Que alguien se entere depende de `AlertEmail`:
+
+- **Vacío** (valor por defecto y el de `samconfig.toml`): la condición
+  `HasAlertEmail` es falsa y no se crea ninguna `AWS::SNS::Subscription`. El
+  topic existe y recibe mensajes, pero **nadie los recibe**: las alertas no son
+  operativas.
+- **Con una dirección real**: CloudFormation crea una suscripción `email` y AWS
+  envía al destinatario un correo *AWS Notification - Subscription
+  Confirmation*. Mientras no se pulse el enlace, la suscripción queda en
+  `PendingConfirmation` y **no se entrega ninguna alerta**. Las notificaciones
+  solo cuentan como operativas cuando el destinatario la confirma.
+
+La dirección no se guarda en `samconfig.toml` ni en ningún archivo del
+repositorio: se pasa al desplegar. `--parameter-overrides` en la línea de
+comandos **sustituye por completo** la lista de `samconfig.toml` (no la
+combina), y un parámetro omitido toma el `Default` de la plantilla, no el valor
+desplegado. Por eso el comando repite todos los parámetros del entorno,
+calendario `DISABLED` incluido.
+
+Windows PowerShell (5.1 o 7), desde la raíz del repositorio. Todo va en un
+único bloque para que, si falta la dirección, no se ejecute ningún comando de
+SAM ni aunque se pegue en la consola:
+
+```powershell
+# $env:ALERT_EMAIL debe contener la dirección real del destinatario (no un ejemplo):
+#   $env:ALERT_EMAIL = Read-Host 'Correo para las alertas'
+if ([string]::IsNullOrWhiteSpace($env:ALERT_EMAIL) -or $env:ALERT_EMAIL -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+    Write-Error 'Define $env:ALERT_EMAIL con la dirección real del destinatario. No se ha ejecutado SAM.'
+} else {
+    Push-Location infra
+    try {
+        sam build
+        if ($LASTEXITCODE -eq 0) {
+            sam deploy --config-env dev --parameter-overrides `
+                "ParameterKey=ProjectName,ParameterValue=f1-race-intelligence" `
+                "ParameterKey=Environment,ParameterValue=dev" `
+                "ParameterKey=AvailabilitySchedule,ParameterValue='rate(15 minutes)'" `
+                "ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED" `
+                "ParameterKey=PipelineEnabled,ParameterValue=false" `
+                "ParameterKey=LogRetentionDays,ParameterValue=30" `
+                "ParameterKey=AlertEmail,ParameterValue=$env:ALERT_EMAIL"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+```
+
+En PowerShell, `rate(15 minutes)` va entre comillas **simples** dentro del
+argumento: SAM las acepta, y Windows PowerShell 5.1 no transmite bien comillas
+dobles anidadas a un ejecutable nativo (`sam` es un `.cmd`). Para solo preparar
+el change set sin aplicarlo, añadir `--no-execute-changeset` a `sam deploy`.
+
+Bash:
+
+```bash
+# ALERT_EMAIL debe contener la dirección real del destinatario (no un ejemplo).
+: "${ALERT_EMAIL:?Define ALERT_EMAIL con la dirección real del destinatario}"
+cd infra
+sam build
+sam deploy --config-env dev --parameter-overrides \
+  ParameterKey=ProjectName,ParameterValue=f1-race-intelligence \
+  ParameterKey=Environment,ParameterValue=dev \
+  'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"' \
+  ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED \
+  ParameterKey=PipelineEnabled,ParameterValue=false \
+  ParameterKey=LogRetentionDays,ParameterValue=30 \
+  "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}"
+```
+
+En ambos casos `rate(15 minutes)` va entrecomillado dentro del argumento porque
+SAM separa los valores por espacios: sin comillas se queda con `rate(15`, que no
+está en `AllowedValues`. Para `prod`: `--config-env prod`, `Environment=prod` y
+`LogRetentionDays=90`.
+
+Antes de aceptar el change set, comprobar que no aparece ningún cambio en
+`AvailabilityScheduleRule` y que el único recurso nuevo es
+`AlertEmailSubscription`. Después del despliegue y de que el destinatario
+confirme:
+
+```bash
+aws sns list-subscriptions-by-topic --topic-arn "$(aws cloudformation describe-stacks \
+  --stack-name f1-race-intelligence-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='AlertTopicArn'].OutputValue" --output text)" \
+  --query "Subscriptions[].SubscriptionArn" --output text
+# Un ARN completo = confirmada; "PendingConfirmation" = todavía no llegan alertas.
+```
+
+```powershell
+$topic = aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev `
+    --query "Stacks[0].Outputs[?OutputKey=='AlertTopicArn'].OutputValue" --output text
+aws sns list-subscriptions-by-topic --topic-arn $topic --query "Subscriptions[].SubscriptionArn" --output text
+# Un ARN completo = confirmada; "PendingConfirmation" = todavía no llegan alertas.
+```
+
+Activar el calendario (`AvailabilityScheduleState=ENABLED`) no forma parte de
+ningún ejemplo de este documento: es una decisión explícita y revisada, que se
+toma sustituyendo `DISABLED` en el despliegue correspondiente.
+
 ## Eliminar
 
 `sam delete --stack-name f1-race-intelligence-dev` borra el stack pero
@@ -184,8 +284,11 @@ que el reintento no choque con sus nombres fijos.
 
 ## Riesgos conocidos
 
-- Con el chequeo cada 15 min y `PipelineEnabled=false`, cada chequeo crea una
-  ejecución STANDARD (~96/día, pocas transiciones): coste bajo pero no cero.
+- El calendario está desactivado por defecto. Si se activa con el chequeo cada
+  15 min y `PipelineEnabled=false`, cada chequeo crea una ejecución STANDARD
+  (~96/día, pocas transiciones): coste bajo pero no cero.
+- Con `AlertEmail` vacío, o con la suscripción sin confirmar, las alarmas y los
+  fallos de la Lambda no llegan a nadie.
 - La Lambda sale a internet sin VPC. Si más adelante se mete en una VPC hará
   falta NAT.
 - El topic SNS no usa KMS: las alarmas de CloudWatch no pueden publicar en un

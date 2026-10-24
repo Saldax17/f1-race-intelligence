@@ -6,6 +6,16 @@
 #
 # confirm_changeset stays true on purpose: no deploy happens without a human
 # reading the change set.
+#
+# parameter_overrides, as SAM CLI reads it:
+# - Each item is split on spaces, so a value containing one must be quoted
+#   ('AvailabilitySchedule="rate(15 minutes)"'); unquoted, SAM keeps "rate(15".
+# - A parameter left out takes the template Default on every deploy, not the
+#   value currently deployed. That is why the schedule state is always explicit.
+# - --parameter-overrides on the command line REPLACES this whole list. A
+#   command-line override must repeat every parameter below (see infra/README.md).
+# - AlertEmail is deliberately absent: no address is committed here. Pass the
+#   real one at deploy time (infra/README.md, "Alertas por correo").
 
 version = 0.1
 
@@ -30,8 +40,8 @@ fail_on_empty_changeset = false
 parameter_overrides = [
   "ProjectName=f1-race-intelligence",
   "Environment=dev",
-  "AvailabilitySchedule=rate(15 minutes)",
-  "AvailabilityScheduleState=ENABLED",
+  'AvailabilitySchedule="rate(15 minutes)"',
+  "AvailabilityScheduleState=DISABLED",
   "PipelineEnabled=false",
   "LogRetentionDays=30",
 ]
@@ -48,8 +58,8 @@ fail_on_empty_changeset = false
 parameter_overrides = [
   "ProjectName=f1-race-intelligence",
   "Environment=prod",
-  "AvailabilitySchedule=rate(15 minutes)",
-  "AvailabilityScheduleState=ENABLED",
+  'AvailabilitySchedule="rate(15 minutes)"',
+  "AvailabilityScheduleState=DISABLED",
   "PipelineEnabled=false",
   "LogRetentionDays=90",
 ]

@@ -2,6 +2,7 @@
 
 from f1_race_intelligence.config.settings import (
     AppSettings,
+    ConfigFileNotFoundError,
     ConsolidationSettings,
     FeatureSettings,
     HistoricalExtractionSettings,
@@ -18,6 +19,7 @@ from f1_race_intelligence.config.settings import (
 
 __all__ = [
     "AppSettings",
+    "ConfigFileNotFoundError",
     "ConsolidationSettings",
     "FeatureSettings",
     "HistoricalExtractionSettings",
