@@ -352,10 +352,32 @@ class AppSettings(BaseModel):
 
 
 # src/f1_race_intelligence/config/settings.py -> parents[3] is the repo root.
+# Only true for a source checkout: an installed package has no configs/ next
+# to it, which is why the container sets F1_CONFIG_PATH.
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "configs" / "config.yaml"
 
 
 _TRUE_VALUES = {"1", "true", "yes"}
+
+
+class ConfigFileNotFoundError(FileNotFoundError):
+    """The base configuration file is missing.
+
+    Running on model defaults instead would look like success while doing
+    nothing (no years, no endpoints), so a missing file is always an error.
+    A :class:`FileNotFoundError`, hence an :class:`OSError`: the CLI reports
+    it as invalid configuration (exit code 2).
+    """
+
+    def __init__(self, path: Path, source: str) -> None:
+        self.path = path
+        self.source = source
+        super().__init__(
+            f"Configuration file not found: {path} (from {source}). "
+            "Point F1_CONFIG_PATH (or --config) at an existing config.yaml; "
+            "in the container image it is /app/configs/config.yaml. "
+            "An empty file is valid and means 'all defaults'."
+        )
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str, Any]:
@@ -370,10 +392,30 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> Dict[str
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
     with path.open("r", encoding="utf-8") as fh:
         return yaml.safe_load(fh) or {}
+
+
+def resolve_config_path(config_path: Optional[Union[str, Path]] = None) -> Path:
+    """The base configuration file to read, which must exist.
+
+    Priority: the ``config_path`` argument (``--config``), then
+    ``F1_CONFIG_PATH``, then the repository's ``configs/config.yaml``. An
+    empty ``F1_CONFIG_PATH`` counts as unset, like the other variables.
+
+    Raises:
+        ConfigFileNotFoundError: the chosen path is not a file.
+    """
+    env_path = (os.getenv("F1_CONFIG_PATH") or "").strip()
+    if config_path:
+        path, source = Path(config_path), "the config_path argument (--config)"
+    elif env_path:
+        path, source = Path(env_path), "F1_CONFIG_PATH"
+    else:
+        path, source = DEFAULT_CONFIG_PATH, "the default location; F1_CONFIG_PATH is not set"
+    if not path.is_file():
+        raise ConfigFileNotFoundError(path, source)
+    return path
 
 
 def overlay_path(config_path: Path, environment: str) -> Path:
@@ -463,24 +505,31 @@ def load_settings(
     Args:
         config_path: Optional explicit path to a YAML config file. If not
             given, uses ``F1_CONFIG_PATH`` if set, otherwise
-            ``configs/config.yaml`` at the repo root.
+            ``configs/config.yaml`` at the repo root. Whichever is chosen
+            must exist (an empty file means "all defaults").
         overrides: Nested values applied last, e.g.
             ``{"storage": {"backend": "s3", "bucket": "my-bucket"}}``.
 
     Returns:
         A validated :class:`AppSettings` instance.
+
+    Raises:
+        ConfigFileNotFoundError: the base configuration file does not exist.
     """
     if load_dotenv is not None:
         load_dotenv()
 
-    path = Path(config_path) if config_path else Path(os.getenv("F1_CONFIG_PATH", DEFAULT_CONFIG_PATH))
+    path = resolve_config_path(config_path)
     raw = _read_yaml(path)
 
     # The environment decides which overlay to read, so resolve it first.
     environment = (overrides or {}).get("environment") or os.getenv("F1_ENVIRONMENT") or raw.get("environment") or "local"
     environment = str(environment).strip().lower()
-    if environment != "local":
-        raw = _deep_merge(raw, _read_yaml(overlay_path(path, environment)))
+    # The overlay is optional: F1_STORAGE_* can supply what it would, and an
+    # incomplete result still fails validation (aws requires s3 and a bucket).
+    overlay = overlay_path(path, environment)
+    if environment != "local" and overlay.is_file():
+        raw = _deep_merge(raw, _read_yaml(overlay))
 
     raw = _apply_env_overrides(raw)
     if overrides:

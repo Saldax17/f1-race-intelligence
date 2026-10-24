@@ -81,6 +81,67 @@ def test_m2_for_a_session_needs_the_year(config_file) -> None:
     assert cli.main(["--stage", "m2", "--session-key", "9158", "--config", str(config_file)]) == cli.EXIT_USAGE
 
 
+# -- configuration that would make a job "succeed" doing nothing -------------------
+
+
+def never_called(settings):
+    raise AssertionError("no OpenF1 client may be built for a rejected run")
+
+
+def test_a_missing_config_file_is_a_usage_error_naming_the_path(tmp_path, capsys) -> None:
+    missing = tmp_path / "missing.yaml"
+
+    code = cli.main(["--stage", "m2", "--year", "2024", "--config", str(missing)], client_factory=never_called)
+
+    assert code == cli.EXIT_USAGE
+    error = capsys.readouterr().err
+    assert "Configuration file not found" in error and str(missing) in error
+
+
+def test_a_missing_f1_config_path_is_a_usage_error(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("F1_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+
+    assert cli.main(["--stage", "m3"]) == cli.EXIT_USAGE
+    assert "F1_CONFIG_PATH" in capsys.readouterr().err
+
+
+def test_an_installed_package_without_config_does_not_report_an_empty_m2_as_success(tmp_path, monkeypatch, capsys) -> None:
+    from f1_race_intelligence.config import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "DEFAULT_CONFIG_PATH", tmp_path / "site-packages" / "configs" / "config.yaml")
+
+    code = cli.main(["--stage", "m2", "--year", "2024", "--session-key", "9472"], client_factory=never_called)
+
+    assert code == cli.EXIT_USAGE
+    assert "F1_CONFIG_PATH is not set" in capsys.readouterr().err
+
+
+def test_m2_without_endpoints_is_a_usage_error(tmp_path, capsys) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("historical_extraction:\n  years: [2024]\n  endpoints: []\n", encoding="utf-8")
+
+    code = cli.main(["--stage", "m2", "--year", "2024", "--session-key", "9472", "--config", str(config)], client_factory=never_called)
+
+    assert code == cli.EXIT_USAGE
+    assert "endpoints is empty" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("stage", ["plan", "m2"])
+def test_extraction_without_a_season_is_a_usage_error(tmp_path, capsys, stage) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("historical_extraction:\n  years: []\n  endpoints: [laps]\n", encoding="utf-8")
+
+    assert cli.main(["--stage", stage, "--config", str(config)], client_factory=never_called) == cli.EXIT_USAGE
+    assert "no season to process" in capsys.readouterr().err
+
+
+def test_a_season_from_the_command_line_is_enough(config_file) -> None:
+    settings = cli.load_settings(str(config_file), overrides={"historical_extraction": {"years": []}})
+
+    cli.check_stage_inputs(["plan", "m2"], settings, year=2024)  # no exception
+    cli.check_stage_inputs(["m3", "m4", "m5", "m6"], settings, year=None)  # only extraction needs one
+
+
 def test_flags_become_configuration_overrides() -> None:
     args = cli.build_parser().parse_args(
         ["--stage", "m4", "--storage-backend", "s3", "--bucket", "b", "--prefix", "dev", "--overwrite", "--environment", "aws"]

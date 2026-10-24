@@ -66,9 +66,12 @@ Parameters:
 
   AvailabilityScheduleState:
     Type: String
-    Default: ENABLED
+    Default: DISABLED
     AllowedValues: [ENABLED, DISABLED]
-    Description: Turn the periodic availability check on or off without deleting it.
+    Description: >-
+      Turn the periodic availability check on or off without deleting it. DISABLED by
+      default, so a deploy that omits this parameter never starts the schedule; ENABLED
+      only as a deliberate, reviewed choice.
 
   PipelineEnabled:
     Type: String
@@ -95,7 +98,10 @@ Parameters:
     Type: String
     Default: ""
     AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
-    Description: Optional e-mail subscribed to critical alerts (must be confirmed from the inbox).
+    Description: >-
+      Optional e-mail subscribed to critical alerts. Empty creates no subscription, and
+      then alarms and Lambda failures publish to a topic nobody receives. A real address
+      gets a confirmation e-mail; alerts are delivered only after it is confirmed.
 
 Conditions:
   UseGeneratedBucketName: !Equals [!Ref S3BucketName, ""]

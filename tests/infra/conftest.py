@@ -5,6 +5,7 @@ part of the Python package), so its directory is put on ``sys.path`` here.
 """
 
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -43,3 +44,18 @@ def template() -> dict:
 @pytest.fixture(scope="session")
 def asl_text() -> str:
     return (INFRA / "statemachine" / "pipeline.asl.json").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="session")
+def samconfig_text() -> str:
+    return (INFRA / "samconfig.toml").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="session")
+def samconfig(samconfig_text) -> dict:
+    return tomllib.loads(samconfig_text)
+
+
+@pytest.fixture(scope="session")
+def infra_readme() -> str:
+    return (INFRA / "README.md").read_text(encoding="utf-8")

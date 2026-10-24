@@ -38,10 +38,13 @@ logging:
     assert settings.logging.json_format is False
 
 
-def test_load_settings_falls_back_to_defaults_when_file_missing(tmp_path: Path) -> None:
-    missing_file = tmp_path / "does_not_exist.yaml"
+def test_load_settings_uses_defaults_for_an_empty_file(tmp_path: Path) -> None:
+    # A missing file is an error (test_settings_environments.py); an empty one
+    # is the explicit way to ask for every default.
+    empty_file = tmp_path / "empty.yaml"
+    empty_file.write_text("", encoding="utf-8")
 
-    settings = load_settings(missing_file)
+    settings = load_settings(empty_file)
 
     assert settings.openf1.base_url == "https://api.openf1.org/v1"
     assert settings.openf1.rate_limit.requests_per_second == 3
@@ -74,7 +77,10 @@ historical_extraction:
 
 
 def test_historical_extraction_defaults_to_races_when_section_is_missing(tmp_path: Path) -> None:
-    extraction = load_settings(tmp_path / "does_not_exist.yaml").historical_extraction
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("openf1:\n  base_url: https://api.openf1.org/v1\n", encoding="utf-8")
+
+    extraction = load_settings(config_file).historical_extraction
 
     assert extraction.years == []
     assert extraction.session_types == ["Race"]
