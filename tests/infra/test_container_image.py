@@ -44,6 +44,33 @@ def test_dependencies_come_only_from_the_lock() -> None:
     assert re.search(r"^boto3==", (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8"), flags=re.M)
 
 
+# Roots certifi dropped after the eMudhra/emSign incident: G3 in 2026.10.19
+# (GHSA-6q48-6c7w-9gw2), C1 and ECC C3 in 2026.10.23 (certifi b60466c).
+# httpx (OpenF1) and botocore (S3) verify TLS against certifi's bundle.
+COMPROMISED_EMSIGN_ROOTS = ("emSign ECC Root CA - G3", "emSign Root CA - C1", "emSign ECC Root CA - C3")
+
+
+def test_the_lock_pins_a_certifi_without_the_compromised_emsign_roots() -> None:
+    lock = (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8")
+    match = re.search(r"^certifi==(\d+)\.(\d+)\.(\d+)$", lock, flags=re.M)
+    assert match, "certifi must stay pinned in the lock"
+    assert tuple(int(part) for part in match.groups()) >= (2026, 10, 23)
+
+
+def test_the_installed_ca_bundle_excludes_the_compromised_emsign_roots() -> None:
+    # The bundle actually used at run time, not the version number: run where
+    # the lock is installed (the test environment, or the image).
+    import certifi
+    import httpx
+
+    labels = re.findall(r'^# Label: "([^"]+)"', Path(certifi.where()).read_text(encoding="utf-8"), flags=re.M)
+    assert len(labels) > 100, f"unexpectedly small CA bundle at {certifi.where()}"
+    assert not set(COMPROMISED_EMSIGN_ROOTS) & set(labels)
+
+    trusted = {dict(item[0] for item in cert["subject"]).get("commonName") for cert in httpx.create_ssl_context().get_ca_certs()}
+    assert not set(COMPROMISED_EMSIGN_ROOTS) & trusted
+
+
 def test_the_container_runs_unprivileged_through_the_cli() -> None:
     assert instructions("USER") == ["f1"]
     assert "--uid 10001" in DOCKERFILE
