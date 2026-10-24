@@ -38,9 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from f1_race_intelligence.config.settings import AppSettings, load_settings
+from f1_race_intelligence.config.settings import AppSettings, StorageSettings, load_settings
 from f1_race_intelligence.scope import SessionScope
-from f1_race_intelligence.storage.store import DataStore, store_from_uri
+from f1_race_intelligence.storage.backends.s3 import S3StorageBackend
+from f1_race_intelligence.storage.store import S3_SCHEME, DataStore, store_from_uri
 from f1_race_intelligence.utils.logging import configure_logging, get_logger, log_context
 
 logger = get_logger("f1_race_intelligence.cli")
@@ -97,7 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--environment", choices=["local", "aws"])
     config.add_argument("--overwrite", action="store_true", help="Rebuild outputs that already exist (m2, m4, m5, copy-raw)")
     config.add_argument("--strict", action="store_true", help="Exit non-zero when validation (m3) comes back FAIL")
-    config.add_argument("--plan-output", help="Also write the plan's work units to this JSON file")
+    config.add_argument(
+        "--plan-output",
+        help="Also write the plan's work units as JSON to this local file or s3://bucket/key "
+        "(where an orchestrator such as Step Functions can read them)",
+    )
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -188,10 +193,45 @@ def run_plan(ctx: RunContext) -> StageOutcome:
         units = pipeline.plan(years)
 
     if ctx.args.plan_output:
-        Path(ctx.args.plan_output).parent.mkdir(parents=True, exist_ok=True)
-        Path(ctx.args.plan_output).write_text(json.dumps(units, indent=2), encoding="utf-8")
+        location = write_plan(ctx.args.plan_output, units, ctx.settings.storage)
+        logger.info("plan_written", extra={"location": location, "work_units": len(units)})
     print(json.dumps(units))
     return StageOutcome(ok=True, summary={"work_units": len(units)})
+
+
+def parse_plan_destination(destination: str) -> Optional[tuple]:
+    """``(bucket, key)`` for ``s3://bucket/key``, ``None`` for a local path.
+
+    Raises:
+        ValueError: an S3 URI that names no object, or another scheme.
+    """
+    if destination.startswith(S3_SCHEME):
+        bucket, _, key = destination[len(S3_SCHEME) :].partition("/")
+        if not bucket or not key or key.endswith("/"):
+            raise ValueError(f"--plan-output must name an object, e.g. s3://bucket/manifests/plan/run.json; got {destination!r}")
+        return bucket, key
+    if "://" in destination:
+        raise ValueError(f"Unsupported --plan-output {destination!r}: use a local path or s3://bucket/key")
+    return None
+
+
+def write_plan(destination: str, units: List[Dict[str, Any]], storage: StorageSettings, *, client: Any = None) -> str:
+    """Store the plan's work units at a local path or ``s3://bucket/key``.
+
+    A container's stdout cannot be read by an orchestrator, so on AWS the
+    plan goes to S3 and the state machine reads it from there. Returns where
+    it was written.
+    """
+    s3_object = parse_plan_destination(destination)
+    if s3_object:
+        bucket, key = s3_object
+        backend = S3StorageBackend(bucket, client=client, region_name=storage.region, endpoint_url=storage.endpoint_url)
+        backend.write_json(key, units)
+        return backend.uri(key)
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(units, indent=2), encoding="utf-8")
+    return str(path)
 
 
 def run_m2(ctx: RunContext) -> StageOutcome:
@@ -373,6 +413,8 @@ def main(
         stages = parse_stages(args.stage)
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
+        if args.plan_output:
+            parse_plan_destination(args.plan_output)  # fail before any OpenF1 call
         settings = load_settings(args.config, overrides=settings_overrides(args))
         check_stage_inputs(stages, settings, args.year)
         input_store = resolve_store(settings, args.input_storage, args.input_layout)

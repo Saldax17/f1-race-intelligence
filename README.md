@@ -993,9 +993,11 @@ docker run --rm -v "$PWD/data:/app/data" \
 
 La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
 Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
-[infra/](infra/README.md). **No está desplegada.** M2–M6 figuran en la state
-machine como estados placeholder y el paso al pipeline está desactivado
-(`PipelineEnabled=false`).
+[infra/](infra/README.md). La base está desplegada en `dev` con el pipeline
+desactivado (`PipelineEnabled=false`) y el calendario `DISABLED`. La Fase 1B
+define M2–M6 como tareas Fargate endurecidas (raíz de solo lectura, sin
+capacidades Linux, usuario 10001, imagen fijada por digest) orquestadas por
+Step Functions con `ecs:runTask.sync`; esa parte **no está desplegada**.
 
 ### 14.9 Arquitectura AWS propuesta (futura, no desplegada)
 

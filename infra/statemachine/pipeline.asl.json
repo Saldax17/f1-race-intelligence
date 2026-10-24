@@ -1,5 +1,6 @@
 {
-  "Comment": "F1 Race Intelligence pipeline orchestration (${Environment}). Input: the OpenF1 availability checker result. M2-M6 are placeholders (Pass states) until the batch jobs are deployed; with PipelineEnabled=false they are never reached.",
+  "Comment": "F1 Race Intelligence pipeline orchestration (${Environment}). Input: the OpenF1 availability checker result. Every stage is a Fargate task of the batch image (python -m f1_race_intelligence --stage ...); all intermediate data lives in S3 (lake layout), so no stage depends on another task's disk. Nothing runs while PipelineEnabled=false.",
+  "TimeoutSeconds": 43200,
   "StartAt": "LoadContext",
   "States": {
     "LoadContext": {
@@ -54,35 +55,154 @@
         {
           "Variable": "$.config.pipeline_enabled",
           "StringEquals": "true",
-          "Next": "PlanSessions"
+          "Next": "CheckForConcurrentRun"
         }
       ],
       "Default": "PipelineDisabled"
     },
     "PipelineDisabled": {
       "Type": "Succeed",
-      "Comment": "OpenF1 is available but the data-processing jobs are not enabled in this deployment (PipelineEnabled=false)."
+      "Comment": "OpenF1 is available but the data-processing tasks are not enabled in this deployment (PipelineEnabled=false)."
+    },
+    "CheckForConcurrentRun": {
+      "Type": "Task",
+      "Comment": "Every successful availability check starts an execution. Count the RUNNING executions of this state machine (this one included) so two runs never extract the history at the same time.",
+      "Resource": "arn:aws:states:::aws-sdk:sfn:listExecutions",
+      "Parameters": {
+        "StateMachineArn.$": "$$.StateMachine.Id",
+        "StatusFilter": "RUNNING",
+        "MaxResults": 2
+      },
+      "ResultSelector": {
+        "running.$": "States.ArrayLength($.Executions)"
+      },
+      "ResultPath": "$.concurrency",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ],
+      "Next": "IsAnotherRunInProgress"
+    },
+    "IsAnotherRunInProgress": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.concurrency.running",
+          "NumericGreaterThan": 1,
+          "Next": "AnotherRunInProgress"
+        }
+      ],
+      "Default": "PlanSessions"
+    },
+    "AnotherRunInProgress": {
+      "Type": "Succeed",
+      "Comment": "Another execution is already processing; this one stops without running any task."
     },
     "PlanSessions": {
+      "Type": "Task",
+      "Comment": "Discover the session work units of the configured seasons (historical_extraction.years) and write them to S3: a task's stdout cannot be read by Step Functions.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "LATEST",
+        "Cluster": "${ClusterArn}",
+        "TaskDefinition": "${TaskDefinitionArn}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "pipeline",
+              "Command.$": "States.Array('--stage', 'plan', '--plan-output', States.Format('s3://${DataBucketName}/manifests/plan/{}.json', $$.Execution.Name))"
+            }
+          ]
+        }
+      },
+      "ResultSelector": {
+        "exit_code.$": "$.Containers[0].ExitCode",
+        "task_arn.$": "$.TaskArn"
+      },
+      "ResultPath": "$.plan_task",
+      "TimeoutSeconds": 1800,
+      "Retry": [
+        {
+          "ErrorEquals": ["AmazonECS.Unknown", "ECS.AmazonECSException", "ECS.ServerException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 120,
+          "MaxAttempts": 1
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ],
+      "Next": "CheckPlanExitCode"
+    },
+    "CheckPlanExitCode": {
+      "Type": "Choice",
+      "Comment": "A non-zero exit fails the stage even if runTask.sync reported the stopped task as a success.",
+      "Choices": [
+        {
+          "Variable": "$.plan_task.exit_code",
+          "NumericEquals": 0,
+          "Next": "LoadPlan"
+        }
+      ],
+      "Default": "PlanExitedNonZero"
+    },
+    "PlanExitedNonZero": {
       "Type": "Pass",
-      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) of the batch image with '--stage plan --plan-output', reading the session work units from S3. Until then it yields no sessions, so nothing downstream does any work. Pass states cannot Catch: when this becomes the ECS Task, add Retry/Catch -> NotifyPipelineFailure.",
       "Result": {
-        "stage": "plan",
-        "status": "not_implemented",
-        "sessions": []
+        "Error": "StageExitedNonZero",
+        "Cause": "The plan task exited with a non-zero code; see its logs in the pipeline log group."
+      },
+      "ResultPath": "$.error",
+      "Next": "NotifyPipelineFailure"
+    },
+    "LoadPlan": {
+      "Type": "Task",
+      "Comment": "Read the work units the plan task wrote: [{year, meeting_key, session_key, session_name}, ...].",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket": "${DataBucketName}",
+        "Key.$": "States.Format('manifests/plan/{}.json', $$.Execution.Name)"
+      },
+      "ResultSelector": {
+        "sessions.$": "States.StringToJson($.Body)"
       },
       "ResultPath": "$.plan",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ],
       "Next": "PerSessionPipeline"
     },
     "PerSessionPipeline": {
       "Type": "Map",
-      "Comment": "One iteration per session: M2 -> M3 -> M4 -> M5. MaxConcurrency stays low because every M2 shares OpenF1's per-client rate limit.",
+      "Comment": "One iteration per session: M2 -> M3 -> M4 -> M5, one Fargate task each, every stage reading its inputs from and writing its outputs to S3. MaxConcurrency stays at 1 because every M2 calls OpenF1, a shared public API with a per-client rate limit.",
       "ItemsPath": "$.plan.sessions",
       "MaxConcurrency": 1,
       "ItemSelector": {
-        "session.$": "$$.Map.Item.Value",
-        "data_bucket.$": "$.config.data_bucket",
-        "environment.$": "$.config.environment"
+        "session.$": "$$.Map.Item.Value"
       },
       "ItemProcessor": {
         "ProcessorConfig": {
@@ -91,36 +211,260 @@
         "StartAt": "M2_Extraction",
         "States": {
           "M2_Extraction": {
-            "Type": "Pass",
-            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m2 --year <y> --meeting-key <m> --session-key <s>'. Retry on task failure (exit code 1 is retryable).",
-            "Result": {"stage": "m2", "status": "not_implemented"},
+            "Type": "Task",
+            "Comment": "--stage m2 for one session: raw OpenF1 data to raw/ and the extraction manifest to manifests/extraction/. Exit code 1 means a retryable extraction failure.",
+            "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "Parameters": {
+              "LaunchType": "FARGATE",
+              "PlatformVersion": "LATEST",
+              "Cluster": "${ClusterArn}",
+              "TaskDefinition": "${TaskDefinitionArn}",
+              "NetworkConfiguration": {
+                "AwsvpcConfiguration": {
+                  "Subnets": ["${SubnetA}", "${SubnetB}"],
+                  "SecurityGroups": ["${TaskSecurityGroupId}"],
+                  "AssignPublicIp": "ENABLED"
+                }
+              },
+              "Overrides": {
+                "ContainerOverrides": [
+                  {
+                    "Name": "pipeline",
+                    "Command.$": "States.Array('--stage', 'm2', '--year', States.Format('{}', $.session.year), '--meeting-key', States.Format('{}', $.session.meeting_key), '--session-key', States.Format('{}', $.session.session_key))"
+                  }
+                ]
+              }
+            },
+            "ResultSelector": {
+              "exit_code.$": "$.Containers[0].ExitCode",
+              "task_arn.$": "$.TaskArn"
+            },
             "ResultPath": "$.m2",
-            "Next": "M3_Validation"
+            "TimeoutSeconds": 1800,
+            "Retry": [
+              {
+                "ErrorEquals": ["AmazonECS.Unknown", "ECS.AmazonECSException", "ECS.ServerException"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              },
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 120,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "CheckM2ExitCode"
+          },
+          "CheckM2ExitCode": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.m2.exit_code",
+                "NumericEquals": 0,
+                "Next": "M3_Validation"
+              }
+            ],
+            "Default": "M2ExitedNonZero"
+          },
+          "M2ExitedNonZero": {
+            "Type": "Fail",
+            "Error": "StageExitedNonZero",
+            "Cause": "M2 (extraction) exited with a non-zero code; see the task logs."
           },
           "M3_Validation": {
-            "Type": "Pass",
-            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m3' for the same session.",
-            "Result": {"stage": "m3", "status": "not_implemented"},
+            "Type": "Task",
+            "Comment": "--stage m3 for the same session: reads raw/ and manifests/extraction/, writes the validation report to validated/. A FAIL verdict is recorded, not a task failure (no --strict), as in the CLI.",
+            "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "Parameters": {
+              "LaunchType": "FARGATE",
+              "PlatformVersion": "LATEST",
+              "Cluster": "${ClusterArn}",
+              "TaskDefinition": "${TaskDefinitionArn}",
+              "NetworkConfiguration": {
+                "AwsvpcConfiguration": {
+                  "Subnets": ["${SubnetA}", "${SubnetB}"],
+                  "SecurityGroups": ["${TaskSecurityGroupId}"],
+                  "AssignPublicIp": "ENABLED"
+                }
+              },
+              "Overrides": {
+                "ContainerOverrides": [
+                  {
+                    "Name": "pipeline",
+                    "Command.$": "States.Array('--stage', 'm3', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))"
+                  }
+                ]
+              }
+            },
+            "ResultSelector": {
+              "exit_code.$": "$.Containers[0].ExitCode",
+              "task_arn.$": "$.TaskArn"
+            },
             "ResultPath": "$.m3",
-            "Next": "M4_Consolidation"
+            "TimeoutSeconds": 900,
+            "Retry": [
+              {
+                "ErrorEquals": ["AmazonECS.Unknown", "ECS.AmazonECSException", "ECS.ServerException"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              },
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 1
+              }
+            ],
+            "Next": "CheckM3ExitCode"
+          },
+          "CheckM3ExitCode": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.m3.exit_code",
+                "NumericEquals": 0,
+                "Next": "M4_Consolidation"
+              }
+            ],
+            "Default": "M3ExitedNonZero"
+          },
+          "M3ExitedNonZero": {
+            "Type": "Fail",
+            "Error": "StageExitedNonZero",
+            "Cause": "M3 (validation) exited with a non-zero code; see the task logs."
           },
           "M4_Consolidation": {
-            "Type": "Pass",
-            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m4' for the same session.",
-            "Result": {"stage": "m4", "status": "not_implemented"},
+            "Type": "Task",
+            "Comment": "--stage m4 for the same session: reads raw/ and validated/, writes consolidated/ and manifests/consolidation/.",
+            "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "Parameters": {
+              "LaunchType": "FARGATE",
+              "PlatformVersion": "LATEST",
+              "Cluster": "${ClusterArn}",
+              "TaskDefinition": "${TaskDefinitionArn}",
+              "NetworkConfiguration": {
+                "AwsvpcConfiguration": {
+                  "Subnets": ["${SubnetA}", "${SubnetB}"],
+                  "SecurityGroups": ["${TaskSecurityGroupId}"],
+                  "AssignPublicIp": "ENABLED"
+                }
+              },
+              "Overrides": {
+                "ContainerOverrides": [
+                  {
+                    "Name": "pipeline",
+                    "Command.$": "States.Array('--stage', 'm4', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))"
+                  }
+                ]
+              }
+            },
+            "ResultSelector": {
+              "exit_code.$": "$.Containers[0].ExitCode",
+              "task_arn.$": "$.TaskArn"
+            },
             "ResultPath": "$.m4",
-            "Next": "M5_Features"
+            "TimeoutSeconds": 900,
+            "Retry": [
+              {
+                "ErrorEquals": ["AmazonECS.Unknown", "ECS.AmazonECSException", "ECS.ServerException"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              },
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 1
+              }
+            ],
+            "Next": "CheckM4ExitCode"
+          },
+          "CheckM4ExitCode": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.m4.exit_code",
+                "NumericEquals": 0,
+                "Next": "M5_Features"
+              }
+            ],
+            "Default": "M4ExitedNonZero"
+          },
+          "M4ExitedNonZero": {
+            "Type": "Fail",
+            "Error": "StageExitedNonZero",
+            "Cause": "M4 (consolidation) exited with a non-zero code; see the task logs."
           },
           "M5_Features": {
-            "Type": "Pass",
-            "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m5' for the same session.",
-            "Result": {"stage": "m5", "status": "not_implemented"},
+            "Type": "Task",
+            "Comment": "--stage m5 for the same session: reads consolidated/, writes features/ and manifests/features/.",
+            "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "Parameters": {
+              "LaunchType": "FARGATE",
+              "PlatformVersion": "LATEST",
+              "Cluster": "${ClusterArn}",
+              "TaskDefinition": "${TaskDefinitionArn}",
+              "NetworkConfiguration": {
+                "AwsvpcConfiguration": {
+                  "Subnets": ["${SubnetA}", "${SubnetB}"],
+                  "SecurityGroups": ["${TaskSecurityGroupId}"],
+                  "AssignPublicIp": "ENABLED"
+                }
+              },
+              "Overrides": {
+                "ContainerOverrides": [
+                  {
+                    "Name": "pipeline",
+                    "Command.$": "States.Array('--stage', 'm5', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))"
+                  }
+                ]
+              }
+            },
+            "ResultSelector": {
+              "exit_code.$": "$.Containers[0].ExitCode",
+              "task_arn.$": "$.TaskArn"
+            },
             "ResultPath": "$.m5",
-            "End": true
+            "TimeoutSeconds": 900,
+            "Retry": [
+              {
+                "ErrorEquals": ["AmazonECS.Unknown", "ECS.AmazonECSException", "ECS.ServerException"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              },
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 1
+              }
+            ],
+            "Next": "CheckM5ExitCode"
+          },
+          "CheckM5ExitCode": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.m5.exit_code",
+                "NumericEquals": 0,
+                "Next": "SessionDone"
+              }
+            ],
+            "Default": "M5ExitedNonZero"
+          },
+          "M5ExitedNonZero": {
+            "Type": "Fail",
+            "Error": "StageExitedNonZero",
+            "Cause": "M5 (features) exited with a non-zero code; see the task logs."
+          },
+          "SessionDone": {
+            "Type": "Succeed"
           }
         }
       },
-      "ResultPath": "$.sessions",
+      "ResultPath": null,
       "Next": "M6_ModelingDataset",
       "Catch": [
         {
@@ -131,11 +475,77 @@
       ]
     },
     "M6_ModelingDataset": {
-      "Type": "Pass",
-      "Comment": "PLACEHOLDER. Future: ECS RunTask (.sync) '--stage m6' once every session has been processed (global batch: the temporal split needs the whole history). Pass states cannot Catch: when this becomes the ECS Task, add Retry/Catch -> NotifyPipelineFailure.",
-      "Result": {"stage": "m6", "status": "not_implemented"},
+      "Type": "Task",
+      "Comment": "--stage m6, once every session has been processed: a global batch, since the temporal split needs the whole history (it ignores any session scope). Reads features/, writes modeling/ and manifests/modeling/.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "LATEST",
+        "Cluster": "${ClusterArn}",
+        "TaskDefinition": "${TaskDefinitionArn}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "pipeline",
+              "Command": ["--stage", "m6"]
+            }
+          ]
+        }
+      },
+      "ResultSelector": {
+        "exit_code.$": "$.Containers[0].ExitCode",
+        "task_arn.$": "$.TaskArn"
+      },
       "ResultPath": "$.m6",
-      "Next": "PipelineSucceeded"
+      "TimeoutSeconds": 1800,
+      "Retry": [
+        {
+          "ErrorEquals": ["AmazonECS.Unknown", "ECS.AmazonECSException", "ECS.ServerException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 1
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyPipelineFailure"
+        }
+      ],
+      "Next": "CheckM6ExitCode"
+    },
+    "CheckM6ExitCode": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.m6.exit_code",
+          "NumericEquals": 0,
+          "Next": "PipelineSucceeded"
+        }
+      ],
+      "Default": "M6ExitedNonZero"
+    },
+    "M6ExitedNonZero": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "StageExitedNonZero",
+        "Cause": "M6 (modelling dataset) exited with a non-zero code; see its logs in the pipeline log group."
+      },
+      "ResultPath": "$.error",
+      "Next": "NotifyPipelineFailure"
     },
     "PipelineSucceeded": {
       "Type": "Succeed"

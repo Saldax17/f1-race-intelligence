@@ -41,6 +41,14 @@ RUN pip install --no-deps . \
     && mkdir -p /app/data \
     && chown -R f1:f1 /app/data
 
+# Hardening: no setuid/setgid executables. The pipeline never needs them, and
+# they are the local privilege-escalation path of the base image's unpatched
+# util-linux (mount) and glibc (ld.so AT_SECURE) findings. -xdev keeps find on
+# the image filesystem; a failing chmod fails the build. The second find proves
+# nothing is left.
+RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+    && test -z "$(find / -xdev -type f -perm /6000)"
+
 # The installed package cannot locate configs/ relative to its own source
 # file, so the config path is explicit. Storage and environment are chosen
 # with F1_ENVIRONMENT / F1_STORAGE_* at run time.

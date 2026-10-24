@@ -1,9 +1,10 @@
 # Infraestructura AWS (SAM / CloudFormation)
 
-> **Estado: NO desplegado.** Este directorio define la infraestructura base y la
-> orquestación inicial. No crea datos, no ejecuta extracciones, no entrena ni
-> publica modelos (sin M7, sin SageMaker). M2–M6 existen en la state machine
-> solo como estados *placeholder*.
+> **Estado:** la infraestructura base está desplegada en `dev` con
+> `PipelineEnabled=false` y el calendario `DISABLED`. La Fase 1B (tareas
+> Fargate endurecidas para M2–M6, su red y su integración con Step Functions)
+> está definida en `template.yaml` pero **no desplegada**. No entrena ni publica
+> modelos (sin M7, sin SageMaker).
 
 ## Estructura
 
@@ -40,15 +41,21 @@ tests/infra/                               # tests de la Lambda, la state machin
         IsAvailabilityResultValid ── no ─► Fail        │   · OpenF1 no disponible 6 h seguidas (EMF)
         IsOpenF1Available ── false ─► OpenF1Unavailable (Succeed)
         IsPipelineEnabled ── false ─► PipelineDisabled (Succeed)   ← valor por defecto
-        PlanSessions                          (placeholder)
-        PerSessionPipeline  Map, concurrencia 1
-          M2_Extraction → M3_Validation → M4_Consolidation → M5_Features   (placeholders)
-        M6_ModelingDataset                    (placeholder)
-        Catch (solo en el Map) ─► NotifyPipelineFailure ─┘ ─► PipelineFailed
+        CheckForConcurrentRun ── otra ejecución RUNNING ─► AnotherRunInProgress (Succeed)
+        PlanSessions        Fargate --stage plan --plan-output s3://…/manifests/plan/<ejecución>.json
+        LoadPlan            s3:getObject del plan → $.plan.sessions
+        PerSessionPipeline  Map, concurrencia 1, una tarea Fargate por etapa
+          M2_Extraction → M3_Validation → M4_Consolidation → M5_Features
+        M6_ModelingDataset  Fargate --stage m6 (global)
+        cada tarea: Retry (arranque / ejecución) + Choice sobre el exit code
+        Catch ─► NotifyPipelineFailure ─┘ ─► PipelineFailed
 
   S3 data lake <p>-<env>-<account>-<region>      ECR <p>-<env>-pipeline      CloudWatch Logs (retención parametrizada)
-  raw/ validated/ consolidated/ features/        (imagen batch M2–M6)        /aws/lambda/…  /aws/vendedlogs/states/…
-  modeling/ models/ manifests/                                               /aws/ecs/… (jobs futuros)
+  raw/ validated/ consolidated/ features/        (imagen batch M2–M6,        /aws/lambda/…  /aws/vendedlogs/states/…
+  modeling/ models/ manifests/                    fijada por digest)          /aws/ecs/<p>-<env>-pipeline (tareas)
+
+  VPC 10.42.0.0/24 (dedicada): 2 subredes públicas, Internet Gateway, sin NAT ni endpoints
+  ECS cluster <p>-<env>-pipeline (sin Container Insights) · task definition Fargate x86_64 0,5 vCPU / 1 GB
 ```
 
 Por qué la Lambda no llama a Step Functions: se limita a responder. Su
@@ -64,7 +71,9 @@ explícitamente si termina (`available == false`) o sigue.
 | S3 `DataBucket` | versionado; SSE-S3; bloqueo total de acceso público; `BucketOwnerEnforced`; política que niega tráfico sin TLS; lifecycle: aborta multipart a 7 d, expira versiones no actuales (parámetro, 90 d), limpia delete markers, `raw/` a Intelligent-Tiering a 30 d, `manifests/` a 90 d, `logs/` expira a 365 d; **nunca expira datasets actuales**; `DeletionPolicy: RetainExceptOnCreate`, `UpdateReplacePolicy: Retain` |
 | Lambda `openf1-availability` | Python 3.12 arm64, 128 MB, 15 s; sin VPC; sin reintentos asíncronos; destinos OnSuccess→bus, OnFailure→SNS; métricas EMF `OpenF1Available`, `OpenF1LatencyMs` |
 | EventBridge | regla programada (parámetros `AvailabilitySchedule`, `AvailabilityScheduleState`); bus propio + regla de resultados |
-| Step Functions | STANDARD; logs `ALL` a CloudWatch; M2–M6 como `Pass` |
+| Step Functions | STANDARD; logs `ALL` a CloudWatch; timeout global 12 h; plan y M2–M6 como `ecs:runTask.sync` (ver "Tareas Fargate") |
+| ECS | cluster sin Container Insights; task definition Fargate `X86_64`, 512 CPU / 1024 MB, usuario `10001:10001`, raíz de solo lectura, `capabilities.drop: [ALL]`, sin puertos ni volúmenes; solo si `PipelineImageUri` tiene valor |
+| Red | VPC dedicada `10.42.0.0/24`, 2 subredes públicas en 2 AZ, Internet Gateway, security group sin entrada y salida solo TCP 443 |
 | SNS | topic de alertas críticas; política para CloudWatch de la misma cuenta; suscripción e-mail opcional |
 | ECR | tags inmutables, escaneo al subir, expira sin tag a 7 d, conserva 30 imágenes; `RetainExceptOnCreate` |
 | CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas |
@@ -74,10 +83,10 @@ explícitamente si termina (`available == false`) o sigue.
 | Rol | Confía en | Permisos |
 |---|---|---|
 | `…-availability-lambda` | `lambda.amazonaws.com` | escribir en su log group; `events:PutEvents` en el bus de orquestación; `sns:Publish` en el topic de alertas. **Sin S3.** |
-| `…-pipeline-states` | `states.amazonaws.com` | `sns:Publish` en el topic; APIs de entrega de logs (`Resource: "*"` exigido por AWS). **Sin S3, sin ECS todavía.** |
+| `…-pipeline-states` | `states.amazonaws.com` | `sns:Publish` en el topic; APIs de entrega de logs (`Resource: "*"` exigido por AWS); `ecs:RunTask` solo de la familia `<p>-<env>-pipeline` y con condición `ecs:cluster`; `ecs:DescribeTasks`/`StopTask` solo sobre tareas del cluster; `events:PutRule/PutTargets/DescribeRule` solo sobre la regla administrada `StepFunctionsGetEventsForECSTaskRule`; `iam:PassRole` solo de los dos roles de tarea y con `iam:PassedToService=ecs-tasks.amazonaws.com`; `s3:GetObject` solo en `manifests/plan/*`; `states:ListExecutions` solo sobre esta state machine |
 | `…-availability-to-states` | `events.amazonaws.com` | `states:StartExecution` solo sobre la state machine |
-| `…-data-processing` (futuro) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` en `raw/ validated/ consolidated/ features/ modeling/ manifests/`. Sin `Delete*`, sin `models/`. |
-| `…-data-processing-exec` (futuro) | `ecs-tasks.amazonaws.com` | pull de la imagen del repositorio ECR (`GetAuthorizationToken` requiere `*`); escribir en `/aws/ecs/…` |
+| `…-data-processing` (tarea) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` en `raw/ validated/ consolidated/ features/ modeling/ manifests/`. Sin `Delete*`, sin `models/`. |
+| `…-data-processing-exec` (ejecución) | `ecs-tasks.amazonaws.com` | pull de la imagen del repositorio ECR (`GetAuthorizationToken` requiere `*`); escribir en `/aws/ecs/…` |
 
 Todas las relaciones de confianza llevan `aws:SourceAccount`, salvo la del rol
 de la Lambda, que usa la confianza estándar de `lambda.amazonaws.com`: no se
@@ -85,10 +94,9 @@ pudo verificar que Lambda admita esa condición en roles de ejecución, y si no 
 admite `CreateFunction` podría fallar. No hay políticas administradas de AWS ni
 `AdministratorAccess`.
 
-`PlanSessions` y `M6_ModelingDataset` son estados `Pass` y Step Functions no
-admite `Retry`/`Catch` en ellos; hoy solo el `Map` captura errores. Al
-convertirlos en `Task` de ECS hay que añadirles `Retry` y `Catch` hacia
-`NotifyPipelineFailure`.
+`ecs:DescribeTasks`/`StopTask` se limitan a `task/<cluster>/*` aunque la
+política que genera AWS usa `"*"`; la condición `ecs:cluster` y ese ámbito se
+verifican en la primera ejecución controlada.
 
 `s3:ListBucket` no se restringe por `s3:prefix` a propósito: sin ese permiso,
 `HeadObject` sobre una clave inexistente devuelve 403 en vez de 404 y la
@@ -103,11 +111,70 @@ idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
 | `S3BucketName` | vacío | vacío ⇒ `<project>-<env>-<account>-<region>` |
 | `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min |
 | `AvailabilityScheduleState` | `DISABLED` | `samconfig.toml` también lo fija en `DISABLED` (dev y prod); activarlo es una decisión explícita |
-| `PipelineEnabled` | `false` | dejar en `false` hasta desplegar los jobs |
+| `PipelineEnabled` | `false` | `true` exige `PipelineImageUri` (regla `PipelineNeedsAnImage`); dejar en `false` hasta verificar una primera ejecución controlada |
+| `PipelineImageUri` | vacío | imagen batch **por digest** (`…/f1-race-intelligence-dev-pipeline@sha256:<64 hex>`); vacío ⇒ no se crea la task definition. No se guarda en `samconfig.toml` |
 | `LogRetentionDays` | `30` | valores válidos de CloudWatch |
 | `NoncurrentVersionExpirationDays` | `90` | |
 | `OpenF1BaseUrl` | `https://api.openf1.org/v1` | |
 | `AlertEmail` | vacío | vacío ⇒ **sin suscripción: nadie recibe las alertas**; ver "Alertas por correo" |
+
+## Tareas Fargate (Fase 1B)
+
+Todas las etapas usan **la misma imagen y la misma task definition**; la state
+machine solo cambia el comando (`python -m f1_race_intelligence …`). Cada
+etapa lee sus entradas de S3 y escribe sus salidas en S3 (layout `lake`), así
+que ninguna tarea depende del disco de otra.
+
+| Estado | Comando | Lee | Escribe |
+|---|---|---|---|
+| `PlanSessions` | `--stage plan --plan-output s3://<bucket>/manifests/plan/<ejecución>.json` | OpenF1 (`meetings`, `sessions`) | `raw/…/endpoint=meetings|sessions/`, `manifests/extraction/`, el plan |
+| `M2_Extraction` | `--stage m2 --year Y --meeting-key M --session-key S` | OpenF1 | `raw/year=Y/meeting=M/session=S/…`, `manifests/extraction/year=Y/session=S/` |
+| `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
+| `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
+| `M5_Features` | `--stage m5 --year Y --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
+| `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/`, `modeling/preprocessing/`, `manifests/modeling/` |
+
+Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
+generan esos comandos y los pasan por el parser real de la CLI.
+
+**Endurecimiento**
+
+- Imagen: sin ejecutables setuid/setgid (se retiran y se verifica en el build).
+- Tarea: usuario `10001:10001`, `readonlyRootFilesystem: true`,
+  `capabilities.drop: ["ALL"]`, sin puertos, sin secretos en el entorno.
+- Sin volúmenes: con la raíz de solo lectura se comprobó en local que plan,
+  M3–M6 y el modo AWS no escriben en ningún directorio (tampoco en `/tmp`).
+  `tmpfs` no existe en Fargate; si una etapa futura necesitara espacio
+  temporal, se añadiría un volumen de tarea montado en `/tmp`.
+
+Estas medidas **mitigan** la explotación local; **no corrigen** los paquetes
+vulnerables de la imagen base Debian 12 (sin parche publicado en bookworm).
+
+**Red y costes**
+
+VPC dedicada con subredes públicas e Internet Gateway; cada tarea recibe una
+IP pública (`AssignPublicIp: ENABLED`) para salir por HTTPS a OpenF1, ECR, S3
+y CloudWatch Logs. Se descartó NAT Gateway y VPC endpoints de interfaz porque
+facturan por hora aunque no se ejecute nada. La VPC, subredes, tabla de rutas,
+gateway y cluster no tienen coste propio; sí lo tienen la **IPv4 pública** de
+cada tarea mientras corre, el cómputo Fargate (0,5 vCPU / 1 GB, mínimo de un
+minuto por tarea), los logs y la transferencia de datos. La conectividad real
+no se ha probado: se verifica en la primera ejecución controlada.
+
+**Publicar y activar (fase posterior, con aprobación)**
+
+1. Publicar la imagen y anotar su **digest de manifiesto**.
+2. Desplegar con `PipelineImageUri=<repositorio>@sha256:<digest>` (añadirlo a
+   la lista completa de parámetros de "Alertas por correo"), manteniendo
+   `PipelineEnabled=false`, y revisar el change set.
+3. Primera ejecución controlada **manual** de una sesión, comprobando en el
+   historial: que un exit code ≠ 0 se detecta (la documentación no aclara si
+   `runTask.sync` falla el estado o termina con éxito; la definición cubre
+   ambos casos), el formato de `Containers[0].ExitCode` en la salida, la
+   respuesta de `listExecutions` (`Executions`) y que el ámbito IAM de
+   `DescribeTasks`/`StopTask` basta.
+4. Solo después, `PipelineEnabled=true`; el calendario sigue siendo una
+   decisión aparte.
 
 ## Validar (sin tocar AWS)
 
