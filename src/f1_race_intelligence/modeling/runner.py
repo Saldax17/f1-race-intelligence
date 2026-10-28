@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from f1_race_intelligence.config.settings import AppSettings, load_settings
 from f1_race_intelligence.features.selection import TARGET_COLUMN, TRACEABILITY
 from f1_race_intelligence.modeling import checks, preprocessing, split as split_module
+from f1_race_intelligence.modeling.fingerprints import ArtifactFile, sha256_hex
 from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader, feature_columns
 from f1_race_intelligence.modeling.models import ModelingReport, SplitArtifacts
 from f1_race_intelligence.modeling.report import save_report
@@ -178,7 +179,7 @@ class ModelingRunner:
             logger.error("modeling_aborted", extra={"failed": report.blocking_failures})
             return self._finish(report, started)
 
-        report.artifacts = self._write_artifacts(splits, transformed, targets, preprocessor, report)
+        report.artifacts, report.artifact_files = self._write_artifacts(splits, transformed, targets, preprocessor, report)
         return self._finish(report, started)
 
     # -- pieces -----------------------------------------------------------
@@ -221,17 +222,22 @@ class ModelingRunner:
         targets: Dict[str, pd.Series],
         preprocessor,
         report: ModelingReport,
-    ) -> List[SplitArtifacts]:
+    ) -> Tuple[List[SplitArtifacts], List[ArtifactFile]]:
         """Write each split twice: as it is, and as a model consumes it.
 
         The untransformed copy keeps the traceability columns so any row can
         be followed back to M5 and from there to the raw files. The encoded
         matrix is what a model reads. Keeping both means an odd prediction
         can be traced to a lap without re-running anything.
+
+        Every object is fingerprinted from the bytes read back after its
+        write returned, so a hash is only ever recorded for something that
+        is actually stored.
         """
         backend, layout = self._output_store.backend, self._output_store.layout
         base = self._output_store.root(Layer.MODELING, self._config.output_path)
         artifacts: List[SplitArtifacts] = []
+        files: List[ArtifactFile] = []
 
         for name in SPLITS:
             frame = splits[name]
@@ -241,6 +247,7 @@ class ModelingRunner:
             matrix_path = join_key(directory, "features.parquet")
 
             bytes_written = backend.write_parquet(dataset_path, frame)
+            files.append(self._stored_file(dataset_path, "dataset.parquet", name))
 
             matrix = transformed[name].copy()
             matrix[TARGET_COLUMN] = targets[name].to_numpy() if not frame.empty else pd.Series(dtype="float64")
@@ -253,6 +260,7 @@ class ModelingRunner:
                         frame[column].to_numpy() if not frame.empty else pd.Series(dtype="Int64")
                     )
             bytes_written += backend.write_parquet(matrix_path, matrix)
+            files.append(self._stored_file(matrix_path, "features.parquet", name))
 
             artifacts.append(
                 SplitArtifacts(
@@ -269,8 +277,10 @@ class ModelingRunner:
             )
 
         preprocessing_dir = layout.preprocessing_prefix(base)
-        backend.write_joblib(join_key(preprocessing_dir, PREPROCESSOR_FILE), preprocessor)
-        backend.write_json_unique(
+        preprocessor_path = join_key(preprocessing_dir, PREPROCESSOR_FILE)
+        backend.write_joblib(preprocessor_path, preprocessor)
+        files.append(self._stored_file(preprocessor_path, PREPROCESSOR_FILE, None))
+        schema_path = backend.write_json_unique(
             preprocessing_dir,
             "feature_schema",
             {
@@ -285,7 +295,20 @@ class ModelingRunner:
                 ),
             },
         )
-        return artifacts
+        files.append(self._stored_file(schema_path, "feature_schema.json", None))
+        return artifacts, files
+
+    def _stored_file(self, key: str, artifact: str, split: Optional[str]) -> ArtifactFile:
+        """Fingerprint an object from what storage now holds, not from what was sent."""
+        backend = self._output_store.backend
+        data = backend.read_bytes(key)
+        return ArtifactFile(
+            artifact=artifact,
+            split=split,
+            path=backend.uri(key),
+            sha256=sha256_hex(data),
+            size_bytes=len(data),
+        )
 
     @staticmethod
     def _missing_share(frame: pd.DataFrame, columns: List[str]) -> Dict[str, float]:

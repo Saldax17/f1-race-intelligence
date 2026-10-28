@@ -796,6 +796,40 @@ combustible — y sin el prefijo la clave sobrescribiría a la feature.
 Todo en `data/modeling/` está fuera de Git y se reproduce volviendo a
 ejecutar el módulo.
 
+### Huellas de contenido en el reporte
+
+Una ruta dice dónde estaba un dato; un hash dice qué era. El reporte de M6
+registra el SHA-256 de los bytes reales, de modo que cualquiera puede
+volver a calcularlo y comprobarlo:
+
+| campo | contenido |
+|---|---|
+| `source.inputs` | cada archivo de M5 leído: `input` (`session_<s>.parquet`), `year`, `session_key`, `sha256`, `size_bytes` |
+| `source.input_fingerprint` | huella agregada de las entradas, `sha256:<hex>` (también en `summary`) |
+| `source.input_fingerprint_scheme` | versión del algoritmo: `m6-input-fingerprint/v1` |
+| `artifact_files` | cada objeto escrito: `artifact`, `split`, `path`, `sha256`, `size_bytes` |
+
+- Cada entrada se lee **una sola vez**; se hashea y se parsea desde esos
+  mismos bytes, así que la huella describe exactamente lo que se modeló. Los
+  archivos cuyas filas descartan después los filtros `years`/`session_keys`
+  también se leyeron, y figuran.
+- `artifact_files` cubre los seis Parquet (`dataset.parquet` y
+  `features.parquet` por split), `preprocessor.joblib` y
+  `feature_schema*.json`. Cada hash se calcula releyendo el objeto del
+  almacenamiento después de escribirlo.
+- `input_fingerprint` es el SHA-256 de este documento JSON canónico (claves
+  ordenadas, sin espacios, `ensure_ascii`):
+  `{"inputs": [{"input", "year", "session_key", "sha256"}, …], "scheme": "m6-input-fingerprint/v1"}`,
+  con las entradas ordenadas por `year` (`null` primero), `session_key`,
+  `input` y `sha256`. No incluye URIs, rutas, bucket, backend, fechas ni
+  números de ejecución: los mismos archivos dan la misma huella en disco
+  local y en S3, en cualquier orden de listado.
+- Un run abortado (guarda bloqueante, train vacío, sin filas con target)
+  conserva `source.inputs` de lo que sí leyó, y deja `artifacts` y
+  `artifact_files` vacíos, porque no escribió nada. Si falla una lectura o
+  una escritura del almacenamiento, el error se propaga y no se escribe
+  reporte, como hasta ahora.
+
 ## 14. Preparación para la nube (AWS-ready)
 
 > **AWS todavía NO está desplegado.** No existe bucket, rol IAM, imagen en
