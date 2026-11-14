@@ -10,6 +10,7 @@ import yaml
 
 from f1_race_intelligence import cli
 from f1_race_intelligence.modeling import checks
+from f1_race_intelligence.storage.backends.s3 import S3StorageBackend
 from factories import MEETING_KEY, SESSION_KEY, YEAR, car_data_record
 from test_consolidation import build_raw  # noqa: F401 - fixture
 from test_historical_extraction import make_client
@@ -216,6 +217,32 @@ def test_plan_lists_work_units(config_file, tmp_path, capsys) -> None:
     assert code == cli.EXIT_OK
     units = json.loads(output.read_text(encoding="utf-8"))
     assert units == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
+
+
+def test_plan_can_be_written_to_s3_for_the_orchestrator(config_file, monkeypatch) -> None:
+    # Step Functions cannot read a container's stdout: on AWS the plan is read
+    # back from S3 by the state machine (LoadPlan).
+    from s3_fakes import FakeS3Client
+
+    s3 = FakeS3Client()
+    monkeypatch.setattr(cli, "S3StorageBackend", lambda bucket, **kwargs: S3StorageBackend(bucket, **{**kwargs, "client": s3}))
+
+    code = cli.main(
+        ["--stage", "plan", "--year", "2023", "--config", str(config_file), "--plan-output", "s3://plans-bucket/manifests/plan/exec-1.json"],
+        client_factory=fake_client_factory(make_client()),
+    )
+
+    assert code == cli.EXIT_OK
+    stored = json.loads(s3.get_object(Bucket="plans-bucket", Key="manifests/plan/exec-1.json")["Body"].read())
+    assert stored == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
+
+
+@pytest.mark.parametrize("destination", ["s3://plans-bucket", "s3://plans-bucket/manifests/plan/", "gs://bucket/plan.json"])
+def test_an_unusable_plan_output_is_rejected_before_calling_openf1(config_file, destination, capsys) -> None:
+    code = cli.main(["--stage", "plan", "--year", "2023", "--config", str(config_file), "--plan-output", destination], client_factory=never_called)
+
+    assert code == cli.EXIT_USAGE
+    assert "--plan-output" in capsys.readouterr().err
 
 
 def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch) -> None:

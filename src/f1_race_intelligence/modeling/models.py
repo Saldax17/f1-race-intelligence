@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from f1_race_intelligence.modeling.fingerprints import ArtifactFile
+
 
 @dataclass
 class SplitArtifacts:
@@ -48,6 +50,8 @@ class ModelingReport:
     split: Dict[str, Any] = field(default_factory=dict)
     preprocessing: Dict[str, Any] = field(default_factory=dict)
     artifacts: List[SplitArtifacts] = field(default_factory=list)
+    # Only objects this run wrote and read back; empty when it aborted.
+    artifact_files: List[ArtifactFile] = field(default_factory=list)
     checks: List[Dict[str, Any]] = field(default_factory=list)
     blocking_failures: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -68,6 +72,7 @@ class ModelingReport:
             "rows_modelled": self.source.get("rows_out", 0),
             "rows_dropped_without_target": self.source.get("rows_dropped_without_target", 0),
             "sessions": self.source.get("sessions", 0),
+            "input_fingerprint": self.source.get("input_fingerprint"),
             "rows_by_split": by_split,
             "numeric_features": len(self.features.get("numeric", [])),
             "categorical_features": len(self.features.get("categorical", [])),
@@ -91,6 +96,7 @@ class ModelingReport:
             "split": self.split,
             "preprocessing": self.preprocessing,
             "artifacts": [item.to_dict() for item in self.artifacts],
+            "artifact_files": [item.to_dict() for item in self.artifact_files],
             "checks": self.checks,
             "blocking_failures": self.blocking_failures,
             "warnings": self.warnings,

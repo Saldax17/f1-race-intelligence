@@ -71,6 +71,17 @@ def test_the_installed_ca_bundle_excludes_the_compromised_emsign_roots() -> None
     assert not set(COMPROMISED_EMSIGN_ROOTS) & trusted
 
 
+def test_setuid_and_setgid_bits_are_stripped_and_verified_at_build_time() -> None:
+    runs = instructions("RUN")
+    hardening = next((run for run in runs if "-perm /6000" in run), None)
+    assert hardening, "the image must strip setuid/setgid executables"
+    assert "chmod ug-s" in hardening and "-xdev" in hardening
+    assert 'test -z "$(find / -xdev -type f -perm /6000)"' in hardening, "the build must prove none are left"
+    assert "|| true" not in hardening, "a failing chmod must fail the build"
+    # Done as root, before switching to the unprivileged user.
+    assert DOCKERFILE.index("-perm /6000") < DOCKERFILE.index("USER f1")
+
+
 def test_the_container_runs_unprivileged_through_the_cli() -> None:
     assert instructions("USER") == ["f1"]
     assert "--uid 10001" in DOCKERFILE

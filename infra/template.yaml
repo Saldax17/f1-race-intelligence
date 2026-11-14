@@ -3,8 +3,9 @@ Transform: AWS::Serverless-2016-10-31
 Description: >-
   F1 Race Intelligence - base infrastructure and availability-gated orchestration.
   Creates the data lake bucket, the OpenF1 availability checker, the pipeline state
-  machine (M2-M6 as placeholders), alerting, logs, ECR and least-privilege IAM roles.
-  It does not run any extraction, train or deploy any model.
+  machine with M2-M6 as hardened Fargate tasks, their network, alerting, logs, ECR and
+  least-privilege IAM roles. Nothing runs while PipelineEnabled is false; it does not
+  train or deploy any model.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -15,6 +16,8 @@ Metadata:
         Parameters: [S3BucketName, NoncurrentVersionExpirationDays]
       - Label: { default: Orchestration }
         Parameters: [AvailabilitySchedule, AvailabilityScheduleState, PipelineEnabled, OpenF1BaseUrl]
+      - Label: { default: Batch tasks }
+        Parameters: [PipelineImageUri]
       - Label: { default: Observability }
         Parameters: [LogRetentionDays, AlertEmail]
 
@@ -78,9 +81,19 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: >-
-      Whether an available OpenF1 lets the state machine continue into M2-M6. Keep
-      "false" until the batch jobs are deployed and verified; today M2-M6 are
-      placeholders either way.
+      Whether an available OpenF1 lets the state machine continue into M2-M6 (Fargate
+      tasks). Keep "false" until a first controlled run has been verified; "true"
+      requires PipelineImageUri (rule PipelineNeedsAnImage).
+
+  PipelineImageUri:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
+    ConstraintDescription: Empty, or an ECR image pinned by digest (repository@sha256:<64 hex>). Tags are not accepted.
+    Description: >-
+      The M2-M6 batch image, pinned by manifest digest so a task always runs exactly the
+      image that was tested. Empty (the default) creates no task definition; the pipeline
+      cannot be enabled until an image is supplied.
 
   OpenF1BaseUrl:
     Type: String
@@ -106,6 +119,16 @@ Parameters:
 Conditions:
   UseGeneratedBucketName: !Equals [!Ref S3BucketName, ""]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasPipelineImage: !Not [!Equals [!Ref PipelineImageUri, ""]]
+
+Rules:
+  # Enabling the pipeline without a task image would start executions that can
+  # only fail; CloudFormation rejects that combination before changing anything.
+  PipelineNeedsAnImage:
+    RuleCondition: !Equals [!Ref PipelineEnabled, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PipelineImageUri, ""]]
+        AssertDescription: PipelineEnabled=true requires PipelineImageUri (an ECR image pinned by digest).
 
 Globals:
   Function:
@@ -314,7 +337,7 @@ Resources:
   DataProcessingLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      # For the future M2-M6 container tasks.
+      # Container logs of the M2-M6 Fargate tasks (stdout, JSON lines).
       LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-pipeline"
       RetentionInDays: !Ref LogRetentionDays
       Tags:
@@ -367,8 +390,8 @@ Resources:
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-pipeline-states"
       Description: >-
-        Execution role of the pipeline state machine. Today it can only publish alerts and
-        write its logs; ECS RunTask and PassRole are added when the M2-M6 jobs exist.
+        Execution role of the pipeline state machine: run and watch the M2-M6 Fargate tasks,
+        read the session plan, check for a concurrent run, publish alerts and write its logs.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -404,6 +427,54 @@ Resources:
                   - logs:DescribeResourcePolicies
                   - logs:DescribeLogGroups
                 Resource: "*"
+        # ARNs are built from names (not !Ref/!GetAtt) where referencing the
+        # resource would make this role depend on it and close a cycle.
+        - PolicyName: run-pipeline-tasks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunPipelineTaskDefinitionOnTheClusterOnly
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-${Environment}-pipeline:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt PipelineCluster.Arn
+              # runTask.sync polls and, on timeout or abort, stops the task.
+              # AWS's generated policy uses "*"; tasks of this cluster suffice.
+              - Sid: WatchAndStopPipelineTasks
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}-${Environment}-pipeline/*"
+              # The managed rule through which runTask.sync learns that a task stopped.
+              - Sid: TaskCompletionEvents
+                Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+              - Sid: PassOnlyThePipelineTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt DataProcessingTaskRole.Arn
+                  - !GetAtt DataProcessingExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+        - PolicyName: read-session-plan
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The plan task writes manifests/plan/<execution>.json; nothing else is readable.
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DataBucket.Arn}/manifests/plan/*"
+        - PolicyName: detect-concurrent-run
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:ListExecutions
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-pipeline"
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
@@ -434,15 +505,14 @@ Resources:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
 
-  # Future data-processing roles (M2-M6 container tasks). Created now so their
-  # permissions are reviewed together with the rest; nothing assumes them yet.
+  # Data-processing roles of the M2-M6 Fargate tasks (PipelineTaskDefinition).
   DataProcessingTaskRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-data-processing"
       Description: >-
-        Future task role of the M2-M6 batch jobs: read/write the pipeline prefixes of the
-        data lake. No delete, no access to models/.
+        Task role of the M2-M6 batch tasks: read/write the pipeline prefixes of the data
+        lake. No delete, no access to models/.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -485,7 +555,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-data-processing-exec"
-      Description: Future ECS task execution role - pull the pipeline image and write container logs.
+      Description: ECS task execution role of the batch tasks - pull the pipeline image and write container logs.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -518,6 +588,183 @@ Resources:
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
+
+  # ---------------------------------------------------------------------------
+  # Network for the batch tasks
+  # ---------------------------------------------------------------------------
+  # A dedicated VPC with public subnets: the tasks reach OpenF1, ECR, S3 and
+  # CloudWatch Logs over HTTPS through an Internet Gateway, with a public IP per
+  # running task. No NAT Gateway and no interface endpoints: both bill by the
+  # hour even when nothing runs. The VPC, subnets, route table and gateway cost
+  # nothing by themselves; a task's public IPv4 address is billed while the
+  # task runs. Nothing can connect in: the security group has no ingress rule.
+  PipelineVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PipelineVpc
+      InternetGatewayId: !Ref PipelineInternetGateway
+
+  # Two Availability Zones, so a task can still start when one is short of
+  # Fargate capacity. Public IPs are requested per task (AssignPublicIp), not
+  # by default on the subnet.
+  PipelineSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PipelineVpc
+      CidrBlock: 10.42.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-a" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PipelineVpc
+      CidrBlock: 10.42.0.64/26
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-b" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelinePublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PipelineVpc
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-public" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: PipelineGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PipelinePublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref PipelineInternetGateway
+
+  PipelineSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PipelineSubnetA
+      RouteTableId: !Ref PipelinePublicRouteTable
+
+  PipelineSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PipelineSubnetB
+      RouteTableId: !Ref PipelinePublicRouteTable
+
+  PipelineTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: M2-M6 batch tasks - no inbound traffic, outbound HTTPS only.
+      VpcId: !Ref PipelineVpc
+      # No SecurityGroupIngress: the container serves nothing.
+      # Egress replaces the default allow-all: only HTTPS (OpenF1, ECR, S3,
+      # CloudWatch Logs, STS). Name resolution goes to the VPC's Amazon DNS
+      # resolver, which security groups do not filter.
+      SecurityGroupEgress:
+        - Description: HTTPS to OpenF1 and AWS service endpoints
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-tasks" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---------------------------------------------------------------------------
+  # ECS / Fargate: the batch tasks (M2-M6)
+  # ---------------------------------------------------------------------------
+  PipelineCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-pipeline"
+      # Container Insights bills per metric; the task logs and the state
+      # machine's own metrics are enough for a batch pipeline.
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  # One task definition for every stage: the image runs
+  # `python -m f1_race_intelligence --stage ...` and the state machine
+  # overrides the command per stage. Created only once an image digest is
+  # supplied (PipelineImageUri).
+  PipelineTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasPipelineImage
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-pipeline"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # Measured locally: about 160-185 MB peak per stage; 1 GB leaves room for
+      # larger sessions.
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt DataProcessingExecutionRole.Arn
+      TaskRoleArn: !GetAtt DataProcessingTaskRole.Arn
+      # No volumes: with a read-only root filesystem every stage was verified
+      # to run without any writable path (no /tmp either); all data goes to S3.
+      ContainerDefinitions:
+        - Name: pipeline
+          Image: !Ref PipelineImageUri
+          Essential: true
+          User: "10001:10001"
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+            InitProcessEnabled: true
+          Command: ["--help"]
+          # Only non-secret settings; credentials come from the task role.
+          Environment:
+            - { Name: F1_ENVIRONMENT, Value: aws }
+            - { Name: F1_CONFIG_PATH, Value: /app/configs/config.yaml }
+            - { Name: F1_STORAGE_BUCKET, Value: !Ref DataBucket }
+            - { Name: F1_STORAGE_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DataProcessingLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: pipeline
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
 
   # ---------------------------------------------------------------------------
   # Availability checker
@@ -619,6 +866,13 @@ Resources:
         PipelineEnabled: !Ref PipelineEnabled
         DataBucketName: !Ref DataBucket
         AlertTopicArn: !Ref AlertTopic
+        ClusterArn: !GetAtt PipelineCluster.Arn
+        # Without an image there is no task definition; the PipelineNeedsAnImage
+        # rule keeps the pipeline disabled in that case, so it is never used.
+        TaskDefinitionArn: !If [HasPipelineImage, !Ref PipelineTaskDefinition, "not-configured"]
+        SubnetA: !Ref PipelineSubnetA
+        SubnetB: !Ref PipelineSubnetB
+        TaskSecurityGroupId: !Ref PipelineTaskSecurityGroup
       Role: !GetAtt PipelineStateMachineRole.Arn
       Logging:
         Level: ALL
@@ -788,8 +1042,21 @@ Outputs:
     Description: ECR repository for the M2-M6 batch image.
     Value: !GetAtt PipelineImageRepository.RepositoryUri
   DataProcessingTaskRoleArn:
-    Description: Future task role for the M2-M6 container jobs.
+    Description: Task role of the M2-M6 Fargate tasks.
     Value: !GetAtt DataProcessingTaskRole.Arn
   DataProcessingExecutionRoleArn:
-    Description: Future ECS task execution role (image pull, container logs).
+    Description: ECS task execution role of the batch tasks (image pull, container logs).
     Value: !GetAtt DataProcessingExecutionRole.Arn
+  PipelineClusterName:
+    Description: ECS cluster the batch tasks run on.
+    Value: !Ref PipelineCluster
+  PipelineTaskDefinitionArn:
+    Condition: HasPipelineImage
+    Description: Fargate task definition of the M2-M6 batch tasks (image pinned by digest).
+    Value: !Ref PipelineTaskDefinition
+  PipelineSubnetIds:
+    Description: Public subnets of the batch tasks (comma separated).
+    Value: !Join [",", [!Ref PipelineSubnetA, !Ref PipelineSubnetB]]
+  PipelineTaskSecurityGroupId:
+    Description: Security group of the batch tasks (no ingress, HTTPS egress only).
+    Value: !Ref PipelineTaskSecurityGroup
