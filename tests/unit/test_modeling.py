@@ -27,6 +27,7 @@ from f1_race_intelligence.modeling.split import (
     apply_assignments,
     assign_sessions,
 )
+from f1_race_intelligence.validation.states import CheckStatus, RunVerdict
 
 RACE_START = pd.Timestamp("2023-03-05T15:00:00Z")
 
@@ -56,7 +57,7 @@ def feature_rows(
                     "lap_duration": 90.0 + lap + driver * 0.1,
                     "tyre_age": lap,
                     "position_at_lap_start": 1,
-                    "speed_mean": 200.0 + lap,
+                    "speed_mean": 200.0 + lap + session_key * 10,
                     "gap_to_leader_s": None if lap == 1 else float(lap),
                     "lap_time_prev_1": None if lap == 1 else 90.0 + lap - 1,
                     "compound": compound,
@@ -119,7 +120,9 @@ def modeling_settings(tmp_path: Path) -> Callable[..., AppSettings]:
 
 
 def load_matrix(settings, split: str) -> pd.DataFrame:
-    return pd.read_parquet(Path(settings.modeling.output_path) / split / "features.parquet", engine="pyarrow")
+    paths = sorted((Path(settings.modeling.output_path) / split / "runs").glob("*/features.parquet"))
+    assert paths, f"no versioned matrix for {split}"
+    return pd.read_parquet(paths[-1], engine="pyarrow")
 
 
 # -- loading and target ---------------------------------------------------
@@ -167,11 +170,12 @@ def test_a_race_is_never_divided_between_splits(three_races, modeling_settings) 
     three_races()
     settings = modeling_settings()
 
-    ModelingRunner(settings).run()
+    report = ModelingRunner(settings).run()
 
     keys = {}
     for split in (TRAIN, VALIDATION, TEST):
-        frame = pd.read_parquet(Path(settings.modeling.output_path) / split / "dataset.parquet")
+        artifact = next(item for item in report.artifacts if item.name == split)
+        frame = pd.read_parquet(artifact.dataset_path)
         keys[split] = set(frame["session_key"].unique())
     assert keys[TRAIN] & keys[VALIDATION] == set()
     assert keys[TRAIN] & keys[TEST] == set()
@@ -327,7 +331,8 @@ def test_a_category_unseen_in_training_does_not_break_transform(feature_dataset,
     """A driver who debuts in a later season must not break the pipeline."""
     feature_dataset(feature_rows(1, 2023, 0, drivers=(1, 44)), 2023, 1)
     feature_dataset(feature_rows(2, 2024, 365, drivers=(1, 99), compound="WET", team="New Team"), 2024, 2)
-    settings = modeling_settings(train_fraction=0.5, validation_fraction=0.5)
+    feature_dataset(feature_rows(3, 2025, 730), 2025, 3)
+    settings = modeling_settings(train_fraction=1 / 3, validation_fraction=1 / 3)
 
     report = ModelingRunner(settings).run()
 
@@ -516,7 +521,19 @@ def test_the_fitting_guard_accepts_a_transformer_fitted_on_train() -> None:
     result = checks.check_no_validation_statistics_used_in_training(correct, train, validation)
 
     assert result.passed is True
-    assert result.details["adding_split_changes_parameters"] is True, "the comparison can discriminate"
+
+
+def test_fitting_guard_is_inconclusive_when_other_split_cannot_distinguish_the_fit() -> None:
+    train = pd.DataFrame({"speed_mean": [200.0, 200.0]})
+    test = train.copy()
+    preprocessor = preprocessing.build_preprocessor(["speed_mean"], [])
+    preprocessor.fit(train)
+
+    result = checks.check_no_test_statistics_used_in_training(preprocessor, train, test)
+
+    assert result.status is CheckStatus.INCONCLUSIVE
+    assert result.passed is False
+    assert result.to_dict()["details"]["adding_split_changes_parameters"] is False
 
 
 def test_the_schema_guard_rejects_mismatched_columns() -> None:
@@ -560,12 +577,17 @@ def test_the_report_records_the_configuration_and_the_split(three_races, modelin
     three_races()
     settings = modeling_settings()
 
-    ModelingRunner(settings).run()
+    report = ModelingRunner(settings).run()
 
     files = list((tmp_path / "modeling" / "reports").glob("modeling_report_*.json"))
     assert len(files) == 1
     payload = json.loads(files[0].read_text(encoding="utf-8"))
     assert payload["pipeline_name"] == "modeling_dataset"
+    assert payload["schema_version"] == 2
+    assert payload["run_id"] == report.run_id
+    assert payload["verdict"] in {"VALID", "VALID_WITH_WARNINGS"}
+    assert len(payload["config_fingerprint"]) == 64
+    assert payload["dependency_lock_sha256"] is None or len(payload["dependency_lock_sha256"]) == 64
     assert payload["config"]["split_strategy"] == "fraction"
     assert payload["preprocessing"]["fitted_on"] == "train split only"
     assert payload["target"]["definition"].startswith("lap_duration(t+1)")
@@ -579,9 +601,10 @@ def test_the_fitted_preprocessor_is_persisted(three_races, modeling_settings, tm
 
     ModelingRunner(settings).run()
 
-    directory = tmp_path / "modeling" / "preprocessing"
-    assert (directory / "preprocessor.joblib").exists()
-    schema = list(directory.glob("feature_schema*.json"))
+    directory = tmp_path / "modeling" / "preprocessing" / "runs"
+    (run_directory,) = list(directory.iterdir())
+    assert (run_directory / "preprocessor.joblib").exists()
+    schema = list(run_directory.glob("feature_schema*.json"))
     assert schema, "the encoded column names are written for the next stage"
     payload = json.loads(schema[0].read_text(encoding="utf-8"))
     assert payload["target"] == TARGET_COLUMN
@@ -610,7 +633,29 @@ def test_a_thin_history_is_reported_as_insufficient(feature_dataset, modeling_se
 
     assert report.warnings
     assert any("below the configured minimum" in item for item in report.warnings)
-    assert report.aborted is None, "the pipeline still runs; it just refuses to pretend"
+    assert report.verdict is RunVerdict.INCOMPLETE
+    assert report.aborted is not None, "a missing test split cannot be reported as a successful run"
+    assert report.artifact_files == []
+
+
+def test_empty_test_split_is_blocking_even_when_leakage_stop_is_disabled(feature_dataset, modeling_settings) -> None:
+    feature_dataset(feature_rows(1, 2023, 0), 2023, 1)
+    feature_dataset(feature_rows(2, 2024, 365), 2024, 2)
+
+    report = ModelingRunner(
+        modeling_settings(
+            min_sessions_per_split=1,
+            train_fraction=0.5,
+            validation_fraction=0.5,
+            fail_on_leakage=False,
+        )
+    ).run()
+
+    assert report.verdict is RunVerdict.INCOMPLETE
+    assert report.artifact_files == []
+    assert any(item["check"] == "split_completeness" and item["status"] == "FAIL" for item in report.checks)
+    skipped = [item for item in report.checks if item["status"] == "SKIPPED"]
+    assert skipped and all(item.get("reason") for item in skipped)
 
 
 def test_an_empty_input_aborts_without_writing(modeling_settings, tmp_path) -> None:
@@ -637,7 +682,7 @@ def test_features_come_from_the_m5_catalogue(three_races, modeling_settings) -> 
 
     report = ModelingRunner(settings).run()
 
-    frame = pd.read_parquet(Path(settings.modeling.output_path) / TRAIN / "dataset.parquet")
+    frame = pd.read_parquet(next(item for item in report.artifacts if item.name == TRAIN).dataset_path)
     columns = feature_columns(frame)
     assert set(report.features["numeric"]) == set(columns["numeric"])
     assert set(report.features["categorical"]) == set(columns["categorical"])

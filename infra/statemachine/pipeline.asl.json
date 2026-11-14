@@ -529,6 +529,7 @@
     },
     "CheckM6ExitCode": {
       "Type": "Choice",
+      "Comment": "The M6 CLI returns zero only for VALID or VALID_WITH_WARNINGS after all blocking checks pass.",
       "Choices": [
         {
           "Variable": "$.m6.exit_code",

@@ -38,10 +38,17 @@ from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader, feature_
 from f1_race_intelligence.modeling.models import ModelingReport, SplitArtifacts
 from f1_race_intelligence.modeling.report import save_report
 from f1_race_intelligence.modeling.split import SPLITS, TEST, TRAIN, VALIDATION, SplitStrategy
-from f1_race_intelligence.storage.backends.base import join_key
+from f1_race_intelligence.modeling.traceability import (
+    config_fingerprint,
+    dependency_lock_sha256,
+    new_run_id,
+    source_revision,
+)
+from f1_race_intelligence.storage.backends.base import StorageError, join_key
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
+from f1_race_intelligence.validation.states import CheckStatus, RunVerdict
 
 logger = get_logger(__name__)
 
@@ -91,9 +98,21 @@ class ModelingRunner:
         report = ModelingReport(
             pipeline_name=PIPELINE_NAME,
             pipeline_version=PIPELINE_VERSION,
+            run_id=self._new_run_id(),
             config=self._config_snapshot(),
             target=self._target_definition(),
         )
+        report.source_commit, report.source_dirty = source_revision()
+        report.dependency_lock_sha256 = dependency_lock_sha256()
+        report.config_fingerprint = config_fingerprint(report.config)
+        if report.source_commit is None:
+            report.warnings.append("Git source commit is unavailable; no commit was inferred.")
+        elif report.source_dirty:
+            report.warnings.append("The source checkout has uncommitted changes.")
+        elif report.source_dirty is None:
+            report.warnings.append("Git working-tree cleanliness could not be determined.")
+        if report.dependency_lock_sha256 is None:
+            report.warnings.append("The dependency lockfile is unavailable; its SHA-256 could not be recorded.")
 
         dataset = self._loader.load(
             years=list(self._config.years) or None,
@@ -140,6 +159,18 @@ class ModelingRunner:
             "assignments": [item.to_dict() for item in assignments],
         }
         self._warn_about_small_splits(report, splits)
+        split_check = checks.check_split_completeness(splits)
+        if split_check.status is not CheckStatus.PASS:
+            incomplete_checks = checks.complete_required_checks([split_check])
+            report.checks = [item.to_dict() for item in incomplete_checks]
+            report.blocking_failures = checks.blocking_failures(incomplete_checks)
+            empty_splits = split_check.details["empty_splits"]
+            report.aborted = (
+                "the training split is empty; nothing can be fitted"
+                if TRAIN in empty_splits
+                else f"required split(s) are empty: {', '.join(empty_splits)}"
+            )
+            return self._finish(report, started)
 
         matrices = {
             name: preprocessing.prepare_matrix(frame, columns["numeric"], columns["categorical"])
@@ -171,6 +202,7 @@ class ModelingRunner:
         )
 
         outcomes = self._run_checks(preprocessor, matrices, transformed, splits, targets, assignments, columns, dataset.frame)
+        outcomes = checks.complete_required_checks(outcomes)
         report.checks = [item.to_dict() for item in outcomes]
         report.blocking_failures = checks.blocking_failures(outcomes)
 
@@ -198,6 +230,7 @@ class ModelingRunner:
         encoded_names = list(transformed[TRAIN].columns)
         matrix_columns = encoded_names + [TARGET_COLUMN] + [f"{KEY_PREFIX}{c}" for c in GRAIN_COLUMNS]
         return [
+            checks.check_split_completeness(splits),
             checks.check_target_not_in_features(encoded_names),
             checks.check_forbidden_columns_not_in_features(encoded_names),
             checks.check_traceability_columns_not_in_model_features(encoded_names, matrix_columns),
@@ -241,13 +274,16 @@ class ModelingRunner:
 
         for name in SPLITS:
             frame = splits[name]
-            directory = layout.split_prefix(base, name)
+            directory = join_key(layout.split_prefix(base, name), "runs", report.run_id)
 
             dataset_path = join_key(directory, "dataset.parquet")
             matrix_path = join_key(directory, "features.parquet")
 
-            bytes_written = backend.write_parquet(dataset_path, frame)
-            files.append(self._stored_file(dataset_path, "dataset.parquet", name))
+            if not backend.write_parquet_if_absent(dataset_path, frame):
+                raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(dataset_path)}")
+            dataset_file = self._stored_file(dataset_path, "dataset.parquet", name)
+            files.append(dataset_file)
+            bytes_written = dataset_file.size_bytes
 
             matrix = transformed[name].copy()
             matrix[TARGET_COLUMN] = targets[name].to_numpy() if not frame.empty else pd.Series(dtype="float64")
@@ -259,8 +295,11 @@ class ModelingRunner:
                     matrix[f"{KEY_PREFIX}{column}"] = (
                         frame[column].to_numpy() if not frame.empty else pd.Series(dtype="Int64")
                     )
-            bytes_written += backend.write_parquet(matrix_path, matrix)
-            files.append(self._stored_file(matrix_path, "features.parquet", name))
+            if not backend.write_parquet_if_absent(matrix_path, matrix):
+                raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(matrix_path)}")
+            matrix_file = self._stored_file(matrix_path, "features.parquet", name)
+            files.append(matrix_file)
+            bytes_written += matrix_file.size_bytes
 
             artifacts.append(
                 SplitArtifacts(
@@ -276,13 +315,14 @@ class ModelingRunner:
                 )
             )
 
-        preprocessing_dir = layout.preprocessing_prefix(base)
+        preprocessing_dir = join_key(layout.preprocessing_prefix(base), "runs", report.run_id)
         preprocessor_path = join_key(preprocessing_dir, PREPROCESSOR_FILE)
-        backend.write_joblib(preprocessor_path, preprocessor)
+        if not backend.write_joblib_if_absent(preprocessor_path, preprocessor):
+            raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(preprocessor_path)}")
         files.append(self._stored_file(preprocessor_path, PREPROCESSOR_FILE, None))
-        schema_path = backend.write_json_unique(
-            preprocessing_dir,
-            "feature_schema",
+        schema_path = join_key(preprocessing_dir, "feature_schema.json")
+        if not backend.write_json_if_absent(
+            schema_path,
             {
                 "input_features": report.features,
                 "encoded_feature_names": report.preprocessing.get("output_feature_names", []),
@@ -294,7 +334,8 @@ class ModelingRunner:
                     f"'{KEY_PREFIX}' columns sit alongside them and must not be fed to a model."
                 ),
             },
-        )
+        ):
+            raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(schema_path)}")
         files.append(self._stored_file(schema_path, "feature_schema.json", None))
         return artifacts, files
 
@@ -302,10 +343,11 @@ class ModelingRunner:
         """Fingerprint an object from what storage now holds, not from what was sent."""
         backend = self._output_store.backend
         data = backend.read_bytes(key)
+        local_path = backend.local_path(key)
         return ArtifactFile(
             artifact=artifact,
             split=split,
-            path=backend.uri(key),
+            path=str(local_path.resolve()) if local_path is not None else backend.uri(key),
             sha256=sha256_hex(data),
             size_bytes=len(data),
         )
@@ -362,7 +404,22 @@ class ModelingRunner:
             "output_storage": self._output_store.describe(),
         }
 
+    def _new_run_id(self) -> str:
+        backend, layout = self._output_store.backend, self._output_store.layout
+        base = self._output_store.root(Layer.MODELING, self._config.output_path)
+        for _ in range(10):
+            candidate = new_run_id()
+            prefixes = [
+                join_key(layout.split_prefix(base, name), "runs", candidate)
+                for name in SPLITS
+            ]
+            prefixes.append(join_key(layout.preprocessing_prefix(base), "runs", candidate))
+            if not any(backend.has_prefix(prefix) or backend.exists(prefix) for prefix in prefixes):
+                return candidate
+        raise StorageError(f"Could not allocate a unique M6 run id below {backend.uri(base)}")
+
     def _finish(self, report: ModelingReport, started: float) -> ModelingReport:
+        report.verdict = self._verdict(report)
         report.finished_at = datetime.now(timezone.utc)
         path = save_report(
             report,
@@ -381,8 +438,44 @@ class ModelingRunner:
         )
         return report
 
+    @staticmethod
+    def _verdict(report: ModelingReport) -> RunVerdict:
+        checks_by_name = {item.get("check"): item for item in report.checks}
+        split_check = checks_by_name.get("split_completeness")
+        if split_check and split_check.get("status") == CheckStatus.FAIL.value:
+            return RunVerdict.INCOMPLETE
 
-def main() -> None:
+        blocking_statuses = {
+            item.get("status")
+            for item in report.checks
+            if item.get("blocking", True)
+        }
+        if CheckStatus.FAIL.value in blocking_statuses:
+            return RunVerdict.INVALID
+        if CheckStatus.INCONCLUSIVE.value in blocking_statuses:
+            return RunVerdict.INCONCLUSIVE
+        if CheckStatus.SKIPPED.value in blocking_statuses:
+            return RunVerdict.INCOMPLETE
+        if (
+            not report.source_commit
+            or report.source_dirty is None
+            or not report.dependency_lock_sha256
+            or not report.config_fingerprint
+        ):
+            return RunVerdict.INCOMPLETE
+        if report.aborted:
+            return RunVerdict.ABORTED
+
+        has_nonblocking_issue = any(
+            not item.get("blocking", True) and item.get("status") != CheckStatus.PASS.value
+            for item in report.checks
+        )
+        if report.warnings or has_nonblocking_issue:
+            return RunVerdict.VALID_WITH_WARNINGS
+        return RunVerdict.VALID
+
+
+def main() -> int:
     """Entry point for ``python -m f1_race_intelligence.modeling.runner``."""
     settings = load_settings()
     configure_logging(
@@ -394,9 +487,10 @@ def main() -> None:
     report = ModelingRunner(settings).run()
     summary = report.summary()
 
-    if report.aborted:
-        print(f"Modeling dataset aborted: {report.aborted}")
-        return
+    if report.verdict not in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS):
+        details = report.aborted or ", ".join(report.blocking_failures) or "; ".join(report.warnings)
+        print(f"Modeling dataset {report.verdict.value}: {details}")
+        return 1
 
     rows = summary["rows_by_split"]
     print(
@@ -405,7 +499,8 @@ def main() -> None:
     )
     for warning in report.warnings:
         print(f"  warning: {warning}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

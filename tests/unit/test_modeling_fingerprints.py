@@ -9,9 +9,10 @@ agree with itself. S3 is the in-memory stub: no boto3, no network, no AWS.
 import hashlib
 import io
 import json
+import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pytest
@@ -22,6 +23,8 @@ from f1_race_intelligence.modeling.fingerprints import INPUT_FINGERPRINT_SCHEME,
 from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader
 from f1_race_intelligence.modeling.runner import ModelingRunner
 from f1_race_intelligence.modeling.split import SPLITS
+from f1_race_intelligence.modeling.verification import verify_report
+from f1_race_intelligence.modeling import traceability
 from f1_race_intelligence.storage.backends import LocalStorageBackend, S3StorageBackend
 from f1_race_intelligence.storage.backends.base import StorageError
 from f1_race_intelligence.storage.layout import LakeLayout, Layer, LegacyLayout
@@ -101,6 +104,10 @@ class Env:
     def reports(self) -> List[Dict[str, Any]]:
         base = self._uri(Layer.MODELING_REPORTS, DEFAULTS.report_path)
         return [json.loads(data) for uri, data in self.stored().items() if _below(uri, base)]
+
+    def report_locations(self) -> List[str]:
+        base = self._uri(Layer.MODELING_REPORTS, DEFAULTS.report_path)
+        return [uri for uri in self.stored() if _below(uri, base)]
 
 
 def _below(uri: str, base: str) -> bool:
@@ -249,6 +256,7 @@ def test_local_disk_and_s3_give_the_same_fingerprint(tmp_path: Path) -> None:
     assert on_disk.source["files"] != on_s3.source["files"], "the locations really differ"
     assert on_s3.source["inputs"] == on_disk.source["inputs"]
     assert on_s3.source["input_fingerprint"] == on_disk.source["input_fingerprint"]
+    assert on_s3.config_fingerprint == on_disk.config_fingerprint
 
 
 # -- artifact fingerprints ------------------------------------------------
@@ -279,6 +287,204 @@ def test_the_saved_report_carries_the_artifact_hashes(env: Env) -> None:
     (saved,) = env.reports()
     assert saved["artifact_files"] == [item.to_dict() for item in report.artifact_files]
     assert saved["source"]["input_fingerprint_scheme"] == INPUT_FINGERPRINT_SCHEME
+    assert saved["schema_version"] == 2
+    assert saved["run_id"] == report.run_id
+    assert saved["config_fingerprint"] == report.config_fingerprint
+    assert saved["source_commit"] == report.source_commit
+    assert saved["dependency_lock_sha256"] == report.dependency_lock_sha256
+    assert len(saved["dependency_lock_sha256"]) == 64
+
+
+def saved_artifact_hashes(env: Env) -> Dict[Tuple[Optional[str], str], str]:
+    """The hashes the single saved report declares, by (split, artifact) — location left out."""
+    (saved,) = env.reports()
+    return {(item["split"], item["artifact"]): item["sha256"] for item in saved["artifact_files"]}
+
+
+def stored_artifact_bytes(env: Env) -> Dict[Tuple[Optional[str], str], bytes]:
+    """What the medium holds for each declared artifact, by (split, artifact)."""
+    (saved,) = env.reports()
+    if env.kind == "local":
+        stored = {os.path.normcase(os.path.realpath(path)): data for path, data in env.artifact_objects().items()}
+        return {
+            (item["split"], item["artifact"]): stored[os.path.normcase(os.path.realpath(item["path"]))]
+            for item in saved["artifact_files"]
+        }
+    stored = env.artifact_objects()
+    return {(item["split"], item["artifact"]): stored[item["path"]] for item in saved["artifact_files"]}
+
+
+def test_m6_artifact_hashes_match_between_local_and_s3(tmp_path: Path) -> None:
+    """All eight artifacts are the same bytes on disk and on S3, on any operating system.
+
+    The hashes are compared as the reports state them and the objects as the
+    media hold them. Nothing is parsed or normalised first: a JSON file that
+    means the same but differs in its line endings is a different artifact.
+    """
+    local, lake = Env("local", tmp_path), Env("s3", tmp_path)
+    assert local.publish() == lake.publish()
+
+    local.run()
+    lake.run()
+
+    on_disk, on_s3 = saved_artifact_hashes(local), saved_artifact_hashes(lake)
+    assert set(on_disk) == set(on_s3) == EXPECTED_ARTIFACTS
+    assert len(on_disk) == 8
+    differing = sorted((str(key) for key in on_disk if on_disk[key] != on_s3[key]))
+    assert differing == [], f"artifacts whose bytes depend on the backend: {differing}"
+
+    disk_bytes, s3_bytes = stored_artifact_bytes(local), stored_artifact_bytes(lake)
+    for key, declared in on_disk.items():
+        assert disk_bytes[key] == s3_bytes[key], key
+        assert sha256(disk_bytes[key]) == declared, key
+
+
+def test_two_runs_with_the_same_inputs_give_identical_artifact_hashes(env: Env, tmp_path: Path) -> None:
+    """Same inputs, same configuration, same backend, a fresh store each time."""
+    again = Env(env.kind, tmp_path / "second-run")
+    assert env.publish() == again.publish()
+
+    first = env.run()
+    second = again.run()
+
+    assert first.aborted is None and second.aborted is None
+    assert second.source["input_fingerprint"] == first.source["input_fingerprint"]
+    # Only where each store lives may differ between the two runs.
+    where = {"input_storage", "output_storage"}
+    assert {k: v for k, v in second.config.items() if k not in where} == {
+        k: v for k, v in first.config.items() if k not in where
+    }
+    assert saved_artifact_hashes(again) == saved_artifact_hashes(env)
+    assert set(saved_artifact_hashes(env)) == EXPECTED_ARTIFACTS
+    assert stored_artifact_bytes(again) == stored_artifact_bytes(env), "the serialised content is identical too"
+
+
+def test_each_run_uses_a_distinct_versioned_artifact_prefix(env: Env) -> None:
+    env.publish()
+
+    first = env.run()
+    second = env.run()
+
+    assert first.run_id != second.run_id
+    first_paths = {item.path for item in first.artifact_files}
+    second_paths = {item.path for item in second.artifact_files}
+    assert len(first_paths) == len(second_paths) == 8
+    assert first_paths.isdisjoint(second_paths)
+    assert len(env.artifact_objects()) == 16
+
+
+def test_report_verification_checks_artifact_bytes_without_rewriting_report(tmp_path: Path) -> None:
+    env = Env("local", tmp_path)
+    env.publish()
+    env.run()
+    (location,) = env.report_locations()
+    before = Path(location).read_bytes()
+
+    result = verify_report(location)
+
+    assert result["ok"] is True
+    assert result["schema_version"] == 2
+    assert result["artifacts_checked"] == 8
+    assert Path(location).read_bytes() == before
+
+
+def test_report_verification_reads_v1_and_detects_tampering(tmp_path: Path) -> None:
+    env = Env("local", tmp_path / "store")
+    env.publish()
+    env.run()
+    (location,) = env.report_locations()
+    payload = json.loads(Path(location).read_bytes())
+    for field in (
+        "schema_version",
+        "run_id",
+        "source_commit",
+        "source_dirty",
+        "dependency_lock_sha256",
+        "config_fingerprint",
+        "verdict",
+    ):
+        payload.pop(field, None)
+    v1_path = tmp_path / "legacy-v1-report.json"
+    v1_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    legacy = verify_report(str(v1_path))
+    assert legacy["ok"] is True
+    assert legacy["schema_version"] == 1
+
+    artifact_path = Path(payload["artifact_files"][0]["path"])
+    artifact_path.write_bytes(b"tampered")
+    tampered = verify_report(str(v1_path))
+    assert tampered["ok"] is False
+    assert any("sha256 mismatch" in item for item in tampered["errors"])
+
+
+def test_source_commit_is_not_invented_when_git_is_unavailable(monkeypatch) -> None:
+    monkeypatch.delenv("F1_GIT_COMMIT", raising=False)
+    monkeypatch.delenv("F1_GIT_DIRTY", raising=False)
+
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("git is not installed")
+
+    monkeypatch.setattr(traceability.subprocess, "run", unavailable)
+
+    assert traceability.source_revision() == (None, None)
+
+
+def test_injected_commit_is_recorded_without_claiming_unknown_cleanliness(monkeypatch) -> None:
+    monkeypatch.setenv("F1_GIT_COMMIT", "a" * 40)
+    monkeypatch.setenv("F1_GIT_DIRTY", "")
+
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("git is not installed")
+
+    monkeypatch.setattr(traceability.subprocess, "run", unavailable)
+
+    assert traceability.source_revision() == ("a" * 40, None)
+
+
+def test_missing_dependency_lock_prevents_a_valid_verdict(env: Env, monkeypatch, tmp_path: Path) -> None:
+    env.publish()
+    monkeypatch.setenv("F1_DEPENDENCY_LOCK_PATH", str(tmp_path / "missing-lock.txt"))
+
+    report = env.run()
+
+    assert report.dependency_lock_sha256 is None
+    assert report.verdict.value == "INCOMPLETE"
+    assert report.summary()["checks_passed"] is False
+
+
+def test_missing_source_revision_prevents_a_valid_verdict(env: Env, monkeypatch) -> None:
+    env.publish()
+    monkeypatch.setattr("f1_race_intelligence.modeling.runner.source_revision", lambda: (None, None))
+
+    report = env.run()
+
+    assert report.source_commit is None
+    assert report.verdict.value == "INCOMPLETE"
+    assert report.summary()["checks_passed"] is False
+
+
+def test_configuration_fingerprint_excludes_storage_locations_and_secrets() -> None:
+    first = traceability.config_fingerprint(
+        {"split_strategy": "fraction", "input_storage": {"location": "local", "token": "secret-a"}}
+    )
+    second = traceability.config_fingerprint(
+        {"split_strategy": "fraction", "input_storage": {"location": "s3", "token": "secret-b"}}
+    )
+
+    assert first == second
+
+
+def test_the_feature_schema_is_stored_with_lf_line_endings(env: Env) -> None:
+    """The one JSON artifact: UTF-8, LF, no BOM, no trailing newline, on every backend."""
+    env.publish()
+
+    env.run()
+
+    schema = stored_artifact_bytes(env)[(None, "feature_schema.json")]
+    assert b"\r" not in schema
+    assert not schema.startswith(b"\xef\xbb\xbf") and not schema.endswith(b"\n")
+    assert schema == json.dumps(json.loads(schema), ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
 
 # -- runs that stop early -------------------------------------------------
@@ -360,10 +566,10 @@ class FailingStorage(LocalStorageBackend):
             raise StorageError(f"forced read failure for {key}")
         return super().read_bytes(key)
 
-    def write_parquet(self, key: str, frame) -> int:
+    def write_parquet_if_absent(self, key: str, frame) -> bool:
         if self._write and self._write in key:
             raise StorageError(f"forced write failure for {key}")
-        return super().write_parquet(key, frame)
+        return super().write_parquet_if_absent(key, frame)
 
 
 def test_a_failed_read_records_no_inputs_at_all(tmp_path: Path) -> None:
@@ -378,7 +584,7 @@ def test_a_failed_read_records_no_inputs_at_all(tmp_path: Path) -> None:
 
 def test_a_failed_write_declares_no_artifacts(tmp_path: Path) -> None:
     Env("local", tmp_path).publish()
-    failing = Env("local", tmp_path, backend=FailingStorage(tmp_path / "store", write="validation/features"))
+    failing = Env("local", tmp_path, backend=FailingStorage(tmp_path / "store", write="validation/runs"))
 
     with pytest.raises(StorageError):
         failing.run()
@@ -434,3 +640,42 @@ def test_a_disabled_leakage_stop_still_writes_and_declares_everything(env: Env, 
     assert report.aborted is None
     assert report.blocking_failures == ["chronological_split"]
     assert {item.path for item in report.artifact_files} == set(env.artifact_objects())
+
+
+def test_an_omitted_required_guard_is_skipped_and_cannot_yield_a_valid_verdict(
+    env: Env, monkeypatch
+) -> None:
+    env.publish()
+    monkeypatch.setattr(
+        ModelingRunner,
+        "_run_checks",
+        lambda *args, **kwargs: [checks.CheckResult("target_not_in_features", True, "safe")],
+    )
+
+    report = env.run(fail_on_leakage=False)
+
+    omitted = next(item for item in report.checks if item["check"] == "chronological_split")
+    assert omitted["status"] == "SKIPPED"
+    assert omitted["reason"]
+    assert report.verdict.value == "INCOMPLETE"
+    assert report.summary()["checks_passed"] is False
+
+
+def test_inconclusive_blocking_guard_cannot_yield_a_valid_verdict(env: Env, monkeypatch) -> None:
+    env.publish()
+    monkeypatch.setattr(
+        checks,
+        "check_no_test_statistics_used_in_training",
+        lambda *args, **kwargs: checks.CheckResult(
+            "no_test_statistics_used_in_training",
+            False,
+            "not distinguishable",
+            details={"inconclusive": "the comparison was not discriminative"},
+        ),
+    )
+
+    report = env.run(fail_on_leakage=False)
+
+    assert report.verdict.value == "INCONCLUSIVE"
+    assert next(item for item in report.checks if item["check"] == "no_test_statistics_used_in_training")["status"] == "INCONCLUSIVE"
+    assert report.summary()["checks_passed"] is False

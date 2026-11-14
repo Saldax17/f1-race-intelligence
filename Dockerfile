@@ -22,6 +22,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Supply these at build time when building from a source checkout. Without a
+# commit argument, the runtime records no commit rather than inventing one.
+ARG F1_GIT_COMMIT
+ARG F1_GIT_DIRTY
+
 # Unprivileged user with a fixed UID, so file ownership on mounted volumes is
 # predictable.
 RUN groupadd --system --gid 10001 f1 \
@@ -53,7 +58,10 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
 # file, so the config path is explicit. Storage and environment are chosen
 # with F1_ENVIRONMENT / F1_STORAGE_* at run time.
 ENV F1_CONFIG_PATH=/app/configs/config.yaml \
-    F1_ENVIRONMENT=local
+    F1_ENVIRONMENT=local \
+    F1_GIT_COMMIT=${F1_GIT_COMMIT} \
+    F1_GIT_DIRTY=${F1_GIT_DIRTY} \
+    F1_DEPENDENCY_LOCK_PATH=/app/requirements/runtime-lock.txt
 
 USER f1
 

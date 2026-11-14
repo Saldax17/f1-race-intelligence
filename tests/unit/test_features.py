@@ -14,6 +14,7 @@ import pytest
 
 from f1_race_intelligence.config.settings import AppSettings
 from f1_race_intelligence.features import checks, selection
+from f1_race_intelligence.validation.states import CheckStatus
 from f1_race_intelligence.features.runner import FeatureRunner
 from f1_race_intelligence.features.selection import FeatureRole, TARGET_COLUMN
 from f1_race_intelligence.features.target import add_target
@@ -285,6 +286,19 @@ def test_the_last_lap_guard_catches_an_invented_target() -> None:
 
     assert result.passed is False
     assert result.details["last_laps_with_target"] == 1
+
+
+def test_an_unavailable_last_lap_guard_is_reported_as_skipped_not_passed() -> None:
+    frame = feature_frame().drop(columns=["is_last_lap_for_driver"])
+
+    result = checks.check_last_lap_has_no_target(frame)
+
+    assert result.passed is False
+    assert result.status is CheckStatus.SKIPPED
+    assert result.to_dict()["status"] == "SKIPPED"
+    assert result.to_dict()["reason"]
+    assert result.blocking is False
+    assert checks.blocking_failures([result]) == []
 
 
 def test_the_rolling_guard_catches_a_window_that_saw_the_future() -> None:
