@@ -9,6 +9,7 @@ agree with itself. S3 is the in-memory stub: no boto3, no network, no AWS.
 import hashlib
 import io
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -303,6 +304,12 @@ def saved_artifact_hashes(env: Env) -> Dict[Tuple[Optional[str], str], str]:
 def stored_artifact_bytes(env: Env) -> Dict[Tuple[Optional[str], str], bytes]:
     """What the medium holds for each declared artifact, by (split, artifact)."""
     (saved,) = env.reports()
+    if env.kind == "local":
+        stored = {os.path.normcase(os.path.realpath(path)): data for path, data in env.artifact_objects().items()}
+        return {
+            (item["split"], item["artifact"]): stored[os.path.normcase(os.path.realpath(item["path"]))]
+            for item in saved["artifact_files"]
+        }
     stored = env.artifact_objects()
     return {(item["split"], item["artifact"]): stored[item["path"]] for item in saved["artifact_files"]}
 
