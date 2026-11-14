@@ -1,15 +1,16 @@
 # Infraestructura AWS (SAM / CloudFormation)
 
-> **Estado:** la infraestructura base está desplegada en `dev` con
-> `PipelineEnabled=false` y el calendario `DISABLED`. La Fase 1B (tareas
-> Fargate endurecidas para M2–M6, su red y su integración con Step Functions)
-> está definida en `template.yaml` pero **no desplegada**. No entrena ni publica
-> modelos (sin M7, sin SageMaker).
+> **Estado:** `aws_status.json` es la fuente única de verdad versionada. La
+> arquitectura y su código están definidos, y la validación local está
+> registrada allí. El estado de despliegue y las pruebas en AWS real son
+> **NO VERIFICABLES** en ausencia de comprobación humana; este documento no
+> reemplaza esa evidencia. No entrena ni publica modelos (sin M7, sin SageMaker).
 
 ## Estructura
 
 ```
 infra/
+├── aws_status.json                       # estado técnico AWS: fuente única de verdad
 ├── template.yaml                          # stack SAM (CloudFormation + Transform)
 ├── samconfig.toml                         # parámetros por entorno (dev, prod); confirma changesets
 ├── functions/
@@ -132,7 +133,7 @@ que ninguna tarea depende del disco de otra.
 | `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
 | `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
 | `M5_Features` | `--stage m5 --year Y --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
-| `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/`, `modeling/preprocessing/`, `manifests/modeling/` |
+| `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/runs/<run_id>/`, `modeling/preprocessing/runs/<run_id>/`, `manifests/modeling/` |
 
 Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
 generan esos comandos y los pasan por el parser real de la CLI.

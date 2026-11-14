@@ -259,6 +259,31 @@ def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch
     assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
 
 
+def test_m6_blocking_guard_still_fails_pipeline_when_leakage_stop_is_disabled(
+    config_file, tmp_path, monkeypatch
+) -> None:
+    for session_key, year, offset in ((1, 2023, 0), (2, 2024, 365), (3, 2025, 730)):
+        frame = pd.DataFrame(feature_rows(session_key, year, offset))
+        (tmp_path / "features" / str(year)).mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(tmp_path / "features" / str(year) / f"session_{session_key}.parquet", index=False)
+    config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    config["modeling"]["fail_on_leakage"] = False
+    config_file.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    monkeypatch.setattr(
+        checks, "check_chronological_split", lambda assignments: checks.CheckResult("chronological_split", False, "forced")
+    )
+    assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
+
+
+def test_verify_m6_requires_a_report_and_accepts_a_legacy_report(config_file, tmp_path) -> None:
+    assert cli.main(["--stage", "verify-m6", "--config", str(config_file)]) == cli.EXIT_USAGE
+    report = tmp_path / "m6-v1.json"
+    report.write_text(json.dumps({"artifact_files": []}), encoding="utf-8")
+
+    assert cli.main(["--stage", "verify-m6", "--report", str(report), "--config", str(config_file)]) == cli.EXIT_OK
+
+
 def test_an_unexpected_exception_is_reported_as_a_failed_stage(config_file, monkeypatch) -> None:
     def explode(ctx):
         raise RuntimeError("boom")

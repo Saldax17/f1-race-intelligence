@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from f1_race_intelligence.storage import raw_storage
+from f1_race_intelligence.storage.backends import base as storage_base
+from f1_race_intelligence.storage.backends import local as local_backend
 from f1_race_intelligence.storage.raw_storage import RawDataStorage
-from f1_race_intelligence.utils import files
 
 
 class _FrozenClock:
@@ -110,21 +112,99 @@ def test_save_with_file_name_leaves_no_temporary_files_behind(tmp_path: Path) ->
     assert [item.name for item in path.parent.iterdir()] == ["session_9158.json"]
 
 
-def test_a_failed_write_leaves_neither_a_partial_nor_a_temporary_file(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "module, attribute",
+    [
+        # Before anything reaches the disk: the payload cannot be serialised.
+        (storage_base, "_json_bytes"),
+        # After the temporary file is fully written: it cannot be moved into place.
+        (os, "replace"),
+    ],
+    ids=["while-serialising", "while-replacing"],
+)
+def test_a_failed_write_leaves_neither_a_partial_nor_a_temporary_file(
+    tmp_path: Path, monkeypatch, module, attribute
+) -> None:
     storage = RawDataStorage(base_path=tmp_path)
     storage.save("laps", {"session_key": 9158}, data=["original"], file_name="session_9158.json")
+    target = tmp_path / "laps" / "session_key=9158" / "session_9158.json"
+    original = target.read_bytes()
 
-    def explode(payload, handle):
+    def explode(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(files, "dump_json", explode)
+    monkeypatch.setattr(module, attribute, explode)
 
     with pytest.raises(OSError):
         storage.save("laps", {"session_key": 9158}, data=["replacement"], file_name="session_9158.json")
 
-    target = tmp_path / "laps" / "session_key=9158" / "session_9158.json"
     assert [item.name for item in target.parent.iterdir()] == ["session_9158.json"]
     assert json.loads(target.read_text(encoding="utf-8"))["data"] == ["original"]
+    assert target.read_bytes() == original
+
+
+def test_a_failure_while_writing_the_binary_temporary_file_keeps_the_original(tmp_path: Path, monkeypatch) -> None:
+    """The temporary file exists before its binary write fails and is then removed."""
+    storage = RawDataStorage(base_path=tmp_path)
+    storage.save("laps", {"session_key": 9158}, data=["original"], file_name="session_9158.json")
+    target = tmp_path / "laps" / "session_key=9158" / "session_9158.json"
+    original = target.read_bytes()
+    real_named_temporary_file = local_backend.tempfile.NamedTemporaryFile
+
+    class FailingTemporaryFile:
+        def __init__(self, handle):
+            self._handle = handle
+
+        @property
+        def name(self):
+            return self._handle.name
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def write(self, data):
+            raise OSError("disk full")
+
+    def failing_named_temporary_file(*args, **kwargs):
+        return FailingTemporaryFile(real_named_temporary_file(*args, **kwargs))
+
+    monkeypatch.setattr(local_backend.tempfile, "NamedTemporaryFile", failing_named_temporary_file)
+
+    with pytest.raises(OSError, match="disk full"):
+        storage.save("laps", {"session_key": 9158}, data=["replacement"], file_name="session_9158.json")
+
+    assert [item.name for item in target.parent.iterdir()] == ["session_9158.json"]
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("file_name", ["session_9158.json", None], ids=["named", "timestamped"])
+def test_saved_files_use_lf_line_endings_on_every_operating_system(tmp_path: Path, file_name) -> None:
+    storage = RawDataStorage(base_path=tmp_path)
+
+    path = storage.save("laps", {"session_key": 9158}, data=[{"driver": "Pérez"}], file_name=file_name)
+
+    stored = path.read_bytes()
+    assert b"\r" not in stored
+    assert stored.count(b"\n") > 0
+    assert not stored.startswith(b"\xef\xbb\xbf") and not stored.endswith(b"\n")
+    assert "Pérez".encode("utf-8") in stored
+
+
+def test_a_raw_file_saved_with_crlf_by_an_earlier_version_still_loads_and_is_left_alone(tmp_path: Path) -> None:
+    """Raw files downloaded on Windows before the fix carry CRLF and are never rewritten."""
+    storage = RawDataStorage(base_path=tmp_path)
+    target = storage.resolve_path("laps", {"session_key": 9158}, file_name="session_9158.json")
+    target.parent.mkdir(parents=True)
+    historical = b'{\r\n  "endpoint": "laps",\r\n  "data": [\r\n    {\r\n      "lap_number": 1\r\n    }\r\n  ]\r\n}'
+    target.write_bytes(historical)
+
+    assert storage.exists("laps", {"session_key": 9158}, file_name="session_9158.json")
+    assert storage.load("laps", {"session_key": 9158}, file_name="session_9158.json") == [{"lap_number": 1}]
+    assert target.read_bytes() == historical
 
 
 def test_resolve_path_points_at_where_save_would_write_without_creating_it(tmp_path: Path) -> None:

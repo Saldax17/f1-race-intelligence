@@ -5,12 +5,17 @@ against :class:`StorageBackend` must not be able to tell them apart. The S3
 backend talks to an in-memory stub — no boto3, no network, no credentials.
 """
 
+import json
 import os
+import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pandas as pd
 import pytest
 
+from f1_race_intelligence.storage.backends import local as local_backend
 from f1_race_intelligence.storage.backends import LocalStorageBackend, S3StorageBackend, StorageError, join_key
 from f1_race_intelligence.storage.backends.base import relative_parts
 from f1_race_intelligence.storage.store import DataStore, store_from_storage_settings, store_from_uri
@@ -90,10 +95,95 @@ def test_json_round_trip(backend) -> None:
     assert backend.read_json("raw/laps.json") == payload
 
 
+# -- JSON bytes: one representation on every backend and operating system -----
+
+JSON_PAYLOAD = {
+    "endpoint": "laps",
+    "driver": "Pérez",
+    "nested": {"values": [1, 2.5, None, True], "empty": {}},
+    "data": [{"lap_number": 1}, {"lap_number": 2}],
+}
+
+
+def canonical_json(payload) -> bytes:
+    """The agreed JSON representation, written out here rather than imported.
+
+    UTF-8 without a BOM, two-space indent, LF between lines, no trailing
+    newline. Stating it independently means the backends are compared with
+    the contract, not with their own implementation.
+    """
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def assert_canonical_json(stored: bytes, payload) -> None:
+    assert stored == canonical_json(payload)
+    assert b"\r" not in stored, "no CRLF (or lone CR) line endings"
+    assert stored.count(b"\n") > 0, "lines are separated by LF"
+    assert not stored.startswith(b"\xef\xbb\xbf"), "no byte order mark"
+    assert not stored.endswith(b"\n"), "no trailing newline"
+    assert "Pérez".encode("utf-8") in stored, "non-ASCII text is stored as UTF-8, not escaped"
+    assert json.loads(stored.decode("utf-8")) == payload
+
+
+def test_json_is_stored_as_the_canonical_bytes(backend) -> None:
+    backend.write_json("raw/laps.json", JSON_PAYLOAD)
+
+    assert_canonical_json(backend.read_bytes("raw/laps.json"), JSON_PAYLOAD)
+
+
+def test_unique_json_is_stored_as_the_canonical_bytes(backend) -> None:
+    key = backend.write_json_unique("manifests", "manifest_x", JSON_PAYLOAD)
+
+    assert_canonical_json(backend.read_bytes(key), JSON_PAYLOAD)
+
+
+def test_local_disk_and_s3_store_identical_json_bytes(tmp_path: Path) -> None:
+    """Compared byte for byte, straight from each medium, with nothing normalised."""
+    client = FakeS3Client()
+    local, s3 = LocalStorageBackend(tmp_path), S3StorageBackend(BUCKET, "dev", client=client)
+
+    for store in (local, s3):
+        store.write_json("reports/replaceable.json", JSON_PAYLOAD)
+        assert store.write_json_unique("reports", "unique", JSON_PAYLOAD) == "reports/unique.json"
+
+    for name in ("replaceable.json", "unique.json"):
+        on_disk = (tmp_path / "reports" / name).read_bytes()
+        on_s3 = client.objects[BUCKET][f"dev/reports/{name}"]
+        assert on_disk == on_s3, name
+
+
+def test_json_written_with_crlf_by_an_earlier_version_is_still_readable(backend) -> None:
+    """Files written on Windows before the fix carry CRLF; they must stay readable and untouched."""
+    payload = {"endpoint": "laps", "driver": "Pérez", "data": [{"lap_number": 1}]}
+    historical = canonical_json(payload).replace(b"\n", b"\r\n")
+    assert b"\r\n" in historical
+    backend.write_bytes("raw/old.json", historical)
+
+    assert backend.read_json("raw/old.json") == payload
+    assert backend.read_bytes("raw/old.json") == historical, "reading never rewrites a historical file"
+
+
 def test_write_if_absent_never_replaces(backend) -> None:
     assert backend.write_bytes_if_absent("records/r.json", b"one") is True
     assert backend.write_bytes_if_absent("records/r.json", b"two") is False
     assert backend.read_bytes("records/r.json") == b"one"
+
+
+def test_format_writers_can_publish_once_without_replacing_existing_objects(backend) -> None:
+    first_frame = pd.DataFrame({"value": [1, 2]})
+    second_frame = pd.DataFrame({"value": [9]})
+
+    assert backend.write_json_if_absent("runs/a/report.json", {"run": 1}) is True
+    assert backend.write_json_if_absent("runs/a/report.json", {"run": 2}) is False
+    assert backend.read_bytes("runs/a/report.json") == canonical_json({"run": 1})
+
+    assert backend.write_parquet_if_absent("runs/a/data.parquet", first_frame) is True
+    assert backend.write_parquet_if_absent("runs/a/data.parquet", second_frame) is False
+    pd.testing.assert_frame_equal(backend.read_parquet("runs/a/data.parquet"), first_frame)
+
+    assert backend.write_joblib_if_absent("runs/a/model.joblib", {"run": 1}) is True
+    assert backend.write_joblib_if_absent("runs/a/model.joblib", {"run": 2}) is False
+    assert backend.read_joblib("runs/a/model.joblib") == {"run": 1}
 
 
 def test_unique_json_names_get_suffixes_instead_of_overwriting(backend) -> None:
@@ -104,6 +194,7 @@ def test_unique_json_names_get_suffixes_instead_of_overwriting(backend) -> None:
     assert second == "manifests/manifest_20260101T000000000000Z-1.json"
     assert backend.read_json(first) == {"run": 1}
     assert backend.read_json(second) == {"run": 2}
+    assert backend.read_bytes(first) == canonical_json({"run": 1}), "the first record is left exactly as written"
 
 
 def test_parquet_round_trip_keeps_dtypes_and_invents_no_partition_columns(backend) -> None:
@@ -166,6 +257,123 @@ def test_local_failed_write_leaves_the_previous_file_and_no_temporary(tmp_path: 
 
     assert [item.name for item in (tmp_path / "raw").iterdir()] == ["a.json"]
     assert (tmp_path / "raw" / "a.json").read_bytes() == b"original"
+
+
+def test_local_failed_json_write_leaves_the_previous_file_and_no_temporary(tmp_path: Path, monkeypatch) -> None:
+    """JSON gets the same all-or-nothing replacement as any other object."""
+    backend = LocalStorageBackend(tmp_path)
+    backend.write_json("raw/a.json", {"version": "original"})
+    original = (tmp_path / "raw" / "a.json").read_bytes()
+
+    def explode(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", explode)
+    with pytest.raises(OSError):
+        backend.write_json("raw/a.json", {"version": "replacement"})
+
+    assert [item.name for item in (tmp_path / "raw").iterdir()] == ["a.json"]
+    assert (tmp_path / "raw" / "a.json").read_bytes() == original
+
+
+def test_local_unique_json_is_created_exclusively(tmp_path: Path) -> None:
+    """A name already taken on disk — by anyone — is never replaced."""
+    backend = LocalStorageBackend(tmp_path)
+    (tmp_path / "manifests").mkdir()
+    (tmp_path / "manifests" / "manifest_x.json").write_bytes(b"written by another process")
+
+    key = backend.write_json_unique("manifests", "manifest_x", {"run": 2})
+
+    assert key == "manifests/manifest_x-1.json"
+    assert (tmp_path / "manifests" / "manifest_x.json").read_bytes() == b"written by another process"
+    assert sorted(item.name for item in (tmp_path / "manifests").iterdir()) == ["manifest_x-1.json", "manifest_x.json"]
+
+
+def test_local_unique_json_write_failure_leaves_no_partial_file_or_temporary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    backend = LocalStorageBackend(tmp_path)
+    real_fdopen = local_backend.os.fdopen
+    directory = tmp_path / "manifests"
+    partial_contents: list[bytes] = []
+
+    class FailingBinaryFile:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def write(self, data):
+            self._handle.write(data[:2])
+            self._handle.flush()
+            temp_files = [path for path in directory.iterdir() if path.name.startswith(".tmp-")]
+            assert len(temp_files) == 1
+            partial_contents.append(temp_files[0].read_bytes())
+            raise OSError("disk full")
+
+    def failing_fdopen(descriptor, mode):
+        return FailingBinaryFile(real_fdopen(descriptor, mode))
+
+    monkeypatch.setattr(local_backend.os, "fdopen", failing_fdopen)
+
+    with pytest.raises(OSError, match="disk full"):
+        backend.write_json_unique("manifests", "manifest_x", {"run": 1})
+
+    assert partial_contents == [b"{\n"]
+    assert not (directory / "manifest_x.json").exists()
+    assert [path.name for path in directory.iterdir()] == []
+
+
+def test_local_write_bytes_if_absent_allows_only_one_concurrent_publisher(tmp_path: Path) -> None:
+    backend = LocalStorageBackend(tmp_path)
+    barrier = Barrier(2)
+
+    def publish(data: bytes) -> bool:
+        barrier.wait(timeout=5)
+        return backend.write_bytes_if_absent("records/shared.bin", data)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, (b"writer one", b"writer two")))
+
+    assert sorted(results) == [False, True]
+    assert backend.read_bytes("records/shared.bin") in {b"writer one", b"writer two"}
+    assert [path.name for path in (tmp_path / "records").iterdir()] == ["shared.bin"]
+
+
+def test_local_write_bytes_if_absent_preserves_default_create_permissions(tmp_path: Path) -> None:
+    backend = LocalStorageBackend(tmp_path)
+    expected_mode_path = tmp_path / "ordinary-create.bin"
+    with expected_mode_path.open("xb") as handle:
+        handle.write(b"ordinary")
+
+    backend.write_bytes_if_absent("records/created.bin", b"atomic")
+
+    actual_mode = stat.S_IMODE((tmp_path / "records" / "created.bin").stat().st_mode)
+    expected_mode = stat.S_IMODE(expected_mode_path.stat().st_mode)
+    assert actual_mode == expected_mode
+
+
+def test_local_unique_json_fails_safely_when_hard_link_publication_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    backend = LocalStorageBackend(tmp_path)
+
+    def unsupported(*args, **kwargs):
+        raise OSError("hard links unsupported")
+
+    monkeypatch.setattr(local_backend.os, "link", unsupported)
+
+    with pytest.raises(OSError, match="hard links unsupported"):
+        backend.write_json_unique("manifests", "manifest_x", {"run": 1})
+
+    directory = tmp_path / "manifests"
+    assert not (directory / "manifest_x.json").exists()
+    assert list(directory.iterdir()) == []
 
 
 # -- S3 specifics -------------------------------------------------------------

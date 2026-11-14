@@ -26,6 +26,7 @@ from f1_race_intelligence.features.selection import FORBIDDEN_AS_FEATURES, TARGE
 from f1_race_intelligence.features import selection
 from f1_race_intelligence.modeling import preprocessing
 from f1_race_intelligence.modeling.split import SPLITS, TEST, TRAIN, VALIDATION, SessionAssignment
+from f1_race_intelligence.validation.states import CheckStatus
 
 # Columns that must never appear in the feature matrix: the target and its
 # flag, everything M5 classified as leaky or excluded, and the identifiers
@@ -56,6 +57,23 @@ guard that forbids these columns from the model input does not have to
 import the module it is guarding.
 """
 
+REQUIRED_M6_CHECKS = (
+    "split_completeness",
+    "target_not_in_features",
+    "forbidden_columns_not_in_features",
+    "traceability_columns_not_in_model_features",
+    "no_session_overlap_between_splits",
+    "no_row_overlap_between_splits",
+    "chronological_split",
+    "preprocessing_fitted_on_train_only",
+    "no_validation_statistics_used_in_training",
+    "no_test_statistics_used_in_training",
+    "consistent_feature_schema",
+    "categorical_unknown_handling",
+    "target_alignment",
+    "target_rows_are_valid",
+)
+
 
 @dataclass
 class CheckResult:
@@ -66,21 +84,75 @@ class CheckResult:
     description: str
     blocking: bool = True
     details: Dict[str, Any] = field(default_factory=dict)
+    status: Optional[CheckStatus] = None
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.status is None:
+            if self.details.get("skipped"):
+                self.status = CheckStatus.SKIPPED
+            elif self.details.get("inconclusive"):
+                self.status = CheckStatus.INCONCLUSIVE
+            else:
+                self.status = CheckStatus.PASS if self.passed else CheckStatus.FAIL
+        elif not isinstance(self.status, CheckStatus):
+            self.status = CheckStatus(self.status)
+        if self.status is CheckStatus.PASS and not self.passed:
+            raise ValueError(f"Passing check {self.name!r} must have passed=True")
+        if self.status is CheckStatus.FAIL and self.passed:
+            raise ValueError(f"Failed check {self.name!r} must have passed=False")
+        self.passed = self.status is CheckStatus.PASS
+        if self.status is CheckStatus.SKIPPED:
+            self.reason = self.reason or self.details.get("reason") or self.description
+            if not self.reason.strip():
+                raise ValueError(f"Skipped check {self.name!r} must include a reason")
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
             "check": self.name,
-            "status": "PASS" if self.passed else "FAIL",
+            "status": self.status.value,
             "blocking": self.blocking,
             "description": self.description,
         }
+        if self.reason:
+            payload["reason"] = self.reason
         if self.details:
             payload["details"] = self.details
         return payload
 
 
 def blocking_failures(results: Sequence[CheckResult]) -> List[str]:
-    return [item.name for item in results if item.blocking and not item.passed]
+    return [item.name for item in results if item.blocking and item.status is not CheckStatus.PASS]
+
+
+def complete_required_checks(results: Sequence[CheckResult]) -> List[CheckResult]:
+    """Make omitted mandatory guards explicit and blocking."""
+    completed = list(results)
+    present = {item.name for item in completed}
+    for name in REQUIRED_M6_CHECKS:
+        if name not in present:
+            completed.append(
+                CheckResult(
+                    name,
+                    False,
+                    "Required guard was not executed",
+                    details={"skipped": True},
+                    status=CheckStatus.SKIPPED,
+                    reason="Required guard was not executed",
+                )
+            )
+    return completed
+
+
+def check_split_completeness(splits: Dict[str, pd.DataFrame]) -> CheckResult:
+    """Require non-empty train, validation and test partitions."""
+    empty = [name for name in SPLITS if name not in splits or splits[name].empty]
+    return CheckResult(
+        "split_completeness",
+        not empty,
+        "Train, validation and test splits all contain rows",
+        details={"empty_splits": empty},
+    )
 
 
 # -- feature matrix --------------------------------------------------------
@@ -340,9 +412,11 @@ def _check_split_not_used_for_fitting(
     if other_matrix.empty:
         return CheckResult(
             name,
-            True,
+            False,
             f"Skipped: the {other_name} split is empty",
             details={"skipped": True, "reason": f"no {other_name} rows"},
+            status=CheckStatus.SKIPPED,
+            reason=f"no {other_name} rows",
         )
 
     actual = preprocessing.learned_parameters(preprocessor)
@@ -361,7 +435,13 @@ def _check_split_not_used_for_fitting(
             f"Fitting on train alone and on train + {other_name} produced identical statistics, so this "
             "comparison cannot discriminate. The preprocessing_fitted_on_train_only guard still applies."
         )
-        return CheckResult(name, matches_train, f"No {other_name} statistics reached the transformer", details=details)
+        return CheckResult(
+            name,
+            False,
+            f"No {other_name} statistics reached the transformer",
+            details=details,
+            status=CheckStatus.INCONCLUSIVE,
+        )
 
     return CheckResult(
         name,
@@ -402,7 +482,15 @@ def check_categorical_unknown_handling(
     season should not break the pipeline at the moment it is used.
     """
     if not categorical:
-        return CheckResult("categorical_unknown_handling", True, "No categorical features", details={"skipped": True})
+        return CheckResult(
+            "categorical_unknown_handling",
+            True,
+            "No categorical features",
+            blocking=False,
+            details={"skipped": True, "reason": "No categorical features are configured"},
+            status=CheckStatus.SKIPPED,
+            reason="No categorical features are configured",
+        )
 
     block = preprocessing._block(preprocessor, preprocessing.CATEGORICAL_BLOCK)
     encoder = block.named_steps["encode"] if block is not None else None

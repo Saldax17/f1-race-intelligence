@@ -11,7 +11,8 @@
 
 Stages: ``plan`` (list the session work units of a season), ``m2`` extraction,
 ``m3`` validation, ``m4`` consolidation, ``m5`` features, ``m6`` modelling
-datasets, and ``copy-raw`` (copy already-extracted raw data between stores).
+datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), and
+``copy-raw`` (copy already-extracted raw data between stores).
 Several stages run in order when given as a comma-separated list; the first
 failure stops the chain.
 
@@ -50,7 +51,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "copy-raw")
+STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "copy-raw")
 
 
 @dataclass
@@ -103,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also write the plan's work units as JSON to this local file or s3://bucket/key "
         "(where an orchestrator such as Step Functions can read them)",
     )
+    config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -306,12 +308,24 @@ def run_m5(ctx: RunContext) -> StageOutcome:
 
 def run_m6(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.modeling.runner import ModelingRunner
+    from f1_race_intelligence.validation.states import RunVerdict
 
     if not ctx.scope.is_empty:
         logger.warning("m6_ignores_scope", extra={"reason": "the split needs the whole history; use modeling.years"})
     report = ModelingRunner(ctx.settings, store=ctx.input_store, output_store=ctx.output_store).run()
     summary = report.summary()
-    return StageOutcome(ok=report.aborted is None, summary=summary, reason=report.aborted)
+    successful = report.verdict in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS)
+    details = report.aborted or ", ".join(report.blocking_failures) or "; ".join(report.warnings)
+    reason = None if successful else f"M6 verdict is {report.verdict.value}: {details}"
+    return StageOutcome(ok=successful, summary=summary, reason=reason)
+
+
+def run_verify_m6(ctx: RunContext) -> StageOutcome:
+    from f1_race_intelligence.modeling.verification import verify_report
+
+    result = verify_report(ctx.args.report, storage=ctx.settings.storage)
+    reason = None if result["ok"] else "; ".join(result["errors"])
+    return StageOutcome(ok=result["ok"], summary=result, reason=reason)
 
 
 def run_copy_raw(ctx: RunContext) -> StageOutcome:
@@ -341,6 +355,7 @@ STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
     "m4": run_m4,
     "m5": run_m5,
     "m6": run_m6,
+    "verify-m6": run_verify_m6,
     "copy-raw": run_copy_raw,
 }
 
@@ -411,6 +426,10 @@ def main(
 
     try:
         stages = parse_stages(args.stage)
+        if "verify-m6" in stages and (len(stages) != 1 or not args.report):
+            raise ValueError("verify-m6 must be run alone and requires --report")
+        if args.report and "verify-m6" not in stages:
+            raise ValueError("--report is only valid with --stage verify-m6")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
         if args.plan_output:

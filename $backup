@@ -1,0 +1,2245 @@
+diff --git a/Dockerfile b/Dockerfile
+index 8fe21af..fba232a 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -22,6 +22,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
+ 
+ WORKDIR /app
+ 
++# Supply these at build time when building from a source checkout. Without a
++# commit argument, the runtime records no commit rather than inventing one.
++ARG F1_GIT_COMMIT
++ARG F1_GIT_DIRTY
++
+ # Unprivileged user with a fixed UID, so file ownership on mounted volumes is
+ # predictable.
+ RUN groupadd --system --gid 10001 f1 \
+@@ -53,7 +58,10 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+ # file, so the config path is explicit. Storage and environment are chosen
+ # with F1_ENVIRONMENT / F1_STORAGE_* at run time.
+ ENV F1_CONFIG_PATH=/app/configs/config.yaml \
+-    F1_ENVIRONMENT=local
++    F1_ENVIRONMENT=local \
++    F1_GIT_COMMIT=${F1_GIT_COMMIT} \
++    F1_GIT_DIRTY=${F1_GIT_DIRTY} \
++    F1_DEPENDENCY_LOCK_PATH=/app/requirements/runtime-lock.txt
+ 
+ USER f1
+ 
+diff --git a/README.md b/README.md
+index 49fa917..e6e80a5 100644
+--- a/README.md
++++ b/README.md
+@@ -27,11 +27,13 @@ No se implementa (todavía) Machine Learning, Deep Learning, feature
+ engineering, entrenamiento, MLflow, FastAPI, Docker, Kubernetes, AWS,
+ CI/CD ni dashboards.
+ 
+-> **Actualización (preparación cloud):** M1–M6 ya son *cloud-ready*: el
++> **Actualización (preparación cloud):** M1–M6 son *cloud-ready*: el
+ > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
+-> job batch independiente (por sesión) y existe una imagen Docker. **AWS
+-> todavía NO está desplegado**: no hay bucket, roles ni infraestructura
+-> creados. Ver [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
++> job batch independiente y existe una imagen Docker. El estado de diseño,
++> código, validación local y despliegue se mantiene en
++> [infra/aws_status.json](infra/aws_status.json); los estados de despliegue y
++> pruebas reales son **NO VERIFICABLES** sin evidencia humana. Ver
++> [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
+ 
+ ## 2. Arquitectura
+ 
+@@ -104,7 +106,7 @@ completamente desacoplada del transporte HTTP.
+ | `validation/specs.py` | Qué se espera de cada endpoint, de forma declarativa | Ajustar una regla es editar datos, no lógica |
+ | `validation/validators.py` | Las comprobaciones, genéricas sobre las specs | Una sola pasada por archivo, sin importar cuántas reglas haya |
+ | `validation/runner.py` | Orquestar la validación y producir el reporte | Streaming: la memoria no depende del tamaño del dataset |
+-| `utils/files.py` | Escrituras que no pierden archivos | Ni sobrescritura silenciosa ni archivos a medio escribir |
++| `storage/backends/` | Escrituras que no pierden archivos y JSON idéntico byte a byte | Ni sobrescritura silenciosa, ni archivos a medio escribir, ni bytes que dependan del sistema operativo |
+ 
+ ### Decisiones respecto a la estructura sugerida
+ 
+@@ -202,7 +204,7 @@ f1-race-intelligence/
+ │       │
+ │       └── utils/
+ │           ├── __init__.py
+-│           ├── files.py
++│           ├── files.py                   # Compatibilidad deprecada; usar storage/backends
+ │           └── logging.py                 # JSON a stdout + log_context(stage, year, session…)
+ │
+ └── tests/
+@@ -714,7 +716,9 @@ listos para entrenar. **No entrena ningún modelo.**
+ python -m f1_race_intelligence.modeling.runner
+ ```
+ 
+-Salida en `data/modeling/`, con el reporte en `data/modeling/reports/`.
++Salida en `data/modeling/`, versionada bajo `runs/<run_id>/` dentro de cada
++prefijo de split y de preprocessing. El reporte queda en
++`data/modeling/reports/`.
+ 
+ ### Orden de las operaciones
+ 
+@@ -765,7 +769,8 @@ como ceros en vez de romper el pipeline.
+ 
+ ### Guardas anti-leakage
+ 
+-Doce comprobaciones, once bloqueantes. Las tres centrales funcionan
++Las comprobaciones de M6 incluyen la completitud de los tres splits y las
++guardas anti-leakage existentes. Las tres centrales funcionan
+ **re-ajustando**: se entrena un transformador nuevo solo con train y otro con
+ train + validation, y el que está en uso debe coincidir con el primero y
+ diferir del segundo. Una guarda que solo inspeccionara nuestra intención
+@@ -774,19 +779,33 @@ estaría de acuerdo con nosotros incluso estando equivocados.
+ Si la comparación no puede distinguir ambos ajustes, se reporta como
+ **inconcluyente**, no como aprobada.
+ 
+-Un run que falle una guarda bloqueante **no escribe nada**.
++Un split vacío, una guarda bloqueante omitida o un resultado inconcluyente
++impiden el veredicto válido y la publicación. Con `fail_on_leakage=false`,
++los fallos de guardas sí pueden dejar artefactos para diagnóstico, pero el
++veredicto sigue siendo `INVALID`/`INCOMPLETE`/`INCONCLUSIVE` y M6 sale con
++código distinto de cero.
+ 
+ ### Salida
+ 
+ ```
+ data/modeling/
+-├── train/dataset.parquet     # filas con trazabilidad, sin transformar
+-├── train/features.parquet    # matriz codificada + target + claves key_*
+-├── validation/ , test/       # idem
+-├── preprocessing/preprocessor.joblib   # el transformador ajustado con train
++├── train/runs/<run_id>/{dataset,features}.parquet
++├── validation/runs/<run_id>/… ; test/runs/<run_id>/…
++├── preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
+ └── reports/
+ ```
+ 
++Las rutas de los prefijos configurados y de cada split se conservan; cada
++ejecución escribe en su propio directorio para no sobrescribir artefactos
++anteriores. El reporte contiene el `run_id`, SHA-256 de lock y configuración,
++commit de origen, estado de limpieza del checkout, fingerprint de entradas,
++estados de guardas, veredicto global y hashes de artefactos releídos. Si el
++commit o la limpieza del checkout no pueden determinarse, o falta el lock,
++el reporte deja el dato explícitamente ausente y M6 no informa éxito.
++`verify-m6` permite comprobar
++un reporte y sus artefactos sin reescribirlos:
++`python -m f1_race_intelligence --stage verify-m6 --report <ruta>`.
++
+ Cada split se escribe dos veces: sin transformar, para poder rastrear
+ cualquier fila hasta M5 y de ahí al raw, y codificado, que es lo que lee un
+ modelo. Las claves llevan prefijo `key_` porque una columna puede ser clave
+@@ -804,6 +823,11 @@ volver a calcularlo y comprobarlo:
+ 
+ | campo | contenido |
+ |---|---|
++| `schema_version` / `verdict` | versión 2 y estado global: `VALID`, `VALID_WITH_WARNINGS`, `INCOMPLETE`, `INCONCLUSIVE`, `INVALID` o `ABORTED` |
++| `run_id` | identificador único que también versiona las rutas de artefactos |
++| `source_commit` / `source_dirty` | revisión real de Git y estado de limpieza, si están disponibles |
++| `dependency_lock_sha256` | SHA-256 de `requirements/runtime-lock.txt` |
++| `config_fingerprint` | SHA-256 de la configuración M6 sin ubicaciones de storage |
+ | `source.inputs` | cada archivo de M5 leído: `input` (`session_<s>.parquet`), `year`, `session_key`, `sha256`, `size_bytes` |
+ | `source.input_fingerprint` | huella agregada de las entradas, `sha256:<hex>` (también en `summary`) |
+ | `source.input_fingerprint_scheme` | versión del algoritmo: `m6-input-fingerprint/v1` |
+@@ -816,7 +840,10 @@ volver a calcularlo y comprobarlo:
+ - `artifact_files` cubre los seis Parquet (`dataset.parquet` y
+   `features.parquet` por split), `preprocessor.joblib` y
+   `feature_schema*.json`. Cada hash se calcula releyendo el objeto del
+-  almacenamiento después de escribirlo.
++  almacenamiento después de escribirlo. Con las mismas entradas y la misma
++  configuración, los ocho hashes son iguales en disco local y en S3
++  simulado en las pruebas ejecutadas en Windows. La paridad en Linux queda
++  pendiente de ejecutarse en un entorno Linux real.
+ - `input_fingerprint` es el SHA-256 de este documento JSON canónico (claves
+   ordenadas, sin espacios, `ensure_ascii`):
+   `{"inputs": [{"input", "year", "session_key", "sha256"}, …], "scheme": "m6-input-fingerprint/v1"}`,
+@@ -829,13 +856,20 @@ volver a calcularlo y comprobarlo:
+   `artifact_files` vacíos, porque no escribió nada. Si falla una lectura o
+   una escritura del almacenamiento, el error se propaga y no se escribe
+   reporte, como hasta ahora.
++- Los reportes nuevos usan `schema_version: 2` y estados `PASS`, `FAIL`,
++  `INCONCLUSIVE` o `SKIPPED` (con motivo). La CLI oficial solo devuelve éxito
++  con veredicto `VALID` o `VALID_WITH_WARNINGS`. Reportes v1 se pueden verificar
++  sin reescritura.
++- La estrategia de split actual se conserva. La separación futura por
++  `meeting_key`, el corte UTC del 1 de julio de 2025 y el tratamiento de Sprint
++  dependen de la aprobación académica pendiente.
+ 
+ ## 14. Preparación para la nube (AWS-ready)
+ 
+-> **AWS todavía NO está desplegado.** No existe bucket, rol IAM, imagen en
+-> ECR ni ninguna otra infraestructura. Esta sección describe cómo quedó
+-> preparado el código para que un despliegue posterior (CloudFormation/SAM)
+-> no requiera tocar la lógica de M1–M6.
++> El estado de AWS se registra únicamente en
++> [infra/aws_status.json](infra/aws_status.json). El diseño, el código y la
++> validación local se distinguen del despliegue y de las pruebas reales; estos
++> últimos permanecen **NO VERIFICABLES** sin comprobación humana.
+ 
+ La lógica funcional, estadística y anti-leakage de M4/M5/M6 **no cambió**.
+ Se verificó ejecutando el pipeline nuevo sobre los datos locales y
+@@ -884,6 +918,17 @@ Sobre esas primitivas la interfaz ofrece JSON, Parquet, joblib y nombres
+   Ambos son `OSError`, así que los manejadores existentes siguen valiendo.
+ - Parquet se lee siempre desde un buffer: pyarrow no puede inventar columnas
+   a partir de directorios `year=…`.
++- Un documento JSON tiene una sola representación binaria: una función lo
++  serializa (UTF-8 sin BOM, sangría de dos espacios, saltos de línea LF, sin
++  salto final) y ambos backends guardan esos bytes tal cual, siempre en modo
++  binario. Las pruebas ejecutadas en Windows verifican la igualdad entre
++  disco local y S3 simulado; la ejecución equivalente en Linux sigue
++  pendiente. Los archivos escritos en Windows por versiones anteriores llevan
++  CRLF: siguen siendo legibles y no se reescriben, pero su hash es distinto
++  del que tendría el mismo documento escrito hoy.
++- El plan local que escribe `cli.py:233` sigue fuera de este contrato y de los
++  artefactos fingerprintados de M6. Usa modo texto y se tratará como una tarea
++  independiente si pasa a requerir reproducibilidad de bytes.
+ 
+ `boto3` es opcional (`pip install ".[aws]"`, ≥ 1.35.2 por las escrituras
+ condicionales) y solo se importa al crear un cliente S3.
+@@ -900,8 +945,8 @@ s3://<bucket>/<prefix>/
+ ├── validated/validation_report_<ts>.json                        (M3 global)
+ ├── consolidated/year=<y>/session=<s>/session_<s>.parquet        (M4)
+ ├── features/year=<y>/session=<s>/session_<s>.parquet            (M5)
+-├── modeling/split=<train|validation|test>/{dataset,features}.parquet   (M6)
+-├── modeling/preprocessing/{preprocessor.joblib, feature_schema.json}
++├── modeling/split=<train|validation|test>/runs/<run_id>/{dataset,features}.parquet (M6)
++├── modeling/preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
+ ├── manifests/extraction/[year=<y>/session=<s>/]manifest_<ts>.json
+ ├── manifests/{consolidation,features,modeling}/<stage>_report_<ts>.json
+ ├── models/   (reservado para M7)
+@@ -1011,6 +1056,10 @@ docker run --rm -v "$PWD/data:/app/data" \
+ - Usuario sin privilegios (`uid 10001`); solo `/app/data` es escribible. Con
+   un volumen montado en Linux, añadir `--user "$(id -u):$(id -g)"` si el
+   directorio del host no es escribible para ese uid.
++- La construcción debe inyectar los build args `F1_GIT_COMMIT` y
++  `F1_GIT_DIRTY` desde el checkout. Si Git no está disponible y no se inyecta
++  la revisión, el reporte la deja explícitamente nula; el hash del lock se
++  calcula desde el archivo incluido en la imagen.
+ - Sin datasets, `.env` ni credenciales (`.dockerignore`).
+ - Configuración por variables de entorno (`F1_ENVIRONMENT`, `F1_STORAGE_*`).
+ - `F1_CONFIG_PATH` es explícito: el paquete instalado no puede ubicar
+@@ -1027,13 +1076,13 @@ docker run --rm -v "$PWD/data:/app/data" \
+ 
+ La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
+ Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
+-[infra/](infra/README.md). La base está desplegada en `dev` con el pipeline
+-desactivado (`PipelineEnabled=false`) y el calendario `DISABLED`. La Fase 1B
+-define M2–M6 como tareas Fargate endurecidas (raíz de solo lectura, sin
+-capacidades Linux, usuario 10001, imagen fijada por digest) orquestadas por
+-Step Functions con `ecs:runTask.sync`; esa parte **no está desplegada**.
++[infra/](infra/README.md). `infra/aws_status.json` es la fuente de verdad
++versionada: el estado de despliegue y de pruebas en AWS real permanece
++**NO VERIFICABLE** sin comprobación humana. La Fase 1B define M2–M6 como
++tareas Fargate endurecidas (raíz de solo lectura, sin capacidades Linux,
++usuario 10001, imagen fijada por digest) orquestadas por Step Functions.
+ 
+-### 14.9 Arquitectura AWS propuesta (futura, no desplegada)
++### 14.9 Arquitectura AWS propuesta
+ 
+ ```
+ EventBridge Scheduler
+@@ -1082,8 +1131,9 @@ salida; contexto de logging.
+ - La extracción respeta el límite de OpenF1 por cliente: varios jobs M2 en
+   paralelo comparten ese límite, así que M2 no escala con más contenedores.
+ - `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
+-- **AWS no está desplegado**; el backend S3 solo se ha probado contra un
+-  cliente simulado.
++- **El despliegue AWS es NO VERIFICABLE** según
++  [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
++  contra un cliente simulado.
+ - No hay CI configurado.
+ 
+ ## 17. Licencia y uso de datos
+diff --git a/infra/README.md b/infra/README.md
+index 1a5974c..8e04b48 100644
+--- a/infra/README.md
++++ b/infra/README.md
+@@ -1,15 +1,16 @@
+ # Infraestructura AWS (SAM / CloudFormation)
+ 
+-> **Estado:** la infraestructura base está desplegada en `dev` con
+-> `PipelineEnabled=false` y el calendario `DISABLED`. La Fase 1B (tareas
+-> Fargate endurecidas para M2–M6, su red y su integración con Step Functions)
+-> está definida en `template.yaml` pero **no desplegada**. No entrena ni publica
+-> modelos (sin M7, sin SageMaker).
++> **Estado:** `aws_status.json` es la fuente única de verdad versionada. La
++> arquitectura y su código están definidos, y la validación local está
++> registrada allí. El estado de despliegue y las pruebas en AWS real son
++> **NO VERIFICABLES** en ausencia de comprobación humana; este documento no
++> reemplaza esa evidencia. No entrena ni publica modelos (sin M7, sin SageMaker).
+ 
+ ## Estructura
+ 
+ ```
+ infra/
++├── aws_status.json                       # estado técnico AWS: fuente única de verdad
+ ├── template.yaml                          # stack SAM (CloudFormation + Transform)
+ ├── samconfig.toml                         # parámetros por entorno (dev, prod); confirma changesets
+ ├── functions/
+@@ -132,7 +133,7 @@ que ninguna tarea depende del disco de otra.
+ | `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
+ | `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
+ | `M5_Features` | `--stage m5 --year Y --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
+-| `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/`, `modeling/preprocessing/`, `manifests/modeling/` |
++| `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/runs/<run_id>/`, `modeling/preprocessing/runs/<run_id>/`, `manifests/modeling/` |
+ 
+ Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
+ generan esos comandos y los pasan por el parser real de la CLI.
+diff --git a/infra/statemachine/pipeline.asl.json b/infra/statemachine/pipeline.asl.json
+index 97f934d..ac734d3 100644
+--- a/infra/statemachine/pipeline.asl.json
++++ b/infra/statemachine/pipeline.asl.json
+@@ -529,6 +529,7 @@
+     },
+     "CheckM6ExitCode": {
+       "Type": "Choice",
++      "Comment": "The M6 CLI returns zero only for VALID or VALID_WITH_WARNINGS after all blocking checks pass.",
+       "Choices": [
+         {
+           "Variable": "$.m6.exit_code",
+diff --git a/src/f1_race_intelligence/cli.py b/src/f1_race_intelligence/cli.py
+index e06a2fc..ab5592d 100644
+--- a/src/f1_race_intelligence/cli.py
++++ b/src/f1_race_intelligence/cli.py
+@@ -11,7 +11,8 @@
+ 
+ Stages: ``plan`` (list the session work units of a season), ``m2`` extraction,
+ ``m3`` validation, ``m4`` consolidation, ``m5`` features, ``m6`` modelling
+-datasets, and ``copy-raw`` (copy already-extracted raw data between stores).
++datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), and
++``copy-raw`` (copy already-extracted raw data between stores).
+ Several stages run in order when given as a comma-separated list; the first
+ failure stops the chain.
+ 
+@@ -50,7 +51,7 @@ EXIT_OK = 0
+ EXIT_FAILED = 1
+ EXIT_USAGE = 2
+ 
+-STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "copy-raw")
++STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "copy-raw")
+ 
+ 
+ @dataclass
+@@ -103,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
+         help="Also write the plan's work units as JSON to this local file or s3://bucket/key "
+         "(where an orchestrator such as Step Functions can read them)",
+     )
++    config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
+ 
+     storage = parser.add_argument_group("storage")
+     storage.add_argument("--storage-backend", choices=["local", "s3"])
+@@ -306,12 +308,24 @@ def run_m5(ctx: RunContext) -> StageOutcome:
+ 
+ def run_m6(ctx: RunContext) -> StageOutcome:
+     from f1_race_intelligence.modeling.runner import ModelingRunner
++    from f1_race_intelligence.validation.states import RunVerdict
+ 
+     if not ctx.scope.is_empty:
+         logger.warning("m6_ignores_scope", extra={"reason": "the split needs the whole history; use modeling.years"})
+     report = ModelingRunner(ctx.settings, store=ctx.input_store, output_store=ctx.output_store).run()
+     summary = report.summary()
+-    return StageOutcome(ok=report.aborted is None, summary=summary, reason=report.aborted)
++    successful = report.verdict in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS)
++    details = report.aborted or ", ".join(report.blocking_failures) or "; ".join(report.warnings)
++    reason = None if successful else f"M6 verdict is {report.verdict.value}: {details}"
++    return StageOutcome(ok=successful, summary=summary, reason=reason)
++
++
++def run_verify_m6(ctx: RunContext) -> StageOutcome:
++    from f1_race_intelligence.modeling.verification import verify_report
++
++    result = verify_report(ctx.args.report, storage=ctx.settings.storage)
++    reason = None if result["ok"] else "; ".join(result["errors"])
++    return StageOutcome(ok=result["ok"], summary=result, reason=reason)
+ 
+ 
+ def run_copy_raw(ctx: RunContext) -> StageOutcome:
+@@ -341,6 +355,7 @@ STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
+     "m4": run_m4,
+     "m5": run_m5,
+     "m6": run_m6,
++    "verify-m6": run_verify_m6,
+     "copy-raw": run_copy_raw,
+ }
+ 
+@@ -411,6 +426,10 @@ def main(
+ 
+     try:
+         stages = parse_stages(args.stage)
++        if "verify-m6" in stages and (len(stages) != 1 or not args.report):
++            raise ValueError("verify-m6 must be run alone and requires --report")
++        if args.report and "verify-m6" not in stages:
++            raise ValueError("--report is only valid with --stage verify-m6")
+         if "m2" in stages and args.session_key is not None and args.year is None:
+             raise ValueError("m2 for one session needs --year as well as --session-key")
+         if args.plan_output:
+diff --git a/src/f1_race_intelligence/features/checks.py b/src/f1_race_intelligence/features/checks.py
+index ccd626e..cf4a8fb 100644
+--- a/src/f1_race_intelligence/features/checks.py
++++ b/src/f1_race_intelligence/features/checks.py
+@@ -27,6 +27,7 @@ from f1_race_intelligence.features.selection import (
+     TARGET_COLUMN,
+ )
+ from f1_race_intelligence.features.temporal import MIN_PERIODS_SPREAD, RELATIVE_WINDOW
++from f1_race_intelligence.validation.states import CheckStatus
+ 
+ # Rows sampled for the truncated recomputation. The check is O(rows x window)
+ # per sampled row, so a bounded, deterministic sample keeps it affordable
+@@ -45,14 +46,38 @@ class CheckResult:
+     description: str
+     blocking: bool = True
+     details: Dict[str, Any] = field(default_factory=dict)
++    status: Optional[CheckStatus] = None
++    reason: Optional[str] = None
++
++    def __post_init__(self) -> None:
++        if self.status is None:
++            if self.details.get("skipped"):
++                self.status = CheckStatus.SKIPPED
++            elif self.details.get("inconclusive"):
++                self.status = CheckStatus.INCONCLUSIVE
++            else:
++                self.status = CheckStatus.PASS if self.passed else CheckStatus.FAIL
++        elif not isinstance(self.status, CheckStatus):
++            self.status = CheckStatus(self.status)
++        if self.status is CheckStatus.PASS and not self.passed:
++            raise ValueError(f"Passing check {self.name!r} must have passed=True")
++        if self.status is CheckStatus.FAIL and self.passed:
++            raise ValueError(f"Failed check {self.name!r} must have passed=False")
++        self.passed = self.status is CheckStatus.PASS
++        if self.status is CheckStatus.SKIPPED:
++            self.reason = self.reason or self.details.get("reason") or self.description
++            if not self.reason.strip():
++                raise ValueError(f"Skipped check {self.name!r} must include a reason")
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         payload = {
+             "check": self.name,
+-            "status": "PASS" if self.passed else "FAIL",
++            "status": self.status.value,
+             "blocking": self.blocking,
+             "description": self.description,
+         }
++        if self.reason:
++            payload["reason"] = self.reason
+         if self.details:
+             payload["details"] = self.details
+         return payload
+@@ -131,7 +156,10 @@ def check_last_lap_has_no_target(frame: pd.DataFrame) -> CheckResult:
+             "last_lap_has_no_target",
+             True,
+             "Skipped: the source did not mark last laps",
+-            details={"skipped": True},
++            blocking=False,
++            details={"skipped": True, "reason": "Source has no last-lap marker"},
++            status=CheckStatus.SKIPPED,
++            reason="Source has no last-lap marker",
+         )
+ 
+     last = frame["is_last_lap_for_driver"].fillna(False).astype(bool)
+@@ -291,7 +319,9 @@ def check_correlation_with_target(
+             True,
+             "Skipped: no rows have a target",
+             blocking=False,
+-            details={"skipped": True},
++            details={"skipped": True, "reason": "No rows have a target"},
++            status=CheckStatus.SKIPPED,
++            reason="No rows have a target",
+         )
+ 
+     target = pd.to_numeric(with_target[TARGET_COLUMN], errors="coerce").astype("float64")
+@@ -317,4 +347,4 @@ def check_correlation_with_target(
+ 
+ 
+ def blocking_failures(results: Sequence[CheckResult]) -> List[str]:
+-    return [item.name for item in results if item.blocking and not item.passed]
++    return [item.name for item in results if item.blocking and item.status is not CheckStatus.PASS]
+diff --git a/src/f1_race_intelligence/modeling/checks.py b/src/f1_race_intelligence/modeling/checks.py
+index 5815857..72881d5 100644
+--- a/src/f1_race_intelligence/modeling/checks.py
++++ b/src/f1_race_intelligence/modeling/checks.py
+@@ -26,6 +26,7 @@ from f1_race_intelligence.features.selection import FORBIDDEN_AS_FEATURES, TARGE
+ from f1_race_intelligence.features import selection
+ from f1_race_intelligence.modeling import preprocessing
+ from f1_race_intelligence.modeling.split import SPLITS, TEST, TRAIN, VALIDATION, SessionAssignment
++from f1_race_intelligence.validation.states import CheckStatus
+ 
+ # Columns that must never appear in the feature matrix: the target and its
+ # flag, everything M5 classified as leaky or excluded, and the identifiers
+@@ -56,6 +57,23 @@ guard that forbids these columns from the model input does not have to
+ import the module it is guarding.
+ """
+ 
++REQUIRED_M6_CHECKS = (
++    "split_completeness",
++    "target_not_in_features",
++    "forbidden_columns_not_in_features",
++    "traceability_columns_not_in_model_features",
++    "no_session_overlap_between_splits",
++    "no_row_overlap_between_splits",
++    "chronological_split",
++    "preprocessing_fitted_on_train_only",
++    "no_validation_statistics_used_in_training",
++    "no_test_statistics_used_in_training",
++    "consistent_feature_schema",
++    "categorical_unknown_handling",
++    "target_alignment",
++    "target_rows_are_valid",
++)
++
+ 
+ @dataclass
+ class CheckResult:
+@@ -66,21 +84,75 @@ class CheckResult:
+     description: str
+     blocking: bool = True
+     details: Dict[str, Any] = field(default_factory=dict)
++    status: Optional[CheckStatus] = None
++    reason: Optional[str] = None
++
++    def __post_init__(self) -> None:
++        if self.status is None:
++            if self.details.get("skipped"):
++                self.status = CheckStatus.SKIPPED
++            elif self.details.get("inconclusive"):
++                self.status = CheckStatus.INCONCLUSIVE
++            else:
++                self.status = CheckStatus.PASS if self.passed else CheckStatus.FAIL
++        elif not isinstance(self.status, CheckStatus):
++            self.status = CheckStatus(self.status)
++        if self.status is CheckStatus.PASS and not self.passed:
++            raise ValueError(f"Passing check {self.name!r} must have passed=True")
++        if self.status is CheckStatus.FAIL and self.passed:
++            raise ValueError(f"Failed check {self.name!r} must have passed=False")
++        self.passed = self.status is CheckStatus.PASS
++        if self.status is CheckStatus.SKIPPED:
++            self.reason = self.reason or self.details.get("reason") or self.description
++            if not self.reason.strip():
++                raise ValueError(f"Skipped check {self.name!r} must include a reason")
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         payload = {
+             "check": self.name,
+-            "status": "PASS" if self.passed else "FAIL",
++            "status": self.status.value,
+             "blocking": self.blocking,
+             "description": self.description,
+         }
++        if self.reason:
++            payload["reason"] = self.reason
+         if self.details:
+             payload["details"] = self.details
+         return payload
+ 
+ 
+ def blocking_failures(results: Sequence[CheckResult]) -> List[str]:
+-    return [item.name for item in results if item.blocking and not item.passed]
++    return [item.name for item in results if item.blocking and item.status is not CheckStatus.PASS]
++
++
++def complete_required_checks(results: Sequence[CheckResult]) -> List[CheckResult]:
++    """Make omitted mandatory guards explicit and blocking."""
++    completed = list(results)
++    present = {item.name for item in completed}
++    for name in REQUIRED_M6_CHECKS:
++        if name not in present:
++            completed.append(
++                CheckResult(
++                    name,
++                    False,
++                    "Required guard was not executed",
++                    details={"skipped": True},
++                    status=CheckStatus.SKIPPED,
++                    reason="Required guard was not executed",
++                )
++            )
++    return completed
++
++
++def check_split_completeness(splits: Dict[str, pd.DataFrame]) -> CheckResult:
++    """Require non-empty train, validation and test partitions."""
++    empty = [name for name in SPLITS if name not in splits or splits[name].empty]
++    return CheckResult(
++        "split_completeness",
++        not empty,
++        "Train, validation and test splits all contain rows",
++        details={"empty_splits": empty},
++    )
+ 
+ 
+ # -- feature matrix --------------------------------------------------------
+@@ -340,9 +412,11 @@ def _check_split_not_used_for_fitting(
+     if other_matrix.empty:
+         return CheckResult(
+             name,
+-            True,
++            False,
+             f"Skipped: the {other_name} split is empty",
+             details={"skipped": True, "reason": f"no {other_name} rows"},
++            status=CheckStatus.SKIPPED,
++            reason=f"no {other_name} rows",
+         )
+ 
+     actual = preprocessing.learned_parameters(preprocessor)
+@@ -361,7 +435,13 @@ def _check_split_not_used_for_fitting(
+             f"Fitting on train alone and on train + {other_name} produced identical statistics, so this "
+             "comparison cannot discriminate. The preprocessing_fitted_on_train_only guard still applies."
+         )
+-        return CheckResult(name, matches_train, f"No {other_name} statistics reached the transformer", details=details)
++        return CheckResult(
++            name,
++            False,
++            f"No {other_name} statistics reached the transformer",
++            details=details,
++            status=CheckStatus.INCONCLUSIVE,
++        )
+ 
+     return CheckResult(
+         name,
+@@ -402,7 +482,15 @@ def check_categorical_unknown_handling(
+     season should not break the pipeline at the moment it is used.
+     """
+     if not categorical:
+-        return CheckResult("categorical_unknown_handling", True, "No categorical features", details={"skipped": True})
++        return CheckResult(
++            "categorical_unknown_handling",
++            True,
++            "No categorical features",
++            blocking=False,
++            details={"skipped": True, "reason": "No categorical features are configured"},
++            status=CheckStatus.SKIPPED,
++            reason="No categorical features are configured",
++        )
+ 
+     block = preprocessing._block(preprocessor, preprocessing.CATEGORICAL_BLOCK)
+     encoder = block.named_steps["encode"] if block is not None else None
+diff --git a/src/f1_race_intelligence/modeling/models.py b/src/f1_race_intelligence/modeling/models.py
+index 2998865..f92dcb2 100644
+--- a/src/f1_race_intelligence/modeling/models.py
++++ b/src/f1_race_intelligence/modeling/models.py
+@@ -7,6 +7,8 @@ from datetime import datetime, timezone
+ from typing import Any, Dict, List, Optional
+ 
+ from f1_race_intelligence.modeling.fingerprints import ArtifactFile
++from f1_race_intelligence.modeling.traceability import new_run_id
++from f1_race_intelligence.validation.states import RunVerdict
+ 
+ 
+ @dataclass
+@@ -43,6 +45,13 @@ class ModelingReport:
+ 
+     pipeline_name: str
+     pipeline_version: str
++    schema_version: int = 2
++    run_id: str = field(default_factory=new_run_id)
++    source_commit: Optional[str] = None
++    source_dirty: Optional[bool] = None
++    dependency_lock_sha256: Optional[str] = None
++    config_fingerprint: Optional[str] = None
++    verdict: RunVerdict = RunVerdict.ABORTED
+     config: Dict[str, Any] = field(default_factory=dict)
+     source: Dict[str, Any] = field(default_factory=dict)
+     target: Dict[str, Any] = field(default_factory=dict)
+@@ -68,6 +77,9 @@ class ModelingReport:
+     def summary(self) -> Dict[str, Any]:
+         by_split = {item.name: item.rows for item in self.artifacts}
+         return {
++            "schema_version": self.schema_version,
++            "run_id": self.run_id,
++            "verdict": self.verdict.value,
+             "rows_in": self.source.get("rows_in", 0),
+             "rows_modelled": self.source.get("rows_out", 0),
+             "rows_dropped_without_target": self.source.get("rows_dropped_without_target", 0),
+@@ -77,12 +89,19 @@ class ModelingReport:
+             "numeric_features": len(self.features.get("numeric", [])),
+             "categorical_features": len(self.features.get("categorical", [])),
+             "encoded_feature_count": self.preprocessing.get("output_feature_count", 0),
+-            "checks_passed": not self.blocking_failures,
++            "checks_passed": self.verdict in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS),
+             "warnings": len(self.warnings),
+         }
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         return {
++            "schema_version": self.schema_version,
++            "run_id": self.run_id,
++            "source_commit": self.source_commit,
++            "source_dirty": self.source_dirty,
++            "dependency_lock_sha256": self.dependency_lock_sha256,
++            "config_fingerprint": self.config_fingerprint,
++            "verdict": self.verdict.value,
+             "pipeline_name": self.pipeline_name,
+             "pipeline_version": self.pipeline_version,
+             "started_at": self.started_at.isoformat(),
+diff --git a/src/f1_race_intelligence/modeling/report.py b/src/f1_race_intelligence/modeling/report.py
+index ee780f1..8ec5f68 100644
+--- a/src/f1_race_intelligence/modeling/report.py
++++ b/src/f1_race_intelligence/modeling/report.py
+@@ -22,5 +22,5 @@ def save_report(
+ ) -> Union[Path, str]:
+     """Write the report as JSON and return where it went."""
+     backend = backend or LocalStorageBackend()
+-    stem = f"modeling_report_{report.started_at.strftime('%Y%m%dT%H%M%S%f')}Z"
++    stem = f"modeling_report_{report.started_at.strftime('%Y%m%dT%H%M%S%f')}Z_{report.run_id}"
+     return backend.location(backend.write_json_unique(str(directory), stem, report.to_dict()))
+diff --git a/src/f1_race_intelligence/modeling/runner.py b/src/f1_race_intelligence/modeling/runner.py
+index c565880..b68d87a 100644
+--- a/src/f1_race_intelligence/modeling/runner.py
++++ b/src/f1_race_intelligence/modeling/runner.py
+@@ -38,10 +38,17 @@ from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader, feature_
+ from f1_race_intelligence.modeling.models import ModelingReport, SplitArtifacts
+ from f1_race_intelligence.modeling.report import save_report
+ from f1_race_intelligence.modeling.split import SPLITS, TEST, TRAIN, VALIDATION, SplitStrategy
+-from f1_race_intelligence.storage.backends.base import join_key
++from f1_race_intelligence.modeling.traceability import (
++    config_fingerprint,
++    dependency_lock_sha256,
++    new_run_id,
++    source_revision,
++)
++from f1_race_intelligence.storage.backends.base import StorageError, join_key
+ from f1_race_intelligence.storage.layout import Layer
+ from f1_race_intelligence.storage.store import DataStore
+ from f1_race_intelligence.utils.logging import configure_logging, get_logger
++from f1_race_intelligence.validation.states import CheckStatus, RunVerdict
+ 
+ logger = get_logger(__name__)
+ 
+@@ -91,9 +98,21 @@ class ModelingRunner:
+         report = ModelingReport(
+             pipeline_name=PIPELINE_NAME,
+             pipeline_version=PIPELINE_VERSION,
++            run_id=self._new_run_id(),
+             config=self._config_snapshot(),
+             target=self._target_definition(),
+         )
++        report.source_commit, report.source_dirty = source_revision()
++        report.dependency_lock_sha256 = dependency_lock_sha256()
++        report.config_fingerprint = config_fingerprint(report.config)
++        if report.source_commit is None:
++            report.warnings.append("Git source commit is unavailable; no commit was inferred.")
++        elif report.source_dirty:
++            report.warnings.append("The source checkout has uncommitted changes.")
++        elif report.source_dirty is None:
++            report.warnings.append("Git working-tree cleanliness could not be determined.")
++        if report.dependency_lock_sha256 is None:
++            report.warnings.append("The dependency lockfile is unavailable; its SHA-256 could not be recorded.")
+ 
+         dataset = self._loader.load(
+             years=list(self._config.years) or None,
+@@ -140,6 +159,18 @@ class ModelingRunner:
+             "assignments": [item.to_dict() for item in assignments],
+         }
+         self._warn_about_small_splits(report, splits)
++        split_check = checks.check_split_completeness(splits)
++        if split_check.status is not CheckStatus.PASS:
++            incomplete_checks = checks.complete_required_checks([split_check])
++            report.checks = [item.to_dict() for item in incomplete_checks]
++            report.blocking_failures = checks.blocking_failures(incomplete_checks)
++            empty_splits = split_check.details["empty_splits"]
++            report.aborted = (
++                "the training split is empty; nothing can be fitted"
++                if TRAIN in empty_splits
++                else f"required split(s) are empty: {', '.join(empty_splits)}"
++            )
++            return self._finish(report, started)
+ 
+         matrices = {
+             name: preprocessing.prepare_matrix(frame, columns["numeric"], columns["categorical"])
+@@ -171,6 +202,7 @@ class ModelingRunner:
+         )
+ 
+         outcomes = self._run_checks(preprocessor, matrices, transformed, splits, targets, assignments, columns, dataset.frame)
++        outcomes = checks.complete_required_checks(outcomes)
+         report.checks = [item.to_dict() for item in outcomes]
+         report.blocking_failures = checks.blocking_failures(outcomes)
+ 
+@@ -198,6 +230,7 @@ class ModelingRunner:
+         encoded_names = list(transformed[TRAIN].columns)
+         matrix_columns = encoded_names + [TARGET_COLUMN] + [f"{KEY_PREFIX}{c}" for c in GRAIN_COLUMNS]
+         return [
++            checks.check_split_completeness(splits),
+             checks.check_target_not_in_features(encoded_names),
+             checks.check_forbidden_columns_not_in_features(encoded_names),
+             checks.check_traceability_columns_not_in_model_features(encoded_names, matrix_columns),
+@@ -241,13 +274,16 @@ class ModelingRunner:
+ 
+         for name in SPLITS:
+             frame = splits[name]
+-            directory = layout.split_prefix(base, name)
++            directory = join_key(layout.split_prefix(base, name), "runs", report.run_id)
+ 
+             dataset_path = join_key(directory, "dataset.parquet")
+             matrix_path = join_key(directory, "features.parquet")
+ 
+-            bytes_written = backend.write_parquet(dataset_path, frame)
+-            files.append(self._stored_file(dataset_path, "dataset.parquet", name))
++            if not backend.write_parquet_if_absent(dataset_path, frame):
++                raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(dataset_path)}")
++            dataset_file = self._stored_file(dataset_path, "dataset.parquet", name)
++            files.append(dataset_file)
++            bytes_written = dataset_file.size_bytes
+ 
+             matrix = transformed[name].copy()
+             matrix[TARGET_COLUMN] = targets[name].to_numpy() if not frame.empty else pd.Series(dtype="float64")
+@@ -259,8 +295,11 @@ class ModelingRunner:
+                     matrix[f"{KEY_PREFIX}{column}"] = (
+                         frame[column].to_numpy() if not frame.empty else pd.Series(dtype="Int64")
+                     )
+-            bytes_written += backend.write_parquet(matrix_path, matrix)
+-            files.append(self._stored_file(matrix_path, "features.parquet", name))
++            if not backend.write_parquet_if_absent(matrix_path, matrix):
++                raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(matrix_path)}")
++            matrix_file = self._stored_file(matrix_path, "features.parquet", name)
++            files.append(matrix_file)
++            bytes_written += matrix_file.size_bytes
+ 
+             artifacts.append(
+                 SplitArtifacts(
+@@ -276,13 +315,14 @@ class ModelingRunner:
+                 )
+             )
+ 
+-        preprocessing_dir = layout.preprocessing_prefix(base)
++        preprocessing_dir = join_key(layout.preprocessing_prefix(base), "runs", report.run_id)
+         preprocessor_path = join_key(preprocessing_dir, PREPROCESSOR_FILE)
+-        backend.write_joblib(preprocessor_path, preprocessor)
++        if not backend.write_joblib_if_absent(preprocessor_path, preprocessor):
++            raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(preprocessor_path)}")
+         files.append(self._stored_file(preprocessor_path, PREPROCESSOR_FILE, None))
+-        schema_path = backend.write_json_unique(
+-            preprocessing_dir,
+-            "feature_schema",
++        schema_path = join_key(preprocessing_dir, "feature_schema.json")
++        if not backend.write_json_if_absent(
++            schema_path,
+             {
+                 "input_features": report.features,
+                 "encoded_feature_names": report.preprocessing.get("output_feature_names", []),
+@@ -294,7 +334,8 @@ class ModelingRunner:
+                     f"'{KEY_PREFIX}' columns sit alongside them and must not be fed to a model."
+                 ),
+             },
+-        )
++        ):
++            raise StorageError(f"Run {report.run_id} cannot overwrite existing artifact {backend.uri(schema_path)}")
+         files.append(self._stored_file(schema_path, "feature_schema.json", None))
+         return artifacts, files
+ 
+@@ -302,10 +343,11 @@ class ModelingRunner:
+         """Fingerprint an object from what storage now holds, not from what was sent."""
+         backend = self._output_store.backend
+         data = backend.read_bytes(key)
++        local_path = backend.local_path(key)
+         return ArtifactFile(
+             artifact=artifact,
+             split=split,
+-            path=backend.uri(key),
++            path=str(local_path.resolve()) if local_path is not None else backend.uri(key),
+             sha256=sha256_hex(data),
+             size_bytes=len(data),
+         )
+@@ -362,7 +404,22 @@ class ModelingRunner:
+             "output_storage": self._output_store.describe(),
+         }
+ 
++    def _new_run_id(self) -> str:
++        backend, layout = self._output_store.backend, self._output_store.layout
++        base = self._output_store.root(Layer.MODELING, self._config.output_path)
++        for _ in range(10):
++            candidate = new_run_id()
++            prefixes = [
++                join_key(layout.split_prefix(base, name), "runs", candidate)
++                for name in SPLITS
++            ]
++            prefixes.append(join_key(layout.preprocessing_prefix(base), "runs", candidate))
++            if not any(backend.has_prefix(prefix) or backend.exists(prefix) for prefix in prefixes):
++                return candidate
++        raise StorageError(f"Could not allocate a unique M6 run id below {backend.uri(base)}")
++
+     def _finish(self, report: ModelingReport, started: float) -> ModelingReport:
++        report.verdict = self._verdict(report)
+         report.finished_at = datetime.now(timezone.utc)
+         path = save_report(
+             report,
+@@ -381,8 +438,44 @@ class ModelingRunner:
+         )
+         return report
+ 
++    @staticmethod
++    def _verdict(report: ModelingReport) -> RunVerdict:
++        checks_by_name = {item.get("check"): item for item in report.checks}
++        split_check = checks_by_name.get("split_completeness")
++        if split_check and split_check.get("status") == CheckStatus.FAIL.value:
++            return RunVerdict.INCOMPLETE
++
++        blocking_statuses = {
++            item.get("status")
++            for item in report.checks
++            if item.get("blocking", True)
++        }
++        if CheckStatus.FAIL.value in blocking_statuses:
++            return RunVerdict.INVALID
++        if CheckStatus.INCONCLUSIVE.value in blocking_statuses:
++            return RunVerdict.INCONCLUSIVE
++        if CheckStatus.SKIPPED.value in blocking_statuses:
++            return RunVerdict.INCOMPLETE
++        if (
++            not report.source_commit
++            or report.source_dirty is None
++            or not report.dependency_lock_sha256
++            or not report.config_fingerprint
++        ):
++            return RunVerdict.INCOMPLETE
++        if report.aborted:
++            return RunVerdict.ABORTED
++
++        has_nonblocking_issue = any(
++            not item.get("blocking", True) and item.get("status") != CheckStatus.PASS.value
++            for item in report.checks
++        )
++        if report.warnings or has_nonblocking_issue:
++            return RunVerdict.VALID_WITH_WARNINGS
++        return RunVerdict.VALID
++
+ 
+-def main() -> None:
++def main() -> int:
+     """Entry point for ``python -m f1_race_intelligence.modeling.runner``."""
+     settings = load_settings()
+     configure_logging(
+@@ -394,9 +487,10 @@ def main() -> None:
+     report = ModelingRunner(settings).run()
+     summary = report.summary()
+ 
+-    if report.aborted:
+-        print(f"Modeling dataset aborted: {report.aborted}")
+-        return
++    if report.verdict not in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS):
++        details = report.aborted or ", ".join(report.blocking_failures) or "; ".join(report.warnings)
++        print(f"Modeling dataset {report.verdict.value}: {details}")
++        return 1
+ 
+     rows = summary["rows_by_split"]
+     print(
+@@ -405,7 +499,8 @@ def main() -> None:
+     )
+     for warning in report.warnings:
+         print(f"  warning: {warning}")
++    return 0
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    raise SystemExit(main())
+diff --git a/src/f1_race_intelligence/storage/backends/base.py b/src/f1_race_intelligence/storage/backends/base.py
+index e8a0b5c..1d7d4b2 100644
+--- a/src/f1_race_intelligence/storage/backends/base.py
++++ b/src/f1_race_intelligence/storage/backends/base.py
+@@ -14,6 +14,8 @@ Two guarantees the rest of the project relies on hold for every backend:
+ * :meth:`StorageBackend.write_json_unique` never replaces an existing
+   object, even when two writers pick the same name at the same instant.
+   Execution records (manifests, reports) depend on it.
++* A JSON document is the same bytes on every backend and operating system
++  (see :func:`_json_bytes`), so a content hash means the same everywhere.
+ 
+ Missing keys raise :class:`FileNotFoundError` and any other storage failure
+ raises :class:`StorageError`. Both are :class:`OSError`, so code written
+@@ -34,7 +36,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
+     import pandas as pd
+ 
+ # Only reached when many writes share a clock tick; bounded so a bug cannot
+-# spin forever. Same bound as utils.files.
++# spin forever.
+ MAX_NAME_COLLISION_RETRIES = 100
+ 
+ JSON_CONTENT_TYPE = "application/json"
+@@ -162,6 +164,10 @@ class StorageBackend(ABC):
+         self.write_bytes(key, _json_bytes(payload), content_type=JSON_CONTENT_TYPE)
+         return key
+ 
++    def write_json_if_absent(self, key: str, payload: Any) -> bool:
++        """Store canonical JSON only when the key is still unused."""
++        return self.write_bytes_if_absent(key, _json_bytes(payload), content_type=JSON_CONTENT_TYPE)
++
+     def write_json_unique(self, prefix: str, stem: str, payload: Any, *, extension: str = ".json") -> str:
+         """Store ``payload`` as ``<stem><extension>``, adding ``-1``, ``-2``… rather than replacing.
+ 
+@@ -197,21 +203,45 @@ class StorageBackend(ABC):
+ 
+     def write_parquet(self, key: str, frame: "pd.DataFrame") -> int:
+         """Store a DataFrame as Parquet, without its index. Returns the bytes written."""
+-        buffer = io.BytesIO()
+-        frame.to_parquet(buffer, engine="pyarrow", index=False)
+-        data = buffer.getvalue()
++        data = self._parquet_bytes(frame)
+         self.write_bytes(key, data, content_type=PARQUET_CONTENT_TYPE)
+         return len(data)
+ 
++    def write_parquet_if_absent(self, key: str, frame: "pd.DataFrame") -> bool:
++        """Store a Parquet DataFrame without replacing an existing object."""
++        return self.write_bytes_if_absent(
++            key,
++            self._parquet_bytes(frame),
++            content_type=PARQUET_CONTENT_TYPE,
++        )
++
++    @staticmethod
++    def _parquet_bytes(frame: "pd.DataFrame") -> bytes:
++        buffer = io.BytesIO()
++        frame.to_parquet(buffer, engine="pyarrow", index=False)
++        return buffer.getvalue()
++
+     def write_joblib(self, key: str, value: Any) -> int:
+         """Persist a Python object with joblib. Returns the bytes written."""
++        data = self._joblib_bytes(value)
++        self.write_bytes(key, data, content_type=BINARY_CONTENT_TYPE)
++        return len(data)
++
++    def write_joblib_if_absent(self, key: str, value: Any) -> bool:
++        """Persist a Python object without replacing an existing object."""
++        return self.write_bytes_if_absent(
++            key,
++            self._joblib_bytes(value),
++            content_type=BINARY_CONTENT_TYPE,
++        )
++
++    @staticmethod
++    def _joblib_bytes(value: Any) -> bytes:
+         import joblib
+ 
+         buffer = io.BytesIO()
+         joblib.dump(value, buffer)
+-        data = buffer.getvalue()
+-        self.write_bytes(key, data, content_type=BINARY_CONTENT_TYPE)
+-        return len(data)
++        return buffer.getvalue()
+ 
+     def read_joblib(self, key: str) -> Any:
+         """Load an object written by :meth:`write_joblib`. Only for trusted storage."""
+@@ -221,5 +251,12 @@ class StorageBackend(ABC):
+ 
+ 
+ def _json_bytes(payload: Any) -> bytes:
+-    # Same style as utils.files.dump_json, which the local backend uses.
++    """The one serialisation of every JSON document the project stores.
++
++    UTF-8 without a byte order mark, two-space indent, ``\\n`` between lines
++    and no trailing newline. Every backend stores exactly these bytes, so a
++    document has the same SHA-256 on local disk and on S3, on Windows and on
++    Linux. Nothing else may serialise JSON for storage, and nothing may
++    write it in text mode, where the platform would rewrite the line endings.
++    """
+     return json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+diff --git a/src/f1_race_intelligence/storage/backends/local.py b/src/f1_race_intelligence/storage/backends/local.py
+index 6b7a025..a7a3c72 100644
+--- a/src/f1_race_intelligence/storage/backends/local.py
++++ b/src/f1_race_intelligence/storage/backends/local.py
+@@ -5,20 +5,24 @@ the configured stage paths — ``data/raw``, ``data/processed/lap_dataset`` —
+ resolve exactly where they always did. An absolute key stays absolute,
+ which is what lets tests point a stage at a temporary directory.
+ 
+-JSON goes through :mod:`f1_race_intelligence.utils.files`, the module that
+-already guarantees atomic replacement and never-overwriting unique names,
+-so there is still a single implementation of those rules on disk.
++Every write is binary. JSON is serialised by the base class and reaches the
++disk through :meth:`LocalStorageBackend.write_bytes` (temporary file, then an
++atomic replace) or :meth:`LocalStorageBackend.write_bytes_if_absent` (atomic
++publication without replacement). A text-mode write would let the operating
++system translate line endings — ``\\n`` becomes ``\\r\\n`` on Windows — so the
++same document would be different bytes, and a different SHA-256, depending on
++where it was written.
+ """
+ 
+ from __future__ import annotations
+ 
+ import os
++import secrets
+ import tempfile
+ from pathlib import Path
+-from typing import Any, List, Optional, Union
++from typing import List, Optional, Union
+ 
+-from f1_race_intelligence.storage.backends.base import StorageBackend, join_key
+-from f1_race_intelligence.utils import files
++from f1_race_intelligence.storage.backends.base import MAX_NAME_COLLISION_RETRIES, StorageBackend, join_key
+ 
+ 
+ class LocalStorageBackend(StorageBackend):
+@@ -72,13 +76,38 @@ class LocalStorageBackend(StorageBackend):
+     def write_bytes_if_absent(self, key: str, data: bytes, *, content_type: Optional[str] = None) -> bool:
+         path = self._path(key)
+         path.parent.mkdir(parents=True, exist_ok=True)
++        temp_path: Optional[Path] = None
+         try:
+-            # Exclusive creation lets the filesystem arbitrate between writers.
+-            with path.open("xb") as handle:
+-                handle.write(data)
+-        except FileExistsError:
+-            return False
+-        return True
++            for _ in range(MAX_NAME_COLLISION_RETRIES):
++                candidate = path.with_name(f".tmp-{secrets.token_hex(16)}{path.suffix}")
++                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
++                try:
++                    descriptor = os.open(candidate, flags, 0o666)
++                except FileExistsError:
++                    continue
++                temp_path = candidate
++                try:
++                    handle = os.fdopen(descriptor, "wb")
++                except BaseException:
++                    os.close(descriptor)
++                    raise
++                break
++            else:
++                raise FileExistsError(f"Could not create a temporary file in {path.parent}")
++
++            with handle:
++                written = handle.write(data)
++                if written != len(data):
++                    raise OSError(f"Short write for temporary file {temp_path}")
++            try:
++                # A hard link publishes the complete file only if the name is free.
++                os.link(temp_path, path)
++            except FileExistsError:
++                return False
++            return True
++        finally:
++            if temp_path is not None:
++                temp_path.unlink(missing_ok=True)
+ 
+     def list(self, prefix: str, *, recursive: bool = True) -> List[str]:
+         base = self._path(prefix)
+@@ -95,17 +124,10 @@ class LocalStorageBackend(StorageBackend):
+     def size(self, key: str) -> int:
+         return self._path(key).stat().st_size
+ 
+-    # -- formats: keep the existing single implementation on disk ------------
+-
+-    def write_json(self, key: str, payload: Any) -> str:
+-        path = self._path(key)
+-        path.parent.mkdir(parents=True, exist_ok=True)
+-        files.write_json_atomically(path, payload)
+-        return key
+-
+-    def write_json_unique(self, prefix: str, stem: str, payload: Any, *, extension: str = ".json") -> str:
+-        written = files.write_json_unique(self._path(prefix), stem, payload, extension=extension)
+-        return join_key(prefix, written.name)
++    # -- formats ------------------------------------------------------------
++    #
++    # JSON is deliberately not overridden: the base class serialises once and
++    # hands the bytes to write_bytes / write_bytes_if_absent above.
+ 
+     def read_parquet(self, key: str):
+         import pandas as pd
+diff --git a/src/f1_race_intelligence/utils/files.py b/src/f1_race_intelligence/utils/files.py
+index 594aab7..89a3fcd 100644
+--- a/src/f1_race_intelligence/utils/files.py
++++ b/src/f1_race_intelligence/utils/files.py
+@@ -1,34 +1,39 @@
+-"""Writing files without losing any.
++"""Deprecated compatibility helpers for legacy local JSON callers.
+ 
+-Two rules the rest of the project relies on, in one place because three
+-modules need them and a subtly different copy in each is how data goes
+-missing:
+-
+-* A record of an execution — an extraction manifest, a validation report —
+-  must never overwrite an earlier one, even when two runs land on the same
+-  clock tick. The system clock does not always advance between calls (on
+-  Windows its granularity is around 15 ms), so a timestamped name is not
+-  unique on its own.
+-* A file written under a name a later run will look for must appear whole
+-  or not at all, because "the file exists" is read as "that work is done".
++New pipeline code must use :class:`StorageBackend`: it serialises JSON once
++to canonical UTF-8 bytes and writes through a storage backend.  These names
++remain importable for callers outside this repository that used the original
++module.  They delegate to that implementation rather than keeping a second
++JSON serialiser or a second set of local write primitives.
+ """
+ 
+ from __future__ import annotations
+ 
+-import json
+-import os
+-import tempfile
++import warnings
+ from pathlib import Path
+-from typing import Any, Union
++from typing import Any, TextIO, Union
++
++from f1_race_intelligence.storage.backends.base import MAX_NAME_COLLISION_RETRIES, _json_bytes
++from f1_race_intelligence.storage.backends.local import LocalStorageBackend
+ 
+-# Only reached when many writes share a clock tick; bounded so a bug cannot
+-# spin forever.
+-MAX_NAME_COLLISION_RETRIES = 100
+ 
++def _deprecated(name: str) -> None:
++    warnings.warn(
++        f"f1_race_intelligence.utils.files.{name} is deprecated; use StorageBackend instead",
++        DeprecationWarning,
++        stacklevel=3,
++    )
+ 
+-def dump_json(payload: Any, handle: Any) -> None:
+-    """Serialize with the project's single JSON style."""
+-    json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
++
++def dump_json(payload: Any, handle: TextIO) -> None:
++    """Write the canonical JSON text to a legacy text handle.
++
++    This preserves the historical signature only.  A text handle controlled
++    by a caller may translate newlines on Windows, so it must not be used for
++    persisted project artifacts.  StorageBackend writes canonical bytes.
++    """
++    _deprecated("dump_json")
++    handle.write(_json_bytes(payload).decode("utf-8"))
+ 
+ 
+ def write_json_unique(
+@@ -38,59 +43,17 @@ def write_json_unique(
+     *,
+     extension: str = ".json",
+ ) -> Path:
+-    """Write ``payload`` under ``stem``, adding a suffix rather than replacing.
+-
+-    Creating the file exclusively lets the filesystem decide who owns a
+-    name. That also holds when two processes write at the same instant,
+-    which a "check whether it exists, then write" cannot promise.
+-
+-    Returns:
+-        The path actually written, which may carry a ``-1``, ``-2``… suffix.
+-    """
++    """Create a JSON file exclusively, retaining the former return type."""
++    _deprecated("write_json_unique")
+     target = Path(directory)
+-    target.mkdir(parents=True, exist_ok=True)
+-
+-    for attempt in range(MAX_NAME_COLLISION_RETRIES):
+-        suffix = "" if attempt == 0 else f"-{attempt}"
+-        candidate = target / f"{stem}{suffix}{extension}"
+-        try:
+-            with candidate.open("x", encoding="utf-8") as handle:
+-                dump_json(payload, handle)
+-        except FileExistsError:
+-            continue
+-        return candidate
+-
+-    raise OSError(
+-        f"Could not find a free file name for {stem}{extension} in {target} "
+-        f"after {MAX_NAME_COLLISION_RETRIES} attempts"
+-    )
++    backend = LocalStorageBackend(target)
++    key = backend.write_json_unique("", stem, payload, extension=extension)
++    return target / Path(key).name
+ 
+ 
+ def write_json_atomically(path: Union[str, Path], payload: Any) -> Path:
+-    """Put a JSON file in place in a single step, never half-written.
+-
+-    The payload goes to a temporary file in the same directory and is then
+-    moved onto the target name, so an interrupted run leaves either the
+-    previous file or nothing — never a truncated one that a later run would
+-    accept as complete.
+-    """
++    """Replace a JSON file atomically through the canonical local backend."""
++    _deprecated("write_json_atomically")
+     file_path = Path(path)
+-    temp_path: Path | None = None
+-    try:
+-        with tempfile.NamedTemporaryFile(
+-            "w",
+-            encoding="utf-8",
+-            dir=file_path.parent,
+-            prefix=".tmp-",
+-            suffix=".json",
+-            delete=False,
+-        ) as handle:
+-            temp_path = Path(handle.name)
+-            dump_json(payload, handle)
+-        os.replace(temp_path, file_path)
+-    except BaseException:
+-        # Never leave a stray .tmp- file behind for the next stage to find.
+-        if temp_path is not None:
+-            temp_path.unlink(missing_ok=True)
+-        raise
++    LocalStorageBackend(file_path.parent).write_json(file_path.name, payload)
+     return file_path
+diff --git a/tests/unit/test_cli.py b/tests/unit/test_cli.py
+index 66a11fe..9dcbf2b 100644
+--- a/tests/unit/test_cli.py
++++ b/tests/unit/test_cli.py
+@@ -259,6 +259,31 @@ def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch
+     assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
+ 
+ 
++def test_m6_blocking_guard_still_fails_pipeline_when_leakage_stop_is_disabled(
++    config_file, tmp_path, monkeypatch
++) -> None:
++    for session_key, year, offset in ((1, 2023, 0), (2, 2024, 365), (3, 2025, 730)):
++        frame = pd.DataFrame(feature_rows(session_key, year, offset))
++        (tmp_path / "features" / str(year)).mkdir(parents=True, exist_ok=True)
++        frame.to_parquet(tmp_path / "features" / str(year) / f"session_{session_key}.parquet", index=False)
++    config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
++    config["modeling"]["fail_on_leakage"] = False
++    config_file.write_text(yaml.safe_dump(config), encoding="utf-8")
++
++    monkeypatch.setattr(
++        checks, "check_chronological_split", lambda assignments: checks.CheckResult("chronological_split", False, "forced")
++    )
++    assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
++
++
++def test_verify_m6_requires_a_report_and_accepts_a_legacy_report(config_file, tmp_path) -> None:
++    assert cli.main(["--stage", "verify-m6", "--config", str(config_file)]) == cli.EXIT_USAGE
++    report = tmp_path / "m6-v1.json"
++    report.write_text(json.dumps({"artifact_files": []}), encoding="utf-8")
++
++    assert cli.main(["--stage", "verify-m6", "--report", str(report), "--config", str(config_file)]) == cli.EXIT_OK
++
++
+ def test_an_unexpected_exception_is_reported_as_a_failed_stage(config_file, monkeypatch) -> None:
+     def explode(ctx):
+         raise RuntimeError("boom")
+diff --git a/tests/unit/test_cloud_ready_stages.py b/tests/unit/test_cloud_ready_stages.py
+index 00113ce..dc5b8b4 100644
+--- a/tests/unit/test_cloud_ready_stages.py
++++ b/tests/unit/test_cloud_ready_stages.py
+@@ -365,13 +365,19 @@ def test_m6_on_s3_writes_the_same_artifacts_as_on_disk(lake, s3, tmp_path) -> No
+     assert on_s3.aborted is None and on_disk.aborted is None
+     assert on_s3.split["assignments"] == on_disk.split["assignments"]
+     assert on_s3.checks == on_disk.checks
+-    for split in (TRAIN, VALIDATION, TEST):
+-        for name in ("dataset.parquet", "features.parquet"):
++    s3_base = lake.backend.uri("").rstrip("/") + "/"
++    local_artifacts = {(item.split, item.artifact): item for item in on_disk.artifact_files}
++    for item in on_s3.artifact_files:
++        local_item = local_artifacts[(item.split, item.artifact)]
++        s3_key = item.path.removeprefix(s3_base)
++        assert lake.backend.read_bytes(s3_key) == Path(local_item.path).read_bytes()
++        if item.artifact.endswith(".parquet"):
+             pd.testing.assert_frame_equal(
+-                lake.backend.read_parquet(f"modeling/split={split}/{name}"),
+-                pd.read_parquet(tmp_path / "modeling" / split / name),
++                lake.backend.read_parquet(s3_key),
++                pd.read_parquet(local_item.path),
+             )
+-    preprocessor = lake.backend.read_joblib("modeling/preprocessing/preprocessor.joblib")
++    preprocessor_file = next(item for item in on_s3.artifact_files if item.artifact == "preprocessor.joblib")
++    preprocessor = lake.backend.read_joblib(preprocessor_file.path.removeprefix(s3_base))
+     assert list(preprocessor.get_feature_names_out()) == on_disk.preprocessing["output_feature_names"]
+-    assert objects(s3, "modeling/preprocessing/feature_schema")
++    assert any(item.artifact == "feature_schema.json" for item in on_s3.artifact_files)
+     assert len(objects(s3, "manifests/modeling/modeling_report_")) == 1
+diff --git a/tests/unit/test_features.py b/tests/unit/test_features.py
+index ebed416..6502e1d 100644
+--- a/tests/unit/test_features.py
++++ b/tests/unit/test_features.py
+@@ -14,6 +14,7 @@ import pytest
+ 
+ from f1_race_intelligence.config.settings import AppSettings
+ from f1_race_intelligence.features import checks, selection
++from f1_race_intelligence.validation.states import CheckStatus
+ from f1_race_intelligence.features.runner import FeatureRunner
+ from f1_race_intelligence.features.selection import FeatureRole, TARGET_COLUMN
+ from f1_race_intelligence.features.target import add_target
+@@ -287,6 +288,19 @@ def test_the_last_lap_guard_catches_an_invented_target() -> None:
+     assert result.details["last_laps_with_target"] == 1
+ 
+ 
++def test_an_unavailable_last_lap_guard_is_reported_as_skipped_not_passed() -> None:
++    frame = feature_frame().drop(columns=["is_last_lap_for_driver"])
++
++    result = checks.check_last_lap_has_no_target(frame)
++
++    assert result.passed is False
++    assert result.status is CheckStatus.SKIPPED
++    assert result.to_dict()["status"] == "SKIPPED"
++    assert result.to_dict()["reason"]
++    assert result.blocking is False
++    assert checks.blocking_failures([result]) == []
++
++
+ def test_the_rolling_guard_catches_a_window_that_saw_the_future() -> None:
+     """A centred window is the classic mistake; the guard must reject it."""
+     frame = feature_frame()
+diff --git a/tests/unit/test_manifest.py b/tests/unit/test_manifest.py
+index 721d162..22fcb84 100644
+--- a/tests/unit/test_manifest.py
++++ b/tests/unit/test_manifest.py
+@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ 
+ from f1_race_intelligence.pipelines.manifest import ExecutionManifest, ExtractionStatus, ManifestEntry
++from f1_race_intelligence.validation.manifest_index import ManifestIndex
+ 
+ 
+ def make_manifest(**overrides) -> ExecutionManifest:
+@@ -69,6 +70,35 @@ def test_save_writes_a_timestamped_file_per_execution(tmp_path: Path) -> None:
+     assert first_path.name.startswith("manifest_20230305T120000")
+ 
+ 
++def test_saved_manifests_use_lf_line_endings_on_every_operating_system(tmp_path: Path) -> None:
++    manifest = make_manifest(started_at=datetime(2023, 3, 5, 12, 0, tzinfo=timezone.utc))
++    manifest.record_session(9158)
++
++    stored = manifest.save(tmp_path / "manifests").read_bytes()
++
++    assert b"\r" not in stored
++    assert stored == json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2, default=str).encode("utf-8")
++
++
++def test_a_manifest_written_with_crlf_by_an_earlier_version_is_still_found_and_read(tmp_path: Path) -> None:
++    """Manifests saved on Windows before the fix carry CRLF; M3 must still be able to use them."""
++    manifest = make_manifest(started_at=datetime(2023, 3, 5, 12, 0, tzinfo=timezone.utc))
++    manifest.record_session(9158)
++    manifest.add(ManifestEntry(endpoint="pit", status=ExtractionStatus.FAILED, session_key=9158, status_code=404))
++    text = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2, default=str)
++    historical = text.replace("\n", "\r\n").encode("utf-8")
++    directory = tmp_path / "manifests"
++    directory.mkdir()
++    (directory / "manifest_20230305T120000000000Z.json").write_bytes(historical)
++
++    index = ManifestIndex.load_latest(directory)
++
++    assert index is not None
++    assert index.sessions_processed == [9158]
++    assert index.failure_for("pit", 9158)["status_code"] == 404
++    assert (directory / "manifest_20230305T120000000000Z.json").read_bytes() == historical
++
++
+ def test_two_runs_starting_on_the_same_clock_tick_keep_both_manifests(tmp_path: Path) -> None:
+     """An execution record must never quietly replace an earlier one."""
+     started = datetime(2023, 3, 5, 12, 0, 0, 123456, tzinfo=timezone.utc)
+diff --git a/tests/unit/test_modeling.py b/tests/unit/test_modeling.py
+index dee204f..6db9e64 100644
+--- a/tests/unit/test_modeling.py
++++ b/tests/unit/test_modeling.py
+@@ -27,6 +27,7 @@ from f1_race_intelligence.modeling.split import (
+     apply_assignments,
+     assign_sessions,
+ )
++from f1_race_intelligence.validation.states import CheckStatus, RunVerdict
+ 
+ RACE_START = pd.Timestamp("2023-03-05T15:00:00Z")
+ 
+@@ -56,7 +57,7 @@ def feature_rows(
+                     "lap_duration": 90.0 + lap + driver * 0.1,
+                     "tyre_age": lap,
+                     "position_at_lap_start": 1,
+-                    "speed_mean": 200.0 + lap,
++                    "speed_mean": 200.0 + lap + session_key * 10,
+                     "gap_to_leader_s": None if lap == 1 else float(lap),
+                     "lap_time_prev_1": None if lap == 1 else 90.0 + lap - 1,
+                     "compound": compound,
+@@ -119,7 +120,9 @@ def modeling_settings(tmp_path: Path) -> Callable[..., AppSettings]:
+ 
+ 
+ def load_matrix(settings, split: str) -> pd.DataFrame:
+-    return pd.read_parquet(Path(settings.modeling.output_path) / split / "features.parquet", engine="pyarrow")
++    paths = sorted((Path(settings.modeling.output_path) / split / "runs").glob("*/features.parquet"))
++    assert paths, f"no versioned matrix for {split}"
++    return pd.read_parquet(paths[-1], engine="pyarrow")
+ 
+ 
+ # -- loading and target ---------------------------------------------------
+@@ -167,11 +170,12 @@ def test_a_race_is_never_divided_between_splits(three_races, modeling_settings)
+     three_races()
+     settings = modeling_settings()
+ 
+-    ModelingRunner(settings).run()
++    report = ModelingRunner(settings).run()
+ 
+     keys = {}
+     for split in (TRAIN, VALIDATION, TEST):
+-        frame = pd.read_parquet(Path(settings.modeling.output_path) / split / "dataset.parquet")
++        artifact = next(item for item in report.artifacts if item.name == split)
++        frame = pd.read_parquet(artifact.dataset_path)
+         keys[split] = set(frame["session_key"].unique())
+     assert keys[TRAIN] & keys[VALIDATION] == set()
+     assert keys[TRAIN] & keys[TEST] == set()
+@@ -327,7 +331,8 @@ def test_a_category_unseen_in_training_does_not_break_transform(feature_dataset,
+     """A driver who debuts in a later season must not break the pipeline."""
+     feature_dataset(feature_rows(1, 2023, 0, drivers=(1, 44)), 2023, 1)
+     feature_dataset(feature_rows(2, 2024, 365, drivers=(1, 99), compound="WET", team="New Team"), 2024, 2)
+-    settings = modeling_settings(train_fraction=0.5, validation_fraction=0.5)
++    feature_dataset(feature_rows(3, 2025, 730), 2025, 3)
++    settings = modeling_settings(train_fraction=1 / 3, validation_fraction=1 / 3)
+ 
+     report = ModelingRunner(settings).run()
+ 
+@@ -516,7 +521,19 @@ def test_the_fitting_guard_accepts_a_transformer_fitted_on_train() -> None:
+     result = checks.check_no_validation_statistics_used_in_training(correct, train, validation)
+ 
+     assert result.passed is True
+-    assert result.details["adding_split_changes_parameters"] is True, "the comparison can discriminate"
++
++
++def test_fitting_guard_is_inconclusive_when_other_split_cannot_distinguish_the_fit() -> None:
++    train = pd.DataFrame({"speed_mean": [200.0, 200.0]})
++    test = train.copy()
++    preprocessor = preprocessing.build_preprocessor(["speed_mean"], [])
++    preprocessor.fit(train)
++
++    result = checks.check_no_test_statistics_used_in_training(preprocessor, train, test)
++
++    assert result.status is CheckStatus.INCONCLUSIVE
++    assert result.passed is False
++    assert result.to_dict()["details"]["adding_split_changes_parameters"] is False
+ 
+ 
+ def test_the_schema_guard_rejects_mismatched_columns() -> None:
+@@ -560,12 +577,17 @@ def test_the_report_records_the_configuration_and_the_split(three_races, modelin
+     three_races()
+     settings = modeling_settings()
+ 
+-    ModelingRunner(settings).run()
++    report = ModelingRunner(settings).run()
+ 
+     files = list((tmp_path / "modeling" / "reports").glob("modeling_report_*.json"))
+     assert len(files) == 1
+     payload = json.loads(files[0].read_text(encoding="utf-8"))
+     assert payload["pipeline_name"] == "modeling_dataset"
++    assert payload["schema_version"] == 2
++    assert payload["run_id"] == report.run_id
++    assert payload["verdict"] in {"VALID", "VALID_WITH_WARNINGS"}
++    assert len(payload["config_fingerprint"]) == 64
++    assert payload["dependency_lock_sha256"] is None or len(payload["dependency_lock_sha256"]) == 64
+     assert payload["config"]["split_strategy"] == "fraction"
+     assert payload["preprocessing"]["fitted_on"] == "train split only"
+     assert payload["target"]["definition"].startswith("lap_duration(t+1)")
+@@ -579,9 +601,10 @@ def test_the_fitted_preprocessor_is_persisted(three_races, modeling_settings, tm
+ 
+     ModelingRunner(settings).run()
+ 
+-    directory = tmp_path / "modeling" / "preprocessing"
+-    assert (directory / "preprocessor.joblib").exists()
+-    schema = list(directory.glob("feature_schema*.json"))
++    directory = tmp_path / "modeling" / "preprocessing" / "runs"
++    (run_directory,) = list(directory.iterdir())
++    assert (run_directory / "preprocessor.joblib").exists()
++    schema = list(run_directory.glob("feature_schema*.json"))
+     assert schema, "the encoded column names are written for the next stage"
+     payload = json.loads(schema[0].read_text(encoding="utf-8"))
+     assert payload["target"] == TARGET_COLUMN
+@@ -610,7 +633,29 @@ def test_a_thin_history_is_reported_as_insufficient(feature_dataset, modeling_se
+ 
+     assert report.warnings
+     assert any("below the configured minimum" in item for item in report.warnings)
+-    assert report.aborted is None, "the pipeline still runs; it just refuses to pretend"
++    assert report.verdict is RunVerdict.INCOMPLETE
++    assert report.aborted is not None, "a missing test split cannot be reported as a successful run"
++    assert report.artifact_files == []
++
++
++def test_empty_test_split_is_blocking_even_when_leakage_stop_is_disabled(feature_dataset, modeling_settings) -> None:
++    feature_dataset(feature_rows(1, 2023, 0), 2023, 1)
++    feature_dataset(feature_rows(2, 2024, 365), 2024, 2)
++
++    report = ModelingRunner(
++        modeling_settings(
++            min_sessions_per_split=1,
++            train_fraction=0.5,
++            validation_fraction=0.5,
++            fail_on_leakage=False,
++        )
++    ).run()
++
++    assert report.verdict is RunVerdict.INCOMPLETE
++    assert report.artifact_files == []
++    assert any(item["check"] == "split_completeness" and item["status"] == "FAIL" for item in report.checks)
++    skipped = [item for item in report.checks if item["status"] == "SKIPPED"]
++    assert skipped and all(item.get("reason") for item in skipped)
+ 
+ 
+ def test_an_empty_input_aborts_without_writing(modeling_settings, tmp_path) -> None:
+@@ -637,7 +682,7 @@ def test_features_come_from_the_m5_catalogue(three_races, modeling_settings) ->
+ 
+     report = ModelingRunner(settings).run()
+ 
+-    frame = pd.read_parquet(Path(settings.modeling.output_path) / TRAIN / "dataset.parquet")
++    frame = pd.read_parquet(next(item for item in report.artifacts if item.name == TRAIN).dataset_path)
+     columns = feature_columns(frame)
+     assert set(report.features["numeric"]) == set(columns["numeric"])
+     assert set(report.features["categorical"]) == set(columns["categorical"])
+diff --git a/tests/unit/test_modeling_fingerprints.py b/tests/unit/test_modeling_fingerprints.py
+index fc49916..690ef50 100644
+--- a/tests/unit/test_modeling_fingerprints.py
++++ b/tests/unit/test_modeling_fingerprints.py
+@@ -11,7 +11,7 @@ import io
+ import json
+ import random
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, Tuple
+ 
+ import pandas as pd
+ import pytest
+@@ -22,6 +22,8 @@ from f1_race_intelligence.modeling.fingerprints import INPUT_FINGERPRINT_SCHEME,
+ from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader
+ from f1_race_intelligence.modeling.runner import ModelingRunner
+ from f1_race_intelligence.modeling.split import SPLITS
++from f1_race_intelligence.modeling.verification import verify_report
++from f1_race_intelligence.modeling import traceability
+ from f1_race_intelligence.storage.backends import LocalStorageBackend, S3StorageBackend
+ from f1_race_intelligence.storage.backends.base import StorageError
+ from f1_race_intelligence.storage.layout import LakeLayout, Layer, LegacyLayout
+@@ -102,6 +104,10 @@ class Env:
+         base = self._uri(Layer.MODELING_REPORTS, DEFAULTS.report_path)
+         return [json.loads(data) for uri, data in self.stored().items() if _below(uri, base)]
+ 
++    def report_locations(self) -> List[str]:
++        base = self._uri(Layer.MODELING_REPORTS, DEFAULTS.report_path)
++        return [uri for uri in self.stored() if _below(uri, base)]
++
+ 
+ def _below(uri: str, base: str) -> bool:
+     if uri.startswith("s3://"):
+@@ -249,6 +255,7 @@ def test_local_disk_and_s3_give_the_same_fingerprint(tmp_path: Path) -> None:
+     assert on_disk.source["files"] != on_s3.source["files"], "the locations really differ"
+     assert on_s3.source["inputs"] == on_disk.source["inputs"]
+     assert on_s3.source["input_fingerprint"] == on_disk.source["input_fingerprint"]
++    assert on_s3.config_fingerprint == on_disk.config_fingerprint
+ 
+ 
+ # -- artifact fingerprints ------------------------------------------------
+@@ -279,6 +286,198 @@ def test_the_saved_report_carries_the_artifact_hashes(env: Env) -> None:
+     (saved,) = env.reports()
+     assert saved["artifact_files"] == [item.to_dict() for item in report.artifact_files]
+     assert saved["source"]["input_fingerprint_scheme"] == INPUT_FINGERPRINT_SCHEME
++    assert saved["schema_version"] == 2
++    assert saved["run_id"] == report.run_id
++    assert saved["config_fingerprint"] == report.config_fingerprint
++    assert saved["source_commit"] == report.source_commit
++    assert saved["dependency_lock_sha256"] == report.dependency_lock_sha256
++    assert len(saved["dependency_lock_sha256"]) == 64
++
++
++def saved_artifact_hashes(env: Env) -> Dict[Tuple[Optional[str], str], str]:
++    """The hashes the single saved report declares, by (split, artifact) — location left out."""
++    (saved,) = env.reports()
++    return {(item["split"], item["artifact"]): item["sha256"] for item in saved["artifact_files"]}
++
++
++def stored_artifact_bytes(env: Env) -> Dict[Tuple[Optional[str], str], bytes]:
++    """What the medium holds for each declared artifact, by (split, artifact)."""
++    (saved,) = env.reports()
++    stored = env.artifact_objects()
++    return {(item["split"], item["artifact"]): stored[item["path"]] for item in saved["artifact_files"]}
++
++
++def test_m6_artifact_hashes_match_between_local_and_s3(tmp_path: Path) -> None:
++    """All eight artifacts are the same bytes on disk and on S3, on any operating system.
++
++    The hashes are compared as the reports state them and the objects as the
++    media hold them. Nothing is parsed or normalised first: a JSON file that
++    means the same but differs in its line endings is a different artifact.
++    """
++    local, lake = Env("local", tmp_path), Env("s3", tmp_path)
++    assert local.publish() == lake.publish()
++
++    local.run()
++    lake.run()
++
++    on_disk, on_s3 = saved_artifact_hashes(local), saved_artifact_hashes(lake)
++    assert set(on_disk) == set(on_s3) == EXPECTED_ARTIFACTS
++    assert len(on_disk) == 8
++    differing = sorted((str(key) for key in on_disk if on_disk[key] != on_s3[key]))
++    assert differing == [], f"artifacts whose bytes depend on the backend: {differing}"
++
++    disk_bytes, s3_bytes = stored_artifact_bytes(local), stored_artifact_bytes(lake)
++    for key, declared in on_disk.items():
++        assert disk_bytes[key] == s3_bytes[key], key
++        assert sha256(disk_bytes[key]) == declared, key
++
++
++def test_two_runs_with_the_same_inputs_give_identical_artifact_hashes(env: Env, tmp_path: Path) -> None:
++    """Same inputs, same configuration, same backend, a fresh store each time."""
++    again = Env(env.kind, tmp_path / "second-run")
++    assert env.publish() == again.publish()
++
++    first = env.run()
++    second = again.run()
++
++    assert first.aborted is None and second.aborted is None
++    assert second.source["input_fingerprint"] == first.source["input_fingerprint"]
++    # Only where each store lives may differ between the two runs.
++    where = {"input_storage", "output_storage"}
++    assert {k: v for k, v in second.config.items() if k not in where} == {
++        k: v for k, v in first.config.items() if k not in where
++    }
++    assert saved_artifact_hashes(again) == saved_artifact_hashes(env)
++    assert set(saved_artifact_hashes(env)) == EXPECTED_ARTIFACTS
++    assert stored_artifact_bytes(again) == stored_artifact_bytes(env), "the serialised content is identical too"
++
++
++def test_each_run_uses_a_distinct_versioned_artifact_prefix(env: Env) -> None:
++    env.publish()
++
++    first = env.run()
++    second = env.run()
++
++    assert first.run_id != second.run_id
++    first_paths = {item.path for item in first.artifact_files}
++    second_paths = {item.path for item in second.artifact_files}
++    assert len(first_paths) == len(second_paths) == 8
++    assert first_paths.isdisjoint(second_paths)
++    assert len(env.artifact_objects()) == 16
++
++
++def test_report_verification_checks_artifact_bytes_without_rewriting_report(tmp_path: Path) -> None:
++    env = Env("local", tmp_path)
++    env.publish()
++    env.run()
++    (location,) = env.report_locations()
++    before = Path(location).read_bytes()
++
++    result = verify_report(location)
++
++    assert result["ok"] is True
++    assert result["schema_version"] == 2
++    assert result["artifacts_checked"] == 8
++    assert Path(location).read_bytes() == before
++
++
++def test_report_verification_reads_v1_and_detects_tampering(tmp_path: Path) -> None:
++    env = Env("local", tmp_path / "store")
++    env.publish()
++    env.run()
++    (location,) = env.report_locations()
++    payload = json.loads(Path(location).read_bytes())
++    for field in (
++        "schema_version",
++        "run_id",
++        "source_commit",
++        "source_dirty",
++        "dependency_lock_sha256",
++        "config_fingerprint",
++        "verdict",
++    ):
++        payload.pop(field, None)
++    v1_path = tmp_path / "legacy-v1-report.json"
++    v1_path.write_text(json.dumps(payload), encoding="utf-8")
++
++    legacy = verify_report(str(v1_path))
++    assert legacy["ok"] is True
++    assert legacy["schema_version"] == 1
++
++    artifact_path = Path(payload["artifact_files"][0]["path"])
++    artifact_path.write_bytes(b"tampered")
++    tampered = verify_report(str(v1_path))
++    assert tampered["ok"] is False
++    assert any("sha256 mismatch" in item for item in tampered["errors"])
++
++
++def test_source_commit_is_not_invented_when_git_is_unavailable(monkeypatch) -> None:
++    monkeypatch.delenv("F1_GIT_COMMIT", raising=False)
++    monkeypatch.delenv("F1_GIT_DIRTY", raising=False)
++
++    def unavailable(*args, **kwargs):
++        raise FileNotFoundError("git is not installed")
++
++    monkeypatch.setattr(traceability.subprocess, "run", unavailable)
++
++    assert traceability.source_revision() == (None, None)
++
++
++def test_injected_commit_is_recorded_without_claiming_unknown_cleanliness(monkeypatch) -> None:
++    monkeypatch.setenv("F1_GIT_COMMIT", "a" * 40)
++    monkeypatch.setenv("F1_GIT_DIRTY", "")
++
++    def unavailable(*args, **kwargs):
++        raise FileNotFoundError("git is not installed")
++
++    monkeypatch.setattr(traceability.subprocess, "run", unavailable)
++
++    assert traceability.source_revision() == ("a" * 40, None)
++
++
++def test_missing_dependency_lock_prevents_a_valid_verdict(env: Env, monkeypatch, tmp_path: Path) -> None:
++    env.publish()
++    monkeypatch.setenv("F1_DEPENDENCY_LOCK_PATH", str(tmp_path / "missing-lock.txt"))
++
++    report = env.run()
++
++    assert report.dependency_lock_sha256 is None
++    assert report.verdict.value == "INCOMPLETE"
++    assert report.summary()["checks_passed"] is False
++
++
++def test_missing_source_revision_prevents_a_valid_verdict(env: Env, monkeypatch) -> None:
++    env.publish()
++    monkeypatch.setattr("f1_race_intelligence.modeling.runner.source_revision", lambda: (None, None))
++
++    report = env.run()
++
++    assert report.source_commit is None
++    assert report.verdict.value == "INCOMPLETE"
++    assert report.summary()["checks_passed"] is False
++
++
++def test_configuration_fingerprint_excludes_storage_locations_and_secrets() -> None:
++    first = traceability.config_fingerprint(
++        {"split_strategy": "fraction", "input_storage": {"location": "local", "token": "secret-a"}}
++    )
++    second = traceability.config_fingerprint(
++        {"split_strategy": "fraction", "input_storage": {"location": "s3", "token": "secret-b"}}
++    )
++
++    assert first == second
++
++
++def test_the_feature_schema_is_stored_with_lf_line_endings(env: Env) -> None:
++    """The one JSON artifact: UTF-8, LF, no BOM, no trailing newline, on every backend."""
++    env.publish()
++
++    env.run()
++
++    schema = stored_artifact_bytes(env)[(None, "feature_schema.json")]
++    assert b"\r" not in schema
++    assert not schema.startswith(b"\xef\xbb\xbf") and not schema.endswith(b"\n")
++    assert schema == json.dumps(json.loads(schema), ensure_ascii=False, indent=2, default=str).encode("utf-8")
+ 
+ 
+ # -- runs that stop early -------------------------------------------------
+@@ -360,10 +559,10 @@ class FailingStorage(LocalStorageBackend):
+             raise StorageError(f"forced read failure for {key}")
+         return super().read_bytes(key)
+ 
+-    def write_parquet(self, key: str, frame) -> int:
++    def write_parquet_if_absent(self, key: str, frame) -> bool:
+         if self._write and self._write in key:
+             raise StorageError(f"forced write failure for {key}")
+-        return super().write_parquet(key, frame)
++        return super().write_parquet_if_absent(key, frame)
+ 
+ 
+ def test_a_failed_read_records_no_inputs_at_all(tmp_path: Path) -> None:
+@@ -378,7 +577,7 @@ def test_a_failed_read_records_no_inputs_at_all(tmp_path: Path) -> None:
+ 
+ def test_a_failed_write_declares_no_artifacts(tmp_path: Path) -> None:
+     Env("local", tmp_path).publish()
+-    failing = Env("local", tmp_path, backend=FailingStorage(tmp_path / "store", write="validation/features"))
++    failing = Env("local", tmp_path, backend=FailingStorage(tmp_path / "store", write="validation/runs"))
+ 
+     with pytest.raises(StorageError):
+         failing.run()
+@@ -434,3 +633,42 @@ def test_a_disabled_leakage_stop_still_writes_and_declares_everything(env: Env,
+     assert report.aborted is None
+     assert report.blocking_failures == ["chronological_split"]
+     assert {item.path for item in report.artifact_files} == set(env.artifact_objects())
++
++
++def test_an_omitted_required_guard_is_skipped_and_cannot_yield_a_valid_verdict(
++    env: Env, monkeypatch
++) -> None:
++    env.publish()
++    monkeypatch.setattr(
++        ModelingRunner,
++        "_run_checks",
++        lambda *args, **kwargs: [checks.CheckResult("target_not_in_features", True, "safe")],
++    )
++
++    report = env.run(fail_on_leakage=False)
++
++    omitted = next(item for item in report.checks if item["check"] == "chronological_split")
++    assert omitted["status"] == "SKIPPED"
++    assert omitted["reason"]
++    assert report.verdict.value == "INCOMPLETE"
++    assert report.summary()["checks_passed"] is False
++
++
++def test_inconclusive_blocking_guard_cannot_yield_a_valid_verdict(env: Env, monkeypatch) -> None:
++    env.publish()
++    monkeypatch.setattr(
++        checks,
++        "check_no_test_statistics_used_in_training",
++        lambda *args, **kwargs: checks.CheckResult(
++            "no_test_statistics_used_in_training",
++            False,
++            "not distinguishable",
++            details={"inconclusive": "the comparison was not discriminative"},
++        ),
++    )
++
++    report = env.run(fail_on_leakage=False)
++
++    assert report.verdict.value == "INCONCLUSIVE"
++    assert next(item for item in report.checks if item["check"] == "no_test_statistics_used_in_training")["status"] == "INCONCLUSIVE"
++    assert report.summary()["checks_passed"] is False
+diff --git a/tests/unit/test_raw_storage.py b/tests/unit/test_raw_storage.py
+index 9973ae5..c9a155e 100644
+--- a/tests/unit/test_raw_storage.py
++++ b/tests/unit/test_raw_storage.py
+@@ -1,4 +1,5 @@
+ import json
++import os
+ import re
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -6,8 +7,9 @@ from pathlib import Path
+ import pytest
+ 
+ from f1_race_intelligence.storage import raw_storage
++from f1_race_intelligence.storage.backends import base as storage_base
++from f1_race_intelligence.storage.backends import local as local_backend
+ from f1_race_intelligence.storage.raw_storage import RawDataStorage
+-from f1_race_intelligence.utils import files
+ 
+ 
+ class _FrozenClock:
+@@ -110,21 +112,99 @@ def test_save_with_file_name_leaves_no_temporary_files_behind(tmp_path: Path) ->
+     assert [item.name for item in path.parent.iterdir()] == ["session_9158.json"]
+ 
+ 
+-def test_a_failed_write_leaves_neither_a_partial_nor_a_temporary_file(tmp_path: Path, monkeypatch) -> None:
++@pytest.mark.parametrize(
++    "module, attribute",
++    [
++        # Before anything reaches the disk: the payload cannot be serialised.
++        (storage_base, "_json_bytes"),
++        # After the temporary file is fully written: it cannot be moved into place.
++        (os, "replace"),
++    ],
++    ids=["while-serialising", "while-replacing"],
++)
++def test_a_failed_write_leaves_neither_a_partial_nor_a_temporary_file(
++    tmp_path: Path, monkeypatch, module, attribute
++) -> None:
+     storage = RawDataStorage(base_path=tmp_path)
+     storage.save("laps", {"session_key": 9158}, data=["original"], file_name="session_9158.json")
++    target = tmp_path / "laps" / "session_key=9158" / "session_9158.json"
++    original = target.read_bytes()
+ 
+-    def explode(payload, handle):
++    def explode(*args, **kwargs):
+         raise OSError("disk full")
+ 
+-    monkeypatch.setattr(files, "dump_json", explode)
++    monkeypatch.setattr(module, attribute, explode)
+ 
+     with pytest.raises(OSError):
+         storage.save("laps", {"session_key": 9158}, data=["replacement"], file_name="session_9158.json")
+ 
+-    target = tmp_path / "laps" / "session_key=9158" / "session_9158.json"
+     assert [item.name for item in target.parent.iterdir()] == ["session_9158.json"]
+     assert json.loads(target.read_text(encoding="utf-8"))["data"] == ["original"]
++    assert target.read_bytes() == original
++
++
++def test_a_failure_while_writing_the_binary_temporary_file_keeps_the_original(tmp_path: Path, monkeypatch) -> None:
++    """The temporary file exists before its binary write fails and is then removed."""
++    storage = RawDataStorage(base_path=tmp_path)
++    storage.save("laps", {"session_key": 9158}, data=["original"], file_name="session_9158.json")
++    target = tmp_path / "laps" / "session_key=9158" / "session_9158.json"
++    original = target.read_bytes()
++    real_named_temporary_file = local_backend.tempfile.NamedTemporaryFile
++
++    class FailingTemporaryFile:
++        def __init__(self, handle):
++            self._handle = handle
++
++        @property
++        def name(self):
++            return self._handle.name
++
++        def __enter__(self):
++            self._handle.__enter__()
++            return self
++
++        def __exit__(self, *args):
++            return self._handle.__exit__(*args)
++
++        def write(self, data):
++            raise OSError("disk full")
++
++    def failing_named_temporary_file(*args, **kwargs):
++        return FailingTemporaryFile(real_named_temporary_file(*args, **kwargs))
++
++    monkeypatch.setattr(local_backend.tempfile, "NamedTemporaryFile", failing_named_temporary_file)
++
++    with pytest.raises(OSError, match="disk full"):
++        storage.save("laps", {"session_key": 9158}, data=["replacement"], file_name="session_9158.json")
++
++    assert [item.name for item in target.parent.iterdir()] == ["session_9158.json"]
++    assert target.read_bytes() == original
++
++
++@pytest.mark.parametrize("file_name", ["session_9158.json", None], ids=["named", "timestamped"])
++def test_saved_files_use_lf_line_endings_on_every_operating_system(tmp_path: Path, file_name) -> None:
++    storage = RawDataStorage(base_path=tmp_path)
++
++    path = storage.save("laps", {"session_key": 9158}, data=[{"driver": "Pérez"}], file_name=file_name)
++
++    stored = path.read_bytes()
++    assert b"\r" not in stored
++    assert stored.count(b"\n") > 0
++    assert not stored.startswith(b"\xef\xbb\xbf") and not stored.endswith(b"\n")
++    assert "Pérez".encode("utf-8") in stored
++
++
++def test_a_raw_file_saved_with_crlf_by_an_earlier_version_still_loads_and_is_left_alone(tmp_path: Path) -> None:
++    """Raw files downloaded on Windows before the fix carry CRLF and are never rewritten."""
++    storage = RawDataStorage(base_path=tmp_path)
++    target = storage.resolve_path("laps", {"session_key": 9158}, file_name="session_9158.json")
++    target.parent.mkdir(parents=True)
++    historical = b'{\r\n  "endpoint": "laps",\r\n  "data": [\r\n    {\r\n      "lap_number": 1\r\n    }\r\n  ]\r\n}'
++    target.write_bytes(historical)
++
++    assert storage.exists("laps", {"session_key": 9158}, file_name="session_9158.json")
++    assert storage.load("laps", {"session_key": 9158}, file_name="session_9158.json") == [{"lap_number": 1}]
++    assert target.read_bytes() == historical
+ 
+ 
+ def test_resolve_path_points_at_where_save_would_write_without_creating_it(tmp_path: Path) -> None:
+diff --git a/tests/unit/test_storage_backends.py b/tests/unit/test_storage_backends.py
+index dcf5540..b4e8f79 100644
+--- a/tests/unit/test_storage_backends.py
++++ b/tests/unit/test_storage_backends.py
+@@ -5,12 +5,17 @@ against :class:`StorageBackend` must not be able to tell them apart. The S3
+ backend talks to an in-memory stub — no boto3, no network, no credentials.
+ """
+ 
++import json
+ import os
++import stat
++from concurrent.futures import ThreadPoolExecutor
+ from pathlib import Path
++from threading import Barrier
+ 
+ import pandas as pd
+ import pytest
+ 
++from f1_race_intelligence.storage.backends import local as local_backend
+ from f1_race_intelligence.storage.backends import LocalStorageBackend, S3StorageBackend, StorageError, join_key
+ from f1_race_intelligence.storage.backends.base import relative_parts
+ from f1_race_intelligence.storage.store import DataStore, store_from_storage_settings, store_from_uri
+@@ -90,12 +95,97 @@ def test_json_round_trip(backend) -> None:
+     assert backend.read_json("raw/laps.json") == payload
+ 
+ 
++# -- JSON bytes: one representation on every backend and operating system -----
++
++JSON_PAYLOAD = {
++    "endpoint": "laps",
++    "driver": "Pérez",
++    "nested": {"values": [1, 2.5, None, True], "empty": {}},
++    "data": [{"lap_number": 1}, {"lap_number": 2}],
++}
++
++
++def canonical_json(payload) -> bytes:
++    """The agreed JSON representation, written out here rather than imported.
++
++    UTF-8 without a BOM, two-space indent, LF between lines, no trailing
++    newline. Stating it independently means the backends are compared with
++    the contract, not with their own implementation.
++    """
++    return json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
++
++
++def assert_canonical_json(stored: bytes, payload) -> None:
++    assert stored == canonical_json(payload)
++    assert b"\r" not in stored, "no CRLF (or lone CR) line endings"
++    assert stored.count(b"\n") > 0, "lines are separated by LF"
++    assert not stored.startswith(b"\xef\xbb\xbf"), "no byte order mark"
++    assert not stored.endswith(b"\n"), "no trailing newline"
++    assert "Pérez".encode("utf-8") in stored, "non-ASCII text is stored as UTF-8, not escaped"
++    assert json.loads(stored.decode("utf-8")) == payload
++
++
++def test_json_is_stored_as_the_canonical_bytes(backend) -> None:
++    backend.write_json("raw/laps.json", JSON_PAYLOAD)
++
++    assert_canonical_json(backend.read_bytes("raw/laps.json"), JSON_PAYLOAD)
++
++
++def test_unique_json_is_stored_as_the_canonical_bytes(backend) -> None:
++    key = backend.write_json_unique("manifests", "manifest_x", JSON_PAYLOAD)
++
++    assert_canonical_json(backend.read_bytes(key), JSON_PAYLOAD)
++
++
++def test_local_disk_and_s3_store_identical_json_bytes(tmp_path: Path) -> None:
++    """Compared byte for byte, straight from each medium, with nothing normalised."""
++    client = FakeS3Client()
++    local, s3 = LocalStorageBackend(tmp_path), S3StorageBackend(BUCKET, "dev", client=client)
++
++    for store in (local, s3):
++        store.write_json("reports/replaceable.json", JSON_PAYLOAD)
++        assert store.write_json_unique("reports", "unique", JSON_PAYLOAD) == "reports/unique.json"
++
++    for name in ("replaceable.json", "unique.json"):
++        on_disk = (tmp_path / "reports" / name).read_bytes()
++        on_s3 = client.objects[BUCKET][f"dev/reports/{name}"]
++        assert on_disk == on_s3, name
++
++
++def test_json_written_with_crlf_by_an_earlier_version_is_still_readable(backend) -> None:
++    """Files written on Windows before the fix carry CRLF; they must stay readable and untouched."""
++    payload = {"endpoint": "laps", "driver": "Pérez", "data": [{"lap_number": 1}]}
++    historical = canonical_json(payload).replace(b"\n", b"\r\n")
++    assert b"\r\n" in historical
++    backend.write_bytes("raw/old.json", historical)
++
++    assert backend.read_json("raw/old.json") == payload
++    assert backend.read_bytes("raw/old.json") == historical, "reading never rewrites a historical file"
++
++
+ def test_write_if_absent_never_replaces(backend) -> None:
+     assert backend.write_bytes_if_absent("records/r.json", b"one") is True
+     assert backend.write_bytes_if_absent("records/r.json", b"two") is False
+     assert backend.read_bytes("records/r.json") == b"one"
+ 
+ 
++def test_format_writers_can_publish_once_without_replacing_existing_objects(backend) -> None:
++    first_frame = pd.DataFrame({"value": [1, 2]})
++    second_frame = pd.DataFrame({"value": [9]})
++
++    assert backend.write_json_if_absent("runs/a/report.json", {"run": 1}) is True
++    assert backend.write_json_if_absent("runs/a/report.json", {"run": 2}) is False
++    assert backend.read_bytes("runs/a/report.json") == canonical_json({"run": 1})
++
++    assert backend.write_parquet_if_absent("runs/a/data.parquet", first_frame) is True
++    assert backend.write_parquet_if_absent("runs/a/data.parquet", second_frame) is False
++    pd.testing.assert_frame_equal(backend.read_parquet("runs/a/data.parquet"), first_frame)
++
++    assert backend.write_joblib_if_absent("runs/a/model.joblib", {"run": 1}) is True
++    assert backend.write_joblib_if_absent("runs/a/model.joblib", {"run": 2}) is False
++    assert backend.read_joblib("runs/a/model.joblib") == {"run": 1}
++
++
+ def test_unique_json_names_get_suffixes_instead_of_overwriting(backend) -> None:
+     first = backend.write_json_unique("manifests", "manifest_20260101T000000000000Z", {"run": 1})
+     second = backend.write_json_unique("manifests", "manifest_20260101T000000000000Z", {"run": 2})
+@@ -104,6 +194,7 @@ def test_unique_json_names_get_suffixes_instead_of_overwriting(backend) -> None:
+     assert second == "manifests/manifest_20260101T000000000000Z-1.json"
+     assert backend.read_json(first) == {"run": 1}
+     assert backend.read_json(second) == {"run": 2}
++    assert backend.read_bytes(first) == canonical_json({"run": 1}), "the first record is left exactly as written"
+ 
+ 
+ def test_parquet_round_trip_keeps_dtypes_and_invents_no_partition_columns(backend) -> None:
+@@ -168,6 +259,123 @@ def test_local_failed_write_leaves_the_previous_file_and_no_temporary(tmp_path:
+     assert (tmp_path / "raw" / "a.json").read_bytes() == b"original"
+ 
+ 
++def test_local_failed_json_write_leaves_the_previous_file_and_no_temporary(tmp_path: Path, monkeypatch) -> None:
++    """JSON gets the same all-or-nothing replacement as any other object."""
++    backend = LocalStorageBackend(tmp_path)
++    backend.write_json("raw/a.json", {"version": "original"})
++    original = (tmp_path / "raw" / "a.json").read_bytes()
++
++    def explode(*args, **kwargs):
++        raise OSError("disk full")
++
++    monkeypatch.setattr(os, "replace", explode)
++    with pytest.raises(OSError):
++        backend.write_json("raw/a.json", {"version": "replacement"})
++
++    assert [item.name for item in (tmp_path / "raw").iterdir()] == ["a.json"]
++    assert (tmp_path / "raw" / "a.json").read_bytes() == original
++
++
++def test_local_unique_json_is_created_exclusively(tmp_path: Path) -> None:
++    """A name already taken on disk — by anyone — is never replaced."""
++    backend = LocalStorageBackend(tmp_path)
++    (tmp_path / "manifests").mkdir()
++    (tmp_path / "manifests" / "manifest_x.json").write_bytes(b"written by another process")
++
++    key = backend.write_json_unique("manifests", "manifest_x", {"run": 2})
++
++    assert key == "manifests/manifest_x-1.json"
++    assert (tmp_path / "manifests" / "manifest_x.json").read_bytes() == b"written by another process"
++    assert sorted(item.name for item in (tmp_path / "manifests").iterdir()) == ["manifest_x-1.json", "manifest_x.json"]
++
++
++def test_local_unique_json_write_failure_leaves_no_partial_file_or_temporary(
++    tmp_path: Path, monkeypatch
++) -> None:
++    backend = LocalStorageBackend(tmp_path)
++    real_fdopen = local_backend.os.fdopen
++    directory = tmp_path / "manifests"
++    partial_contents: list[bytes] = []
++
++    class FailingBinaryFile:
++        def __init__(self, handle):
++            self._handle = handle
++
++        def __enter__(self):
++            self._handle.__enter__()
++            return self
++
++        def __exit__(self, *args):
++            return self._handle.__exit__(*args)
++
++        def write(self, data):
++            self._handle.write(data[:2])
++            self._handle.flush()
++            temp_files = [path for path in directory.iterdir() if path.name.startswith(".tmp-")]
++            assert len(temp_files) == 1
++            partial_contents.append(temp_files[0].read_bytes())
++            raise OSError("disk full")
++
++    def failing_fdopen(descriptor, mode):
++        return FailingBinaryFile(real_fdopen(descriptor, mode))
++
++    monkeypatch.setattr(local_backend.os, "fdopen", failing_fdopen)
++
++    with pytest.raises(OSError, match="disk full"):
++        backend.write_json_unique("manifests", "manifest_x", {"run": 1})
++
++    assert partial_contents == [b"{\n"]
++    assert not (directory / "manifest_x.json").exists()
++    assert [path.name for path in directory.iterdir()] == []
++
++
++def test_local_write_bytes_if_absent_allows_only_one_concurrent_publisher(tmp_path: Path) -> None:
++    backend = LocalStorageBackend(tmp_path)
++    barrier = Barrier(2)
++
++    def publish(data: bytes) -> bool:
++        barrier.wait(timeout=5)
++        return backend.write_bytes_if_absent("records/shared.bin", data)
++
++    with ThreadPoolExecutor(max_workers=2) as executor:
++        results = list(executor.map(publish, (b"writer one", b"writer two")))
++
++    assert sorted(results) == [False, True]
++    assert backend.read_bytes("records/shared.bin") in {b"writer one", b"writer two"}
++    assert [path.name for path in (tmp_path / "records").iterdir()] == ["shared.bin"]
++
++
++def test_local_write_bytes_if_absent_preserves_default_create_permissions(tmp_path: Path) -> None:
++    backend = LocalStorageBackend(tmp_path)
++    expected_mode_path = tmp_path / "ordinary-create.bin"
++    with expected_mode_path.open("xb") as handle:
++        handle.write(b"ordinary")
++
++    backend.write_bytes_if_absent("records/created.bin", b"atomic")
++
++    actual_mode = stat.S_IMODE((tmp_path / "records" / "created.bin").stat().st_mode)
++    expected_mode = stat.S_IMODE(expected_mode_path.stat().st_mode)
++    assert actual_mode == expected_mode
++
++
++def test_local_unique_json_fails_safely_when_hard_link_publication_is_unavailable(
++    tmp_path: Path, monkeypatch
++) -> None:
++    backend = LocalStorageBackend(tmp_path)
++
++    def unsupported(*args, **kwargs):
++        raise OSError("hard links unsupported")
++
++    monkeypatch.setattr(local_backend.os, "link", unsupported)
++
++    with pytest.raises(OSError, match="hard links unsupported"):
++        backend.write_json_unique("manifests", "manifest_x", {"run": 1})
++
++    directory = tmp_path / "manifests"
++    assert not (directory / "manifest_x.json").exists()
++    assert list(directory.iterdir()) == []
++
++
+ # -- S3 specifics -------------------------------------------------------------
+ 
+ 

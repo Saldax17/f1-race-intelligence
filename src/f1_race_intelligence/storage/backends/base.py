@@ -14,6 +14,8 @@ Two guarantees the rest of the project relies on hold for every backend:
 * :meth:`StorageBackend.write_json_unique` never replaces an existing
   object, even when two writers pick the same name at the same instant.
   Execution records (manifests, reports) depend on it.
+* A JSON document is the same bytes on every backend and operating system
+  (see :func:`_json_bytes`), so a content hash means the same everywhere.
 
 Missing keys raise :class:`FileNotFoundError` and any other storage failure
 raises :class:`StorageError`. Both are :class:`OSError`, so code written
@@ -34,7 +36,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     import pandas as pd
 
 # Only reached when many writes share a clock tick; bounded so a bug cannot
-# spin forever. Same bound as utils.files.
+# spin forever.
 MAX_NAME_COLLISION_RETRIES = 100
 
 JSON_CONTENT_TYPE = "application/json"
@@ -162,6 +164,10 @@ class StorageBackend(ABC):
         self.write_bytes(key, _json_bytes(payload), content_type=JSON_CONTENT_TYPE)
         return key
 
+    def write_json_if_absent(self, key: str, payload: Any) -> bool:
+        """Store canonical JSON only when the key is still unused."""
+        return self.write_bytes_if_absent(key, _json_bytes(payload), content_type=JSON_CONTENT_TYPE)
+
     def write_json_unique(self, prefix: str, stem: str, payload: Any, *, extension: str = ".json") -> str:
         """Store ``payload`` as ``<stem><extension>``, adding ``-1``, ``-2``… rather than replacing.
 
@@ -197,21 +203,45 @@ class StorageBackend(ABC):
 
     def write_parquet(self, key: str, frame: "pd.DataFrame") -> int:
         """Store a DataFrame as Parquet, without its index. Returns the bytes written."""
-        buffer = io.BytesIO()
-        frame.to_parquet(buffer, engine="pyarrow", index=False)
-        data = buffer.getvalue()
+        data = self._parquet_bytes(frame)
         self.write_bytes(key, data, content_type=PARQUET_CONTENT_TYPE)
         return len(data)
 
+    def write_parquet_if_absent(self, key: str, frame: "pd.DataFrame") -> bool:
+        """Store a Parquet DataFrame without replacing an existing object."""
+        return self.write_bytes_if_absent(
+            key,
+            self._parquet_bytes(frame),
+            content_type=PARQUET_CONTENT_TYPE,
+        )
+
+    @staticmethod
+    def _parquet_bytes(frame: "pd.DataFrame") -> bytes:
+        buffer = io.BytesIO()
+        frame.to_parquet(buffer, engine="pyarrow", index=False)
+        return buffer.getvalue()
+
     def write_joblib(self, key: str, value: Any) -> int:
         """Persist a Python object with joblib. Returns the bytes written."""
+        data = self._joblib_bytes(value)
+        self.write_bytes(key, data, content_type=BINARY_CONTENT_TYPE)
+        return len(data)
+
+    def write_joblib_if_absent(self, key: str, value: Any) -> bool:
+        """Persist a Python object without replacing an existing object."""
+        return self.write_bytes_if_absent(
+            key,
+            self._joblib_bytes(value),
+            content_type=BINARY_CONTENT_TYPE,
+        )
+
+    @staticmethod
+    def _joblib_bytes(value: Any) -> bytes:
         import joblib
 
         buffer = io.BytesIO()
         joblib.dump(value, buffer)
-        data = buffer.getvalue()
-        self.write_bytes(key, data, content_type=BINARY_CONTENT_TYPE)
-        return len(data)
+        return buffer.getvalue()
 
     def read_joblib(self, key: str) -> Any:
         """Load an object written by :meth:`write_joblib`. Only for trusted storage."""
@@ -221,5 +251,12 @@ class StorageBackend(ABC):
 
 
 def _json_bytes(payload: Any) -> bytes:
-    # Same style as utils.files.dump_json, which the local backend uses.
+    """The one serialisation of every JSON document the project stores.
+
+    UTF-8 without a byte order mark, two-space indent, ``\\n`` between lines
+    and no trailing newline. Every backend stores exactly these bytes, so a
+    document has the same SHA-256 on local disk and on S3, on Windows and on
+    Linux. Nothing else may serialise JSON for storage, and nothing may
+    write it in text mode, where the platform would rewrite the line endings.
+    """
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")

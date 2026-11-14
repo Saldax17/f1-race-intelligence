@@ -27,11 +27,13 @@ No se implementa (todavía) Machine Learning, Deep Learning, feature
 engineering, entrenamiento, MLflow, FastAPI, Docker, Kubernetes, AWS,
 CI/CD ni dashboards.
 
-> **Actualización (preparación cloud):** M1–M6 ya son *cloud-ready*: el
+> **Actualización (preparación cloud):** M1–M6 son *cloud-ready*: el
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
-> job batch independiente (por sesión) y existe una imagen Docker. **AWS
-> todavía NO está desplegado**: no hay bucket, roles ni infraestructura
-> creados. Ver [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
+> job batch independiente y existe una imagen Docker. El estado de diseño,
+> código, validación local y despliegue se mantiene en
+> [infra/aws_status.json](infra/aws_status.json); los estados de despliegue y
+> pruebas reales son **NO VERIFICABLES** sin evidencia humana. Ver
+> [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
 
 ## 2. Arquitectura
 
@@ -104,7 +106,7 @@ completamente desacoplada del transporte HTTP.
 | `validation/specs.py` | Qué se espera de cada endpoint, de forma declarativa | Ajustar una regla es editar datos, no lógica |
 | `validation/validators.py` | Las comprobaciones, genéricas sobre las specs | Una sola pasada por archivo, sin importar cuántas reglas haya |
 | `validation/runner.py` | Orquestar la validación y producir el reporte | Streaming: la memoria no depende del tamaño del dataset |
-| `utils/files.py` | Escrituras que no pierden archivos | Ni sobrescritura silenciosa ni archivos a medio escribir |
+| `storage/backends/` | Escrituras que no pierden archivos y JSON idéntico byte a byte | Ni sobrescritura silenciosa, ni archivos a medio escribir, ni bytes que dependan del sistema operativo |
 
 ### Decisiones respecto a la estructura sugerida
 
@@ -202,7 +204,7 @@ f1-race-intelligence/
 │       │
 │       └── utils/
 │           ├── __init__.py
-│           ├── files.py
+│           ├── files.py                   # Compatibilidad deprecada; usar storage/backends
 │           └── logging.py                 # JSON a stdout + log_context(stage, year, session…)
 │
 └── tests/
@@ -714,7 +716,9 @@ listos para entrenar. **No entrena ningún modelo.**
 python -m f1_race_intelligence.modeling.runner
 ```
 
-Salida en `data/modeling/`, con el reporte en `data/modeling/reports/`.
+Salida en `data/modeling/`, versionada bajo `runs/<run_id>/` dentro de cada
+prefijo de split y de preprocessing. El reporte queda en
+`data/modeling/reports/`.
 
 ### Orden de las operaciones
 
@@ -765,7 +769,8 @@ como ceros en vez de romper el pipeline.
 
 ### Guardas anti-leakage
 
-Doce comprobaciones, once bloqueantes. Las tres centrales funcionan
+Las comprobaciones de M6 incluyen la completitud de los tres splits y las
+guardas anti-leakage existentes. Las tres centrales funcionan
 **re-ajustando**: se entrena un transformador nuevo solo con train y otro con
 train + validation, y el que está en uso debe coincidir con el primero y
 diferir del segundo. Una guarda que solo inspeccionara nuestra intención
@@ -774,18 +779,32 @@ estaría de acuerdo con nosotros incluso estando equivocados.
 Si la comparación no puede distinguir ambos ajustes, se reporta como
 **inconcluyente**, no como aprobada.
 
-Un run que falle una guarda bloqueante **no escribe nada**.
+Un split vacío, una guarda bloqueante omitida o un resultado inconcluyente
+impiden el veredicto válido y la publicación. Con `fail_on_leakage=false`,
+los fallos de guardas sí pueden dejar artefactos para diagnóstico, pero el
+veredicto sigue siendo `INVALID`/`INCOMPLETE`/`INCONCLUSIVE` y M6 sale con
+código distinto de cero.
 
 ### Salida
 
 ```
 data/modeling/
-├── train/dataset.parquet     # filas con trazabilidad, sin transformar
-├── train/features.parquet    # matriz codificada + target + claves key_*
-├── validation/ , test/       # idem
-├── preprocessing/preprocessor.joblib   # el transformador ajustado con train
+├── train/runs/<run_id>/{dataset,features}.parquet
+├── validation/runs/<run_id>/… ; test/runs/<run_id>/…
+├── preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
 └── reports/
 ```
+
+Las rutas de los prefijos configurados y de cada split se conservan; cada
+ejecución escribe en su propio directorio para no sobrescribir artefactos
+anteriores. El reporte contiene el `run_id`, SHA-256 de lock y configuración,
+commit de origen, estado de limpieza del checkout, fingerprint de entradas,
+estados de guardas, veredicto global y hashes de artefactos releídos. Si el
+commit o la limpieza del checkout no pueden determinarse, o falta el lock,
+el reporte deja el dato explícitamente ausente y M6 no informa éxito.
+`verify-m6` permite comprobar
+un reporte y sus artefactos sin reescribirlos:
+`python -m f1_race_intelligence --stage verify-m6 --report <ruta>`.
 
 Cada split se escribe dos veces: sin transformar, para poder rastrear
 cualquier fila hasta M5 y de ahí al raw, y codificado, que es lo que lee un
@@ -804,6 +823,11 @@ volver a calcularlo y comprobarlo:
 
 | campo | contenido |
 |---|---|
+| `schema_version` / `verdict` | versión 2 y estado global: `VALID`, `VALID_WITH_WARNINGS`, `INCOMPLETE`, `INCONCLUSIVE`, `INVALID` o `ABORTED` |
+| `run_id` | identificador único que también versiona las rutas de artefactos |
+| `source_commit` / `source_dirty` | revisión real de Git y estado de limpieza, si están disponibles |
+| `dependency_lock_sha256` | SHA-256 de `requirements/runtime-lock.txt` |
+| `config_fingerprint` | SHA-256 de la configuración M6 sin ubicaciones de storage |
 | `source.inputs` | cada archivo de M5 leído: `input` (`session_<s>.parquet`), `year`, `session_key`, `sha256`, `size_bytes` |
 | `source.input_fingerprint` | huella agregada de las entradas, `sha256:<hex>` (también en `summary`) |
 | `source.input_fingerprint_scheme` | versión del algoritmo: `m6-input-fingerprint/v1` |
@@ -816,7 +840,10 @@ volver a calcularlo y comprobarlo:
 - `artifact_files` cubre los seis Parquet (`dataset.parquet` y
   `features.parquet` por split), `preprocessor.joblib` y
   `feature_schema*.json`. Cada hash se calcula releyendo el objeto del
-  almacenamiento después de escribirlo.
+  almacenamiento después de escribirlo. Con las mismas entradas y la misma
+  configuración, los ocho hashes son iguales en disco local y en S3
+  simulado en las pruebas ejecutadas en Windows. La paridad en Linux queda
+  pendiente de ejecutarse en un entorno Linux real.
 - `input_fingerprint` es el SHA-256 de este documento JSON canónico (claves
   ordenadas, sin espacios, `ensure_ascii`):
   `{"inputs": [{"input", "year", "session_key", "sha256"}, …], "scheme": "m6-input-fingerprint/v1"}`,
@@ -829,13 +856,20 @@ volver a calcularlo y comprobarlo:
   `artifact_files` vacíos, porque no escribió nada. Si falla una lectura o
   una escritura del almacenamiento, el error se propaga y no se escribe
   reporte, como hasta ahora.
+- Los reportes nuevos usan `schema_version: 2` y estados `PASS`, `FAIL`,
+  `INCONCLUSIVE` o `SKIPPED` (con motivo). La CLI oficial solo devuelve éxito
+  con veredicto `VALID` o `VALID_WITH_WARNINGS`. Reportes v1 se pueden verificar
+  sin reescritura.
+- La estrategia de split actual se conserva. La separación futura por
+  `meeting_key`, el corte UTC del 1 de julio de 2025 y el tratamiento de Sprint
+  dependen de la aprobación académica pendiente.
 
 ## 14. Preparación para la nube (AWS-ready)
 
-> **AWS todavía NO está desplegado.** No existe bucket, rol IAM, imagen en
-> ECR ni ninguna otra infraestructura. Esta sección describe cómo quedó
-> preparado el código para que un despliegue posterior (CloudFormation/SAM)
-> no requiera tocar la lógica de M1–M6.
+> El estado de AWS se registra únicamente en
+> [infra/aws_status.json](infra/aws_status.json). El diseño, el código y la
+> validación local se distinguen del despliegue y de las pruebas reales; estos
+> últimos permanecen **NO VERIFICABLES** sin comprobación humana.
 
 La lógica funcional, estadística y anti-leakage de M4/M5/M6 **no cambió**.
 Se verificó ejecutando el pipeline nuevo sobre los datos locales y
@@ -884,6 +918,17 @@ Sobre esas primitivas la interfaz ofrece JSON, Parquet, joblib y nombres
   Ambos son `OSError`, así que los manejadores existentes siguen valiendo.
 - Parquet se lee siempre desde un buffer: pyarrow no puede inventar columnas
   a partir de directorios `year=…`.
+- Un documento JSON tiene una sola representación binaria: una función lo
+  serializa (UTF-8 sin BOM, sangría de dos espacios, saltos de línea LF, sin
+  salto final) y ambos backends guardan esos bytes tal cual, siempre en modo
+  binario. Las pruebas ejecutadas en Windows verifican la igualdad entre
+  disco local y S3 simulado; la ejecución equivalente en Linux sigue
+  pendiente. Los archivos escritos en Windows por versiones anteriores llevan
+  CRLF: siguen siendo legibles y no se reescriben, pero su hash es distinto
+  del que tendría el mismo documento escrito hoy.
+- El plan local que escribe `cli.py:233` sigue fuera de este contrato y de los
+  artefactos fingerprintados de M6. Usa modo texto y se tratará como una tarea
+  independiente si pasa a requerir reproducibilidad de bytes.
 
 `boto3` es opcional (`pip install ".[aws]"`, ≥ 1.35.2 por las escrituras
 condicionales) y solo se importa al crear un cliente S3.
@@ -900,8 +945,8 @@ s3://<bucket>/<prefix>/
 ├── validated/validation_report_<ts>.json                        (M3 global)
 ├── consolidated/year=<y>/session=<s>/session_<s>.parquet        (M4)
 ├── features/year=<y>/session=<s>/session_<s>.parquet            (M5)
-├── modeling/split=<train|validation|test>/{dataset,features}.parquet   (M6)
-├── modeling/preprocessing/{preprocessor.joblib, feature_schema.json}
+├── modeling/split=<train|validation|test>/runs/<run_id>/{dataset,features}.parquet (M6)
+├── modeling/preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
 ├── manifests/extraction/[year=<y>/session=<s>/]manifest_<ts>.json
 ├── manifests/{consolidation,features,modeling}/<stage>_report_<ts>.json
 ├── models/   (reservado para M7)
@@ -1011,6 +1056,10 @@ docker run --rm -v "$PWD/data:/app/data" \
 - Usuario sin privilegios (`uid 10001`); solo `/app/data` es escribible. Con
   un volumen montado en Linux, añadir `--user "$(id -u):$(id -g)"` si el
   directorio del host no es escribible para ese uid.
+- La construcción debe inyectar los build args `F1_GIT_COMMIT` y
+  `F1_GIT_DIRTY` desde el checkout. Si Git no está disponible y no se inyecta
+  la revisión, el reporte la deja explícitamente nula; el hash del lock se
+  calcula desde el archivo incluido en la imagen.
 - Sin datasets, `.env` ni credenciales (`.dockerignore`).
 - Configuración por variables de entorno (`F1_ENVIRONMENT`, `F1_STORAGE_*`).
 - `F1_CONFIG_PATH` es explícito: el paquete instalado no puede ubicar
@@ -1027,13 +1076,13 @@ docker run --rm -v "$PWD/data:/app/data" \
 
 La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
 Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
-[infra/](infra/README.md). La base está desplegada en `dev` con el pipeline
-desactivado (`PipelineEnabled=false`) y el calendario `DISABLED`. La Fase 1B
-define M2–M6 como tareas Fargate endurecidas (raíz de solo lectura, sin
-capacidades Linux, usuario 10001, imagen fijada por digest) orquestadas por
-Step Functions con `ecs:runTask.sync`; esa parte **no está desplegada**.
+[infra/](infra/README.md). `infra/aws_status.json` es la fuente de verdad
+versionada: el estado de despliegue y de pruebas en AWS real permanece
+**NO VERIFICABLE** sin comprobación humana. La Fase 1B define M2–M6 como
+tareas Fargate endurecidas (raíz de solo lectura, sin capacidades Linux,
+usuario 10001, imagen fijada por digest) orquestadas por Step Functions.
 
-### 14.9 Arquitectura AWS propuesta (futura, no desplegada)
+### 14.9 Arquitectura AWS propuesta
 
 ```
 EventBridge Scheduler
@@ -1082,8 +1131,9 @@ salida; contexto de logging.
 - La extracción respeta el límite de OpenF1 por cliente: varios jobs M2 en
   paralelo comparten ese límite, así que M2 no escala con más contenedores.
 - `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
-- **AWS no está desplegado**; el backend S3 solo se ha probado contra un
-  cliente simulado.
+- **El despliegue AWS es NO VERIFICABLE** según
+  [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
+  contra un cliente simulado.
 - No hay CI configurado.
 
 ## 17. Licencia y uso de datos

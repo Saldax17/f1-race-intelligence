@@ -22,5 +22,5 @@ def save_report(
 ) -> Union[Path, str]:
     """Write the report as JSON and return where it went."""
     backend = backend or LocalStorageBackend()
-    stem = f"modeling_report_{report.started_at.strftime('%Y%m%dT%H%M%S%f')}Z"
+    stem = f"modeling_report_{report.started_at.strftime('%Y%m%dT%H%M%S%f')}Z_{report.run_id}"
     return backend.location(backend.write_json_unique(str(directory), stem, report.to_dict()))
