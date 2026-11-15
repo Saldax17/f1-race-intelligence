@@ -19,7 +19,7 @@
 #   "emSign ECC Root CA - C3" (certifi commit b60466c). It only ships the CA
 #   bundle; never pin below it.
 annotated-types==0.8.0
-anyio==4.15.0
+anyio==4.16.0
 boto3==1.43.95
 botocore==1.43.95
 certifi==2026.10.23

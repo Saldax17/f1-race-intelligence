@@ -66,8 +66,43 @@ def fake_client_factory(client):
 
 def test_stages_are_parsed_in_order() -> None:
     assert cli.parse_stages("m3, M4,m5") == ["m3", "m4", "m5"]
+    assert cli.parse_stages("m7") == ["m7"]
     with pytest.raises(ValueError):
-        cli.parse_stages("m7")
+        cli.parse_stages("m7,unknown")
+
+
+def test_m7_requires_an_m6_report(config_file) -> None:
+    assert cli.main(["--stage", "m7", "--config", str(config_file)]) == cli.EXIT_USAGE
+
+
+def test_m7_rejects_s3_storage(config_file) -> None:
+    assert cli.main(
+        [
+            "--stage",
+            "m7",
+            "--m6-report",
+            "m6-report.json",
+            "--storage-backend",
+            "s3",
+            "--bucket",
+            "not-used",
+            "--config",
+            str(config_file),
+        ]
+    ) == cli.EXIT_USAGE
+
+
+def test_m7_must_run_against_an_existing_m6_report(config_file) -> None:
+    assert cli.main(
+        [
+            "--stage",
+            "m6,m7",
+            "--m6-report",
+            "m6-report.json",
+            "--config",
+            str(config_file),
+        ]
+    ) == cli.EXIT_USAGE
 
 
 def test_unknown_stage_is_a_usage_error(config_file) -> None:

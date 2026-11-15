@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,29 @@ def test_dependencies_come_only_from_the_lock() -> None:
     assert "pip install --no-deps ." in runs and "pip check" in runs
     # The S3 backend's optional dependency must be in the image anyway.
     assert re.search(r"^boto3==", (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8"), flags=re.M)
+
+
+def test_m7_dependencies_are_optional_and_locked_separately() -> None:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    base_dependencies = [item.lower() for item in project["dependencies"]]
+    training_extra = [item.lower() for item in project["optional-dependencies"]["training"]]
+    runtime_lock = (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8").lower()
+    training_lock = (REPO_ROOT / "requirements" / "training-lock.txt").read_text(encoding="utf-8")
+
+    assert not any(item.startswith(("mlflow", "sqlalchemy")) for item in base_dependencies)
+    assert training_extra == ["mlflow==3.18.0", "sqlalchemy==2.0.57"]
+    assert not re.search(r"^(?:mlflow(?:-[a-z]+)?|sqlalchemy)==", runtime_lock, flags=re.M)
+    assert re.search(r"^mlflow==3\.18\.0$", training_lock, flags=re.M)
+    assert re.search(r"^sqlalchemy==2\.0\.57$", training_lock, flags=re.M)
+    assert re.search(r'^gunicorn==23\.0\.0 ; platform_system != "Windows"$', training_lock, flags=re.M)
+    assert re.search(r'^waitress==3\.0\.2 ; platform_system == "Windows"$', training_lock, flags=re.M)
+    assert re.search(r'^pywin32==312 ; platform_system == "Windows"$', training_lock, flags=re.M)
+    requirements = [
+        line.strip()
+        for line in training_lock.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert all(re.match(r"^[A-Za-z0-9_.-]+==[^ ;]+(?:\s*;\s*.+)?$", line) for line in requirements)
 
 
 # Roots certifi dropped after the eMudhra/emSign incident: G3 in 2026.10.19

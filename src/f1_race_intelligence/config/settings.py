@@ -327,6 +327,17 @@ class ModelingSettings(BaseModel):
     """Refuse to write anything when a blocking guard fails."""
 
 
+class TrainingSettings(BaseModel):
+    """Local tracking and report locations for M7 training runs."""
+
+    m6_report_path: Optional[str] = None
+    tracking_db_path: str = "data/mlflow/tracking.db"
+    artifact_path: str = "data/mlflow/artifacts"
+    output_path: str = "data/modeling/training/reports"
+    experiment_name: str = "f1-race-intelligence"
+    registered_model_name: str = "f1-next-lap-linear-regression"
+
+
 class AppSettings(BaseModel):
     """Top-level application settings."""
 
@@ -343,6 +354,7 @@ class AppSettings(BaseModel):
     consolidation: ConsolidationSettings = Field(default_factory=ConsolidationSettings)
     features: FeatureSettings = Field(default_factory=FeatureSettings)
     modeling: ModelingSettings = Field(default_factory=ModelingSettings)
+    training: TrainingSettings = Field(default_factory=TrainingSettings)
 
     @model_validator(mode="after")
     def _aws_runs_on_object_storage(self) -> "AppSettings":

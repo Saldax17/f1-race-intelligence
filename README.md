@@ -6,8 +6,9 @@ pilotos de Fórmula 1 a partir de datos históricos de la API pública
 [OpenF1](https://openf1.org/) (documentación: https://openf1.org/docs/).
 
 La unidad de análisis objetivo es **Piloto × Carrera × Vuelta**, con la meta
-futura de predecir `next_lap_time` (tiempo de la siguiente vuelta). Esa parte
-predictiva **no** está implementada todavía — ver [Limitaciones actuales](#limitaciones-actuales).
+de predecir `next_lap_time` (tiempo de la siguiente vuelta). M7 incorpora un
+pipeline reproducible de regresión lineal y evaluación sobre los splits M6;
+el entrenamiento con datos reales sigue pendiente de autorización.
 
 ## 1. Objetivo de esta primera etapa
 
@@ -23,9 +24,11 @@ Esta etapa construye únicamente la base de ingeniería de datos del proyecto:
   descubre meetings y sesiones desde la API y registra cada ejecución en un
   manifest (ver [Pipeline de extracción histórica](#9-pipeline-de-extracción-histórica)).
 
-No se implementa (todavía) Machine Learning, Deep Learning, feature
-engineering, entrenamiento, MLflow, FastAPI, Docker, Kubernetes, AWS,
-CI/CD ni dashboards.
+No se implementan LSTM/GRU, métodos estadísticos avanzados, FastAPI,
+Kubernetes, ni entrenamiento real sin autorización.
+
+La arquitectura, configuración, comandos, validación sintética y pendientes
+de M7.1 están documentados en [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md).
 
 > **Actualización (preparación cloud):** M1–M6 son *cloud-ready*: el
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
@@ -141,7 +144,8 @@ f1-race-intelligence/
 │   └── config.aws.yaml        # overlay para environment=aws (solo diferencias)
 │
 ├── requirements/
-│   └── runtime-lock.txt       # versiones exactas para la imagen Docker
+│   ├── runtime-lock.txt       # runtime M1-M6 e imagen Docker
+│   └── training-lock.txt      # cierre exacto para el extra M7
 │
 ├── data/
 │   ├── raw/
@@ -224,6 +228,14 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -e ".[dev]"
+```
+
+M7 es opcional: para entrenamiento local instala el lock específico y activa
+el extra, sin añadir MLflow al runtime batch M1-M6:
+
+```bash
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -e ".[training]" --no-deps
 ```
 
 Dependencias principales: `httpx` (HTTP), `tenacity` (retries con backoff),
