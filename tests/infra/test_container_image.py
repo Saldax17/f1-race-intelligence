@@ -213,6 +213,94 @@ def test_nothing_git_ignores_under_the_copied_paths_reaches_the_build_context() 
     assert leaked == []
 
 
+# -- sensitive files: out of the build context at the root and at any depth
+#
+# Hypothetical paths only: these tests match names against the patterns and
+# never create or read such files. Git ignores most of these names at any
+# depth (.env, .aws/, *.pem, virtualenvs), so a nested one is invisible to the
+# clean-tree guard; only .dockerignore keeps COPY src / COPY configs from
+# baking it, or a committed .env.* / *.key, into the image.
+
+NESTED_SENSITIVE_PATHS = [
+    "configs/nested/.env",
+    "configs/.env",
+    "src/nested/.env.local",
+    "src/nested/.aws/credentials",
+    "configs/.aws/config",
+    "src/pkg/cert.pem",
+    "configs/tls/server.key",
+    "src/nested/.venv",
+    "src/nested/.venv/pyvenv.cfg",
+    "src/nested/venv/bin/activate",
+]
+ROOT_SENSITIVE_PATHS = [
+    ".env",
+    ".env.local",
+    ".aws/credentials",
+    "cert.pem",
+    "server.key",
+    ".venv/pyvenv.cfg",
+    "venv/bin/activate",
+]
+# The secret and environment patterns before they became recursive (4d7a4a9).
+ROOT_ONLY_SENSITIVE_PATTERNS = [".env", ".env.*", "!.env.example", ".aws/", "*.pem", "*.key", ".venv/", "venv/"]
+RECURSIVE_SENSITIVE_PATTERNS = ["**/.env", "**/.env.*", "**/.aws/", "**/*.pem", "**/*.key", "**/.venv/", "**/venv/"]
+
+
+@pytest.mark.parametrize("path", NESTED_SENSITIVE_PATHS + ROOT_SENSITIVE_PATHS)
+def test_sensitive_files_stay_out_of_the_build_context_at_any_depth(path) -> None:
+    assert dockerignore_excludes(path), path
+
+
+def test_the_root_exclusions_are_kept_next_to_the_recursive_ones() -> None:
+    lines = {line.strip() for line in DOCKERIGNORE.splitlines()}
+    assert set(ROOT_ONLY_SENSITIVE_PATTERNS) <= lines
+    assert set(RECURSIVE_SENSITIVE_PATTERNS) <= lines
+
+
+@pytest.mark.parametrize("path", NESTED_SENSITIVE_PATHS)
+def test_the_previous_root_only_patterns_leak_nested_sensitive_files(path) -> None:
+    # The defect fixed here: each nested case got through the old patterns...
+    assert not dockerignore_excludes(path, ROOT_ONLY_SENSITIVE_PATTERNS), path
+    # ...and the current file keeps it out.
+    assert dockerignore_excludes(path), path
+
+
+@pytest.mark.parametrize("path", ROOT_SENSITIVE_PATHS)
+def test_the_previous_patterns_already_covered_the_root(path) -> None:
+    assert dockerignore_excludes(path, ROOT_ONLY_SENSITIVE_PATTERNS), path
+
+
+@pytest.mark.parametrize("pattern", RECURSIVE_SENSITIVE_PATTERNS)
+def test_dropping_any_recursive_sensitive_pattern_leaks_a_nested_file(pattern) -> None:
+    lines = [line for line in DOCKERIGNORE.splitlines() if line.strip() != pattern]
+    leaked = [path for path in NESTED_SENSITIVE_PATHS if not dockerignore_excludes(path, lines)]
+    assert leaked, f"without {pattern} nothing leaks: the nested cases do not exercise it"
+
+
+def test_the_only_exception_reincludes_just_the_root_env_template() -> None:
+    # The last matching pattern wins, so an exception after the sensitive
+    # patterns could bring a secret back. The only one allowed is the root
+    # template, which the image never copies.
+    negations = [line.strip() for line in DOCKERIGNORE.splitlines() if line.strip().startswith("!")]
+    assert negations == ["!.env.example"]
+    assert not dockerignore_excludes(".env.example")
+    assert dockerignore_excludes("configs/.env.example")
+    assert dockerignore_excludes("src/nested/.env.example")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_every_tracked_file_the_image_copies_still_reaches_the_build_context() -> None:
+    # Recursive patterns must not over-exclude: everything versioned under the
+    # COPY sources has to reach the build.
+    listed = subprocess.run(["git", "ls-files", "--", *copied_sources()], cwd=REPO_ROOT, capture_output=True, text=True)
+    if listed.returncode != 0:
+        pytest.skip("not a git checkout")
+    tracked = listed.stdout.splitlines()
+    assert any(path.startswith("src/") for path in tracked) and "configs/config.yaml" in tracked
+    assert [path for path in tracked if dockerignore_excludes(path)] == []
+
+
 # -- traceable builds: the documented recipes record the commit they come from
 
 # The image's architecture is the task definition's (X86_64); the commit is

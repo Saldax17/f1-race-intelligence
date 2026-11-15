@@ -9,19 +9,33 @@ logs/
 *.png
 *.jpg
 
-# Secrets and local environment
+# Secrets and local environment, at the root and at any depth (**/). Git
+# ignores .env, .aws/ and *.pem anywhere, so the clean-tree guard cannot see
+# a nested one; .env.* and *.key it can, but a committed one must not reach
+# the image either. Without **/, COPY src / COPY configs would bake them in.
 .env
+**/.env
 .env.*
+**/.env.*
+# Only the root template comes back; it must stay after the .env.* patterns
+# (the last matching pattern wins) and never re-include a nested file.
 !.env.example
 .aws/
+**/.aws/
 *.pem
+**/*.pem
 *.key
+**/*.key
 
 # VCS, virtualenvs, caches, IDE
 .git/
 .gitignore
+# Virtual environments: Git ignores them at any depth, and one may hold
+# credentials (a pip.conf with a private index URL).
 .venv/
+**/.venv/
 venv/
+**/venv/
 # Recursive: a pattern without **/ only matches at the context root, and these
 # appear inside src/ (bytecode caches, the egg-info of an editable install).
 # Git ignores them, so the clean-tree guard of the build recipes cannot see them.
