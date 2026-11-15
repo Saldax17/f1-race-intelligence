@@ -213,6 +213,39 @@ def test_nothing_git_ignores_under_the_copied_paths_reaches_the_build_context() 
     assert leaked == []
 
 
+# -- log files: excluded at the root and at any depth to match .gitignore
+
+LOG_FILE_CASES = [
+    "debug.log",
+    "src/debug.log",
+    "configs/nested/server.log",
+]
+
+
+@pytest.mark.parametrize("path", LOG_FILE_CASES)
+def test_log_files_stay_out_of_the_build_context_at_any_depth(path) -> None:
+    assert dockerignore_excludes(path), path
+
+
+def test_log_exclusions_are_kept_at_the_root_and_recursively() -> None:
+    lines = {line.strip() for line in DOCKERIGNORE.splitlines()}
+    assert {"*.log", "**/*.log"} <= lines
+
+
+def test_dropping_recursive_log_pattern_leaks_nested_logs() -> None:
+    lines = [line for line in DOCKERIGNORE.splitlines() if line.strip() != "**/*.log"]
+    assert not dockerignore_excludes("src/debug.log", lines)
+    assert not dockerignore_excludes("configs/nested/server.log", lines)
+    assert dockerignore_excludes("debug.log", lines)
+
+
+def test_dropping_both_log_patterns_leaks_root_and_nested_logs() -> None:
+    lines = [line for line in DOCKERIGNORE.splitlines() if line.strip() not in {"*.log", "**/*.log"}]
+    assert not dockerignore_excludes("debug.log", lines)
+    assert not dockerignore_excludes("src/debug.log", lines)
+    assert not dockerignore_excludes("configs/nested/server.log", lines)
+
+
 # -- sensitive files: out of the build context at the root and at any depth
 #
 # Hypothetical paths only: these tests match names against the patterns and
