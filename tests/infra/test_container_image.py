@@ -6,7 +6,11 @@ a non-root user, nothing private in the build context, and documented build
 recipes that record the exact commit and refuse uncommitted changes.
 """
 
+import posixpath
 import re
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -94,6 +98,121 @@ def test_private_or_bulky_paths_never_reach_the_build_context(pattern) -> None:
     assert pattern in DOCKERIGNORE.splitlines()
 
 
+# -- .dockerignore semantics: what actually stays out of the build context
+
+
+def _dockerignore_regex(pattern):
+    """Docker's matching (moby/patternmatcher): anchored at the context root,
+    ``*`` and ``?`` stop at ``/``, and only ``**`` crosses directories."""
+    regex, i = "^", 0
+    while i < len(pattern):
+        char = pattern[i]
+        if pattern.startswith("**/", i):
+            regex, i = regex + "(.*/)?", i + 3
+            continue
+        if pattern.startswith("**", i):
+            regex, i = regex + ".*", i + 2
+            continue
+        if char == "*":
+            regex += "[^/]*"
+        elif char == "?":
+            regex += "[^/]"
+        elif char == "[":
+            close = pattern.index("]", i)
+            regex, i = regex + pattern[i : close + 1], close
+        else:
+            regex += re.escape(char)
+        i += 1
+    return re.compile(regex + "$")
+
+
+def dockerignore_excludes(path, lines=None):
+    """Whether Docker leaves ``path`` (relative, ``/``-separated) out of the context.
+
+    As in Docker: a pattern excludes a path when it matches the path or any of
+    its parent directories, and the last matching pattern wins (``!`` re-includes).
+    """
+    lines = DOCKERIGNORE.splitlines() if lines is None else lines
+    parts = path.split("/")
+    candidates = ["/".join(parts[: n + 1]) for n in range(len(parts))]
+    excluded = False
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        pattern = posixpath.normpath(line.lstrip("!").strip("/"))
+        regex = _dockerignore_regex(pattern)
+        if any(regex.match(candidate) for candidate in candidates):
+            excluded = not negated
+    return excluded
+
+
+def test_the_matcher_is_root_anchored_like_docker() -> None:
+    # Without this, the nested-path checks below could pass with a matcher
+    # more permissive than Docker: the old patterns only covered the root.
+    assert dockerignore_excludes("__pycache__/x.pyc", ["__pycache__/"])
+    assert not dockerignore_excludes("src/pkg/__pycache__/x.pyc", ["__pycache__/"])
+    assert not dockerignore_excludes("src/pkg.egg-info/PKG-INFO", ["*.egg-info/"])
+    assert dockerignore_excludes("src/pkg.egg-info/PKG-INFO", ["**/*.egg-info/"])
+    assert not dockerignore_excludes(".env.example", [".env.*", "!.env.example"])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/f1_race_intelligence.egg-info/PKG-INFO",
+        "src/f1_race_intelligence.egg-info/SOURCES.txt",
+        "src/f1_race_intelligence/__pycache__/cli.cpython-312.pyc",
+        "src/f1_race_intelligence/storage/backends/__pycache__/s3.cpython-312.pyc",
+        "src/f1_race_intelligence/stray.pyc",
+        "configs/__pycache__/anything.pyc",
+        "__pycache__/root.cpython-312.pyc",
+        "f1_race_intelligence.egg-info/PKG-INFO",
+    ],
+)
+def test_nested_bytecode_and_egg_info_stay_out_of_the_build_context(path) -> None:
+    assert dockerignore_excludes(path), path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/f1_race_intelligence/__init__.py",
+        "src/f1_race_intelligence/storage/backends/s3.py",
+        "configs/config.yaml",
+        "configs/config.aws.yaml",
+        "requirements/runtime-lock.txt",
+        "pyproject.toml",
+        "README.md",
+    ],
+)
+def test_what_the_image_copies_still_reaches_the_build_context(path) -> None:
+    assert not dockerignore_excludes(path), path
+
+
+def copied_sources():
+    """Source paths of the Dockerfile's COPY instructions (every argument but the destination)."""
+    return [source for arguments in instructions("COPY") for source in arguments.split()[:-1]]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_nothing_git_ignores_under_the_copied_paths_reaches_the_build_context() -> None:
+    # Ignored files are invisible to the clean-tree guard, so the context must
+    # drop them: whatever this checkout holds (editable-install egg-info,
+    # bytecode written by the test run itself).
+    listed = subprocess.run(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--", *copied_sources()],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        pytest.skip("not a git checkout")
+    leaked = [path for path in listed.stdout.splitlines() if not dockerignore_excludes(path)]
+    assert leaked == []
+
+
 # -- traceable builds: the documented recipes record the commit they come from
 
 # The image's architecture is the task definition's (X86_64); the commit is
@@ -104,8 +223,13 @@ TRACEABLE_BUILD_ARGS = (
     '--build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)"',
     "--build-arg F1_GIT_DIRTY=false",
 )
-CLEAN_TREE_GUARD = 'if [ -n "$(git status --porcelain)" ]; then'
-DOCKERFILE_GUARD = 'test -z "$(git status --porcelain)" && docker build'
+# --untracked-files=all: git status honours status.showUntrackedFiles, and
+# "no" would make a tree with new files look clean.
+GUARD_COMMAND = "git status --porcelain --untracked-files=all"
+CLEAN_TREE_GUARD = f'if [ -n "$({GUARD_COMMAND})" ]; then'
+DOCKERFILE_GUARD = f'test -z "$({GUARD_COMMAND})" && docker build'
+# Commands that produce or publish an image: only allowed in the clean branch.
+IMAGE_COMMAND = re.compile(r"\bdocker\s+(?:buildx\s+)?(?:build|push|image\s+push|tag)\b")
 
 
 def join_continuations(text):
@@ -144,24 +268,93 @@ def test_every_documented_build_records_the_full_commit_and_the_task_platform() 
         assert "--short" not in command, f"{source}: the image must record the full SHA"
 
 
+def shell_lines(text):
+    """Non-empty, non-comment lines of a (continuation-joined) shell fragment."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+def guard_violations(block):
+    """Why a documented build block could build or publish from a dirty tree (empty: it cannot).
+
+    The shape required: only comments before the guard; a refusal branch that
+    reports and fails; every image-producing command inside the clean branch;
+    after ``fi``, nothing but ``docker run`` (the local smoke test).
+    """
+    if CLEAN_TREE_GUARD not in block:
+        return ["no clean-tree guard"]
+    guard = block.index(CLEAN_TREE_GUARD)
+    otherwise = block.find("\nelse\n", guard)
+    end = block.find("\nfi\n", otherwise)
+    if otherwise < 0 or end < 0:
+        return ["the guard has no else ... fi"]
+
+    before, refusal, clean = block[:guard], block[guard + len(CLEAN_TREE_GUARD) : otherwise], block[otherwise:end]
+    after = block[end + len("\nfi\n") :]
+    problems = [f"before the guard: {line!r}" for line in shell_lines(before)]
+    if "docker" in refusal or ">&2" not in refusal or shell_lines(refusal)[-1:] != ["false"]:
+        problems.append("the dirty branch must only report to stderr and end in false")
+    problems += [
+        f"{match.group(0)!r} outside the clean branch"
+        for match in IMAGE_COMMAND.finditer(block)
+        if not otherwise < match.start() < end
+    ]
+    problems += [f"after fi: {line!r}" for line in shell_lines(after) if not line.startswith("docker run ")]
+    if "docker build" not in clean:
+        problems.append("no docker build in the clean branch")
+    if "docker push" in clean and not re.search(r"-t \"\$REPO:\$TAG\" \. &&\s*docker push", clean):
+        # A failed build must not push whatever image already has that tag.
+        problems.append("docker push does not depend on the build succeeding")
+    return problems
+
+
 def test_documented_builds_and_pushes_only_run_from_a_clean_tree() -> None:
     for source, block in documented_build_blocks():
-        guard = block.index(CLEAN_TREE_GUARD)
-        refusal, _, clean_branch = block[guard:].partition("\nelse\n")
-        assert clean_branch, f"{source}: the build must sit in the else branch of the clean-tree guard"
-        # The dirty branch only reports, and fails so a script sees the refusal;
-        # nothing is built or published there.
-        assert "docker" not in refusal and ">&2" in refusal, source
-        assert refusal.rstrip().splitlines()[-1].strip() == "false", f"{source}: a refused build must exit non-zero"
-        assert "docker build" not in block[:guard] and "docker push" not in block[:guard], source
-        assert "docker build" in clean_branch, source
-        assert clean_branch.index("docker build") < clean_branch.index("\nfi\n"), f"{source}: the build must end inside the guard"
-        if "docker push" in block:
-            assert clean_branch.index("docker build") < clean_branch.index("docker push"), source
-            # A failed build must not push whatever image already has that tag.
-            assert re.search(r"-t \"\$REPO:\$TAG\" \. &&\s*docker push", clean_branch), source
+        assert guard_violations(block) == [], source
 
     assert dockerfile_build_comment().startswith(DOCKERFILE_GUARD)
+    # The one-liner has a single build and nothing chained after it.
+    assert len(IMAGE_COMMAND.findall(dockerfile_build_comment())) == 1
+
+
+def publish_block():
+    (block,) = [block for source, block in documented_build_blocks() if source == "infra/README.md"]
+    return block
+
+
+@pytest.mark.parametrize(
+    "mutate, problem",
+    [
+        (lambda b: b + 'docker push "$REPO:$TAG"\n', "after fi"),
+        (lambda b: b + "docker build -t other .\n", "after fi"),
+        (lambda b: b + "docker tag f1:dev other:latest\n", "outside the clean branch"),
+        (lambda b: b + "aws ecr batch-delete-image\n", "after fi"),
+        (lambda b: "docker build -t early .\n" + b, "before the guard"),
+        (lambda b: b.replace("  false\n", '  docker push "$REPO:$TAG"\n'), "dirty branch"),
+        (lambda b: b.replace("-t \"$REPO:$TAG\" . &&", "-t \"$REPO:$TAG\" .;"), "depend on the build"),
+    ],
+    ids=["push-after-fi", "build-after-fi", "tag-after-fi", "other-command-after-fi", "build-before-guard", "push-when-dirty", "push-after-failed-build"],
+)
+def test_the_guard_check_rejects_unguarded_image_commands(mutate, problem) -> None:
+    mutated = mutate(publish_block())
+    assert any(problem in violation for violation in guard_violations(mutated)), guard_violations(mutated)
+
+
+def test_the_guard_check_allows_a_smoke_run_after_the_build() -> None:
+    assert guard_violations(publish_block() + 'docker run --rm "$REPO:$TAG" --help\n') == []
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_the_guard_sees_untracked_files_even_when_git_status_hides_them(tmp_path) -> None:
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+
+    git("init", "-q")
+    git("config", "status.showUntrackedFiles", "no")
+    (tmp_path / "untracked.txt").write_text("new\n", encoding="utf-8")
+    # The setting is in effect: the plain porcelain status calls this tree clean...
+    assert git("status", "--porcelain") == ""
+    # ...while the command the recipes run still reports the new file.
+    assert "?? untracked.txt" in git(*shlex.split(GUARD_COMMAND)[1:])
 
 
 def test_the_dockerfile_forwards_the_commit_build_args_to_the_runtime() -> None:

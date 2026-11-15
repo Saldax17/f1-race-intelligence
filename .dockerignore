@@ -22,9 +22,12 @@ logs/
 .gitignore
 .venv/
 venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
+# Recursive: a pattern without **/ only matches at the context root, and these
+# appear inside src/ (bytecode caches, the egg-info of an editable install).
+# Git ignores them, so the clean-tree guard of the build recipes cannot see them.
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
 build/
 dist/
 .pytest_cache/
