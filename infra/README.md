@@ -236,7 +236,7 @@ Para publicar la imagen batch en ECR (cuando corresponda):
 # Solo desde un árbol limpio: cualquier cambio sin commit, incluidos archivos
 # sin seguimiento, impide construir y publicar. La imagen registra el SHA
 # completo del commit (F1_GIT_COMMIT) y F1_GIT_DIRTY=false.
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "Hay cambios sin commit: no se construye ni se publica la imagen." >&2
   false
 else
