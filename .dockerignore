@@ -26,6 +26,21 @@ logs/
 **/*.pem
 *.key
 **/*.key
+# Keystores, SSH private keys and netrc credentials. Git does not ignore
+# them, so the guard refuses an uncommitted one; these keep a committed one
+# out of the image. No exception below may re-include them.
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+id_rsa
+**/id_rsa
+id_ed25519
+**/id_ed25519
+id_ecdsa
+**/id_ecdsa
+.netrc
+**/.netrc
 
 # VCS, virtualenvs, caches, IDE
 .git/

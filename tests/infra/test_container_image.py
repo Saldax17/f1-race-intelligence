@@ -278,6 +278,45 @@ def test_dropping_any_recursive_sensitive_pattern_leaks_a_nested_file(pattern) -
     assert leaked, f"without {pattern} nothing leaks: the nested cases do not exercise it"
 
 
+# Keystores, SSH private keys and netrc credentials: per root pattern, a root
+# case and a nested one (hypothetical paths, never created or read).
+CREDENTIAL_FILE_CASES = {
+    "*.p12": ("client.p12", "configs/certs/client.p12"),
+    "*.pfx": ("client.pfx", "src/pkg/client.pfx"),
+    "id_rsa": ("id_rsa", "configs/ssh/id_rsa"),
+    "id_ed25519": ("id_ed25519", "src/nested/.ssh/id_ed25519"),
+    "id_ecdsa": ("id_ecdsa", "configs/id_ecdsa"),
+    ".netrc": (".netrc", "src/nested/.netrc"),
+}
+CREDENTIAL_PATHS = [path for cases in CREDENTIAL_FILE_CASES.values() for path in cases]
+
+
+@pytest.mark.parametrize("path", CREDENTIAL_PATHS)
+def test_credential_files_stay_out_of_the_build_context_at_any_depth(path) -> None:
+    assert dockerignore_excludes(path), path
+
+
+@pytest.mark.parametrize("pattern", CREDENTIAL_FILE_CASES)
+def test_each_credential_pattern_is_kept_at_the_root_and_recursively(pattern) -> None:
+    lines = {line.strip() for line in DOCKERIGNORE.splitlines()}
+    assert {pattern, f"**/{pattern}"} <= lines
+
+
+@pytest.mark.parametrize("pattern", CREDENTIAL_FILE_CASES)
+def test_dropping_a_credential_pattern_leaks_exactly_its_own_cases(pattern) -> None:
+    root_case, nested_case = CREDENTIAL_FILE_CASES[pattern]
+    lines = DOCKERIGNORE.splitlines()
+
+    def leaked(without):
+        kept = [line for line in lines if line.strip() not in without]
+        return {path for path in CREDENTIAL_PATHS if not dockerignore_excludes(path, kept)}
+
+    # Without the recursive form only the nested case gets in (the root line still holds)...
+    assert leaked({f"**/{pattern}"}) == {nested_case}
+    # ...and without both, both cases do, and nothing that belongs to another pattern.
+    assert leaked({pattern, f"**/{pattern}"}) == {root_case, nested_case}
+
+
 def test_the_only_exception_reincludes_just_the_root_env_template() -> None:
     # The last matching pattern wins, so an exception after the sensitive
     # patterns could bring a secret back. The only one allowed is the root
