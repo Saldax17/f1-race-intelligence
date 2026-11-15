@@ -1041,7 +1041,16 @@ opcional (`logging.file_path` / `F1_LOG_FILE`) y nada depende de él.
 ### 14.7 Docker
 
 ```bash
-docker build -t f1-race-intelligence:dev .
+# Imagen trazable: solo desde un árbol limpio, con el SHA completo del commit
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Hay cambios sin commit: no se construye la imagen." >&2
+    false
+else
+    docker build --platform linux/amd64 \
+        --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+        --build-arg F1_GIT_DIRTY=false \
+        -t f1-race-intelligence:dev .
+fi
 
 # Prueba local sobre los datos del repo, escribiendo en data/smoke (layout lake)
 docker run --rm -v "$PWD/data:/app/data" f1-race-intelligence:dev \
@@ -1056,9 +1065,11 @@ docker run --rm -v "$PWD/data:/app/data" \
 - Usuario sin privilegios (`uid 10001`); solo `/app/data` es escribible. Con
   un volumen montado en Linux, añadir `--user "$(id -u):$(id -g)"` si el
   directorio del host no es escribible para ese uid.
-- La construcción debe inyectar los build args `F1_GIT_COMMIT` y
-  `F1_GIT_DIRTY` desde el checkout. Si Git no está disponible y no se inyecta
-  la revisión, el reporte la deja explícitamente nula; el hash del lock se
+- La receta solo construye desde un árbol limpio (`git status --porcelain`
+  vacío, incluidos los archivos sin seguimiento) e inyecta `F1_GIT_COMMIT` con
+  el SHA completo (`git rev-parse HEAD`) y `F1_GIT_DIRTY=false`. Una imagen
+  construida sin esos build args no es trazable: la imagen no incluye `.git/`,
+  así que el reporte deja la revisión explícitamente nula; el hash del lock se
   calcula desde el archivo incluido en la imagen.
 - Sin datasets, `.env` ni credenciales (`.dockerignore`).
 - Configuración por variables de entorno (`F1_ENVIRONMENT`, `F1_STORAGE_*`).
@@ -1070,7 +1081,9 @@ docker run --rm -v "$PWD/data:/app/data" \
 > Imagen construida y probada en local con Docker Engine (WSL, `linux/amd64`):
 > `--help`, `pip check`, uid 10001, rutas de configuración inexistentes
 > (código 2), configuración AWS/S3 sin red, y `copy-raw` + M3→M5 de una sesión
-> sin red con `--memory 512m --cpus 0.5`. Todavía no se ha subido a ECR.
+> sin red con `--memory 512m --cpus 0.5`. La publicación en ECR es
+> **NO VERIFICABLE** desde el repositorio (ver
+> [infra/aws_status.json](infra/aws_status.json)).
 
 ### 14.8 Infraestructura como código
 
@@ -1134,7 +1147,11 @@ salida; contexto de logging.
 - **El despliegue AWS es NO VERIFICABLE** según
   [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
   contra un cliente simulado.
-- No hay CI configurado.
+- CI con GitHub Actions (`.github/workflows/ci.yml`): en pull requests y
+  pushes a `master`, revisa espacios en blanco y ejecuta
+  `pytest -m "not integration"` (incluye `tests/infra`) en Ubuntu y Windows,
+  y compara los hashes de M6 entre ambos. No ejecuta `cfn-lint` ni
+  `sam validate`, no construye la imagen y no despliega (sin CD).
 
 ## 17. Licencia y uso de datos
 
