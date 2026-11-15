@@ -1,6 +1,7 @@
 # Batch image for the F1 Race Intelligence pipeline (M2-M6).
 #
-# Build:  docker build -t f1-race-intelligence:dev .
+# Build (traceable; refuses uncommitted changes; full recipe in infra/README.md):
+#   test -z "$(git status --porcelain)" && docker build --platform linux/amd64 --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" --build-arg F1_GIT_DIRTY=false -t f1-race-intelligence:dev .
 # Run:    docker run --rm f1-race-intelligence:dev --stage m4 --year 2024 --session-key 9472
 #
 # The image holds code and configuration only: no datasets, no .env, no

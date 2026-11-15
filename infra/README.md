@@ -233,12 +233,29 @@ aws lambda invoke --function-name f1-race-intelligence-dev-openf1-availability \
 Para publicar la imagen batch en ECR (cuando corresponda):
 
 ```bash
-REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
-  --query "Stacks[0].Outputs[?OutputKey=='PipelineImageRepositoryUri'].OutputValue" --output text)
-aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
-docker build -t "$REPO:$(git rev-parse --short HEAD)" .
-docker push "$REPO:$(git rev-parse --short HEAD)"
+# Solo desde un árbol limpio: cualquier cambio sin commit, incluidos archivos
+# sin seguimiento, impide construir y publicar. La imagen registra el SHA
+# completo del commit (F1_GIT_COMMIT) y F1_GIT_DIRTY=false.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "Hay cambios sin commit: no se construye ni se publica la imagen." >&2
+  false
+else
+  REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
+    --query "Stacks[0].Outputs[?OutputKey=='PipelineImageRepositoryUri'].OutputValue" --output text)
+  TAG=$(git rev-parse --short HEAD)
+  aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}" &&
+  docker build --platform linux/amd64 \
+    --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg F1_GIT_DIRTY=false \
+    -t "$REPO:$TAG" . &&
+  docker push "$REPO:$TAG"
+fi
 ```
+
+`--platform linux/amd64` coincide con la task definition (`X86_64`). La
+etiqueta corta solo nombra la imagen; el commit exacto queda en la imagen y
+en los reportes de M6. El digest que se pasa en `PipelineImageUri` es el que
+devuelve `docker push`.
 
 ## Alertas por correo (`AlertEmail`)
 

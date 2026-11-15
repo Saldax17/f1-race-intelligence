@@ -2,7 +2,8 @@
 
 They do not build anything; they pin the decisions a later edit could lose
 without any test noticing: a reproducible base, the config the code needs,
-a non-root user, and nothing private in the build context.
+a non-root user, nothing private in the build context, and documented build
+recipes that record the exact commit and refuse uncommitted changes.
 """
 
 import re
@@ -91,3 +92,93 @@ def test_the_container_runs_unprivileged_through_the_cli() -> None:
 @pytest.mark.parametrize("pattern", ["data/", ".env", ".aws/", "tests/", ".git/", ".venv/", "*.parquet"])
 def test_private_or_bulky_paths_never_reach_the_build_context(pattern) -> None:
     assert pattern in DOCKERIGNORE.splitlines()
+
+
+# -- traceable builds: the documented recipes record the commit they come from
+
+# The image's architecture is the task definition's (X86_64); the commit is
+# the full SHA that traceability.source_revision accepts (a short one is
+# discarded); "false" may only be claimed behind the clean-tree guard.
+TRACEABLE_BUILD_ARGS = (
+    "--platform linux/amd64",
+    '--build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)"',
+    "--build-arg F1_GIT_DIRTY=false",
+)
+CLEAN_TREE_GUARD = 'if [ -n "$(git status --porcelain)" ]; then'
+DOCKERFILE_GUARD = 'test -z "$(git status --porcelain)" && docker build'
+
+
+def join_continuations(text):
+    return re.sub(r"\\\n\s*", " ", text)
+
+
+def documented_build_blocks():
+    """``(source, bash block)`` of every documented ``docker build``, continuations joined."""
+    blocks = []
+    for source in ("README.md", "infra/README.md"):
+        markdown = (REPO_ROOT / source).read_text(encoding="utf-8")
+        for language, body in re.findall(r"^```(\w*)\n(.*?)^```", markdown, flags=re.S | re.M):
+            if "docker build" in body:
+                assert language == "bash", f"{source}: docker build documented in a ```{language} block"
+                blocks.append((source, join_continuations(body)))
+    return blocks
+
+
+def dockerfile_build_comment():
+    """The build command shown in the Dockerfile's header comment."""
+    lines = [line.lstrip("#").strip() for line in DOCKERFILE.splitlines() if line.startswith("#")]
+    (command,) = [line for line in lines if "docker build " in line]  # not "docker buildx"
+    return command
+
+
+def test_every_documented_build_records_the_full_commit_and_the_task_platform() -> None:
+    blocks = documented_build_blocks()
+    # Both READMEs document a build; neither may silently drop out of this check.
+    assert {source for source, _ in blocks} == {"README.md", "infra/README.md"}
+
+    commands = [(source, line) for source, block in blocks for line in block.splitlines() if "docker build" in line]
+    commands.append(("Dockerfile", dockerfile_build_comment()))
+    for source, command in commands:
+        for argument in TRACEABLE_BUILD_ARGS:
+            assert argument in command, f"{source}: {argument!r} missing from {command!r}"
+        assert "--short" not in command, f"{source}: the image must record the full SHA"
+
+
+def test_documented_builds_and_pushes_only_run_from_a_clean_tree() -> None:
+    for source, block in documented_build_blocks():
+        guard = block.index(CLEAN_TREE_GUARD)
+        refusal, _, clean_branch = block[guard:].partition("\nelse\n")
+        assert clean_branch, f"{source}: the build must sit in the else branch of the clean-tree guard"
+        # The dirty branch only reports, and fails so a script sees the refusal;
+        # nothing is built or published there.
+        assert "docker" not in refusal and ">&2" in refusal, source
+        assert refusal.rstrip().splitlines()[-1].strip() == "false", f"{source}: a refused build must exit non-zero"
+        assert "docker build" not in block[:guard] and "docker push" not in block[:guard], source
+        assert "docker build" in clean_branch, source
+        assert clean_branch.index("docker build") < clean_branch.index("\nfi\n"), f"{source}: the build must end inside the guard"
+        if "docker push" in block:
+            assert clean_branch.index("docker build") < clean_branch.index("docker push"), source
+            # A failed build must not push whatever image already has that tag.
+            assert re.search(r"-t \"\$REPO:\$TAG\" \. &&\s*docker push", clean_branch), source
+
+    assert dockerfile_build_comment().startswith(DOCKERFILE_GUARD)
+
+
+def test_the_dockerfile_forwards_the_commit_build_args_to_the_runtime() -> None:
+    assert {"F1_GIT_COMMIT", "F1_GIT_DIRTY"} <= set(instructions("ARG"))
+    env = " ".join(instructions("ENV"))
+    assert "F1_GIT_COMMIT=${F1_GIT_COMMIT}" in env and "F1_GIT_DIRTY=${F1_GIT_DIRTY}" in env
+    assert DOCKERFILE.index("ARG F1_GIT_COMMIT") < DOCKERFILE.index("F1_GIT_COMMIT=${F1_GIT_COMMIT}")
+
+
+def test_the_injected_values_are_what_the_m6_reports_record(monkeypatch) -> None:
+    from f1_race_intelligence.modeling.traceability import source_revision
+
+    full_sha = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setenv("F1_GIT_COMMIT", full_sha)
+    monkeypatch.setenv("F1_GIT_DIRTY", "false")
+    assert source_revision() == (full_sha, False)
+
+    # Why the recipe uses the full SHA: a short one is not recorded at all.
+    monkeypatch.setenv("F1_GIT_COMMIT", full_sha[:7])
+    assert source_revision() == (None, None)
