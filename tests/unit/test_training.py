@@ -114,6 +114,7 @@ def test_training_refuses_an_invalid_m6_report(synthetic_m6) -> None:
 
 
 def test_training_is_reproducible_tracked_registered_and_recoverable(synthetic_m6) -> None:
+    pytest.importorskip("mlflow", reason="install the optional training extra to run MLflow integration tests")
     settings, m6_report_path, m6_payload = synthetic_m6
     original_report_hash = hashlib.sha256(m6_report_path.read_bytes()).hexdigest()
 
@@ -157,3 +158,19 @@ def test_training_is_reproducible_tracked_registered_and_recoverable(synthetic_m
     saved_report = json.loads(Path(first.report_path).read_text(encoding="utf-8"))
     assert saved_report["registered_model"]["recovery_check"] == "passed"
     assert saved_report["input_fingerprint"] == first.input_fingerprint
+
+
+def test_training_explains_when_optional_extra_is_missing(synthetic_m6, monkeypatch) -> None:
+    import builtins
+
+    settings, m6_report_path, _ = synthetic_m6
+    real_import = builtins.__import__
+
+    def without_mlflow(name, *args, **kwargs):
+        if name == "mlflow" or name.startswith("mlflow."):
+            raise ModuleNotFoundError("No module named 'mlflow'", name="mlflow")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_mlflow)
+    with pytest.raises(RuntimeError, match=r"\[training\]"):
+        TrainingRunner(settings, m6_report_path=str(m6_report_path)).run()

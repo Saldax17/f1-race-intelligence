@@ -144,7 +144,8 @@ f1-race-intelligence/
 │   └── config.aws.yaml        # overlay para environment=aws (solo diferencias)
 │
 ├── requirements/
-│   └── runtime-lock.txt       # versiones exactas para la imagen Docker
+│   ├── runtime-lock.txt       # runtime M1-M6 e imagen Docker
+│   └── training-lock.txt      # cierre exacto para el extra M7
 │
 ├── data/
 │   ├── raw/
@@ -227,6 +228,14 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -e ".[dev]"
+```
+
+M7 es opcional: para entrenamiento local instala el lock específico y activa
+el extra, sin añadir MLflow al runtime batch M1-M6:
+
+```bash
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -e ".[training]" --no-deps
 ```
 
 Dependencias principales: `httpx` (HTTP), `tenacity` (retries con backoff),

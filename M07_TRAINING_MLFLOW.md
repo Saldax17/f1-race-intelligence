@@ -28,10 +28,10 @@ codificada de M6, en el orden de `output_feature_names`; M7 carga el URI del
 registro al terminar y comprueba que la predicción coincida con la del modelo
 recién ajustado.
 
-Tracking y Model Registry usan el mismo backend local SQLite, compatible con
-`mlflow==2.22.1` y `SQLAlchemy>=2.0,<2.1` (MLflow 2.22.1 no funciona con
-SQLAlchemy 2.1). El directorio de artefactos es local y separado del archivo
-SQLite:
+Tracking y Model Registry usan el mismo backend local SQLite. El extra
+`training` fija `mlflow==3.18.0` y `SQLAlchemy==2.0.57`, compatibles con las
+versiones pandas/pyarrow del runtime-lock. El directorio de artefactos es
+local y separado del archivo SQLite:
 
 - Tracking/Registry: `data/mlflow/tracking.db`
 - Artefactos MLflow: `data/mlflow/artifacts/`
@@ -47,7 +47,10 @@ debe configurar otra base SQLite o restaurar la ruta anterior.
 Instalar las dependencias del proyecto (MLflow está fijado en `pyproject.toml`):
 
 ```powershell
-python -m pip install -e ".[dev]"
+python -m pip install -r requirements/runtime-lock.txt
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -r requirements/dev-lock.txt
+python -m pip install -e ".[dev,training]" --no-deps
 ```
 
 Con un reporte M6 ya producido:
@@ -87,7 +90,7 @@ también están en el reporte M7 y en los tags del run.
 - `src/f1_race_intelligence/config/settings.py` y `configs/config.yaml`:
   configuración local M7, aditiva a las secciones existentes.
 - `src/f1_race_intelligence/cli.py`: stage `m7` y opción `--m6-report`.
-- `pyproject.toml`: dependencia `mlflow==2.22.1`.
+- `pyproject.toml`: extra opcional `training` con MLflow y SQLAlchemy fijados.
 - `tests/unit/test_training.py`: métricas con ceros/nulos y flujo completo con
   fixtures sintéticos: reproducibilidad, tracking, registro y carga.
 - `README.md`: estado y enlace al alcance M7.

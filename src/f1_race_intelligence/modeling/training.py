@@ -345,8 +345,14 @@ class TrainingRunner:
         )
 
     def _configure_tracking(self) -> Tuple[Any, Any, str]:
-        import mlflow
-        from mlflow.tracking import MlflowClient
+        try:
+            import mlflow
+            from mlflow.tracking import MlflowClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "M7 requires the optional training dependencies; install "
+                '`python -m pip install -e ".[training]"` first'
+            ) from exc
 
         db_path = Path(self._config.tracking_db_path).resolve()
         artifact_root = Path(self._config.artifact_path).resolve()
