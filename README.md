@@ -1042,7 +1042,7 @@ opcional (`logging.file_path` / `F1_LOG_FILE`) y nada depende de él.
 
 ```bash
 # Imagen trazable: solo desde un árbol limpio, con el SHA completo del commit
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
     echo "Hay cambios sin commit: no se construye la imagen." >&2
     false
 else
@@ -1065,10 +1065,12 @@ docker run --rm -v "$PWD/data:/app/data" \
 - Usuario sin privilegios (`uid 10001`); solo `/app/data` es escribible. Con
   un volumen montado en Linux, añadir `--user "$(id -u):$(id -g)"` si el
   directorio del host no es escribible para ese uid.
-- La receta solo construye desde un árbol limpio (`git status --porcelain`
-  vacío, incluidos los archivos sin seguimiento) e inyecta `F1_GIT_COMMIT` con
-  el SHA completo (`git rev-parse HEAD`) y `F1_GIT_DIRTY=false`. Una imagen
-  construida sin esos build args no es trazable: la imagen no incluye `.git/`,
+- La receta solo construye desde un árbol limpio
+  (`git status --porcelain --untracked-files=all` vacío: incluye los archivos
+  sin seguimiento aunque `status.showUntrackedFiles` los oculte) e inyecta
+  `F1_GIT_COMMIT` con el SHA completo (`git rev-parse HEAD`) y
+  `F1_GIT_DIRTY=false`. Una imagen construida sin esos build args no es
+  trazable: la imagen no incluye `.git/`,
   así que el reporte deja la revisión explícitamente nula; el hash del lock se
   calcula desde el archivo incluido en la imagen.
 - Sin datasets, `.env` ni credenciales (`.dockerignore`).
