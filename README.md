@@ -206,6 +206,8 @@ f1-race-intelligence/
 │       │
 │       ├── consolidation/ features/ modeling/   # M4, M5, M6
 │       │
+│       ├── serving/                   # prototipo local de inferencia (M8, sección 19)
+│       │
 │       └── utils/
 │           ├── __init__.py
 │           ├── files.py                   # Compatibilidad deprecada; usar storage/backends
@@ -1182,9 +1184,139 @@ bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir
   `next_lap_time`.
 - Tracking de experimentos con MLflow y model registry.
-- Servir el modelo vía FastAPI.
+- Servir el modelo vía FastAPI: existe un prototipo local (sección 19); falta
+  el modelo registrado por M7 y cualquier despliegue.
 - Despliegue en AWS (CloudFormation/SAM) de la arquitectura propuesta en la
   sección 14.9 (la base ya está definida en `infra/`); construir y publicar
   la imagen Docker en ECR.
 - CI/CD.
 - Dashboard y monitoreo de drift.
+
+## 19. Prototipo de serving (M8)
+
+> Prototipo **local**. No entrena modelos ni despliega en AWS/SageMaker.
+> Mientras M7 no registre un modelo no hay predicciones reales: los valores
+> de los ejemplos de esta sección son **ilustrativos**.
+
+### Arquitectura
+
+```
+POST /predict  {"records": [ {features de M5, sin transformar}, … ]}
+  │
+  ├─ serving/contract.py   valida contra feature_schema.json de M6:
+  │                        nombres, tipos, ausentes, campos prohibidos
+  ├─ M6: prepare_matrix + preprocessor.joblib (ajustado solo con train)
+  │                        ← código y artefacto oficiales de M6, sin copias
+  ├─ modelo cargado con mlflow.pyfunc (models:/… o runs:/…)  ← artefacto de M7
+  └─ una predicción de next_lap_time por registro, en el orden recibido
+```
+
+| Módulo | Responsabilidad |
+|---|---|
+| `serving/contract.py` | Contrato de entrada, leído del `feature_schema.json` de M6 (ninguna lista de features escrita a mano) |
+| `serving/model.py` | Interfaz `ModelLoader`; `MlflowPyfuncLoader` importa MLflow solo al cargar |
+| `serving/service.py` | Carga los artefactos con la capa de storage (local o `s3://`), comprueba que concuerdan y predice |
+| `serving/app.py` | FastAPI: `GET /health`, `GET /model-info`, `POST /predict` |
+
+Al arrancar, el servicio comprueba que `preprocessor.joblib` y
+`feature_schema.json` son de la misma ejecución de M6, y que la firma del
+modelo, si la tiene, declara exactamente las columnas codificadas de esa
+ejecución. Si algo no concuerda, no acepta peticiones. Un test exige que la
+matriz que recibe el modelo sea idéntica, en train, validation y test, a la
+`features.parquet` que escribe el propio M6.
+
+### Contrato esperado del modelo de M7 (pendiente de confirmar con M7)
+
+1. **Entrada:** un DataFrame con las columnas `encoded_feature_names` del
+   `feature_schema.json` de la ejecución de M6 con la que se entrenó; es
+   decir, `features.parquet` sin `next_lap_time` ni las columnas `key_*`.
+2. **Salida:** un valor de `next_lap_time` por fila, en su escala original
+   (la de `lap_duration`). Si M7 transforma el target, la inversa debe ir
+   dentro del modelo registrado.
+3. **Carga:** con `mlflow.pyfunc.load_model`, en cualquier flavor.
+4. **Firma:** registrada con nombres de columna. Sin firma la API arranca,
+   pero `/model-info` muestra `input_signature_verified: false`.
+5. **Trazabilidad:** debe poder saberse qué ejecución de M6 (`run_id`)
+   produjo los datos de entrenamiento, para apuntar
+   `F1_SERVING_PREPROCESSING_URI` a ella. Cómo registrarlo lo decide M7; la
+   API todavía no lo lee del modelo.
+
+Esta API no fija nombres de modelo registrado, alias ni experimentos: se
+pasan en `F1_SERVING_MODEL_URI` cuando M7 los defina.
+
+### Contrato de entrada
+
+- **Features:** exactamente `input_features.numeric` + `input_features.categorical`
+  del esquema de M6, sin transformar (con el catálogo actual de M5, hasta 51,
+  de ellas 3 categóricas: `compound`, `driver_acronym`, `team_name`).
+  `GET /model-info` devuelve la lista exacta.
+- **Tipos:** numéricas, número finito, booleano o `null`; categóricas,
+  texto o `null`.
+- **Todas obligatorias como clave.** `null` significa desconocido: M6 lo
+  imputa con la mediana de train y conserva el indicador de ausencia. Una
+  categoría no vista en train se codifica como ceros.
+- **Opcionales:** las columnas de trazabilidad (`year`, `meeting_key`,
+  `session_key`, `driver_number`, `lap_number`, `session_date`). Se devuelven
+  en `keys` y no llegan al modelo salvo que también sean features
+  (`lap_number`).
+- **Rechazados:** campos desconocidos y columnas prohibidas (el target y
+  `FORBIDDEN_AS_FEATURES`, como `pit_duration`).
+- **Lote:** de 1 a `F1_SERVING_MAX_RECORDS` registros (1000 por defecto).
+
+### Ejecución local
+
+```bash
+pip install -e ".[serve]"     # FastAPI + uvicorn
+pip install mlflow            # a la versión con la que M7 registre el modelo
+export MLFLOW_TRACKING_URI=<tracking URI de M7>
+export F1_SERVING_PREPROCESSING_URI=data/modeling/preprocessing/runs/<run_id de M6>
+export F1_SERVING_MODEL_URI=models:/<nombre registrado por M7>/<versión>
+uvicorn f1_race_intelligence.serving.app:app --host 127.0.0.1 --port 8000
+```
+
+En PowerShell, las variables se definen con `$env:F1_SERVING_MODEL_URI = "..."`.
+La documentación interactiva queda en `http://127.0.0.1:8000/docs`.
+
+### Ejemplos (valores ilustrativos)
+
+```http
+GET /health
+→ 200 {"status": "ok"}
+→ 503 {"status": "unavailable", "reason": "RuntimeError: set F1_SERVING_MODEL_URI"}
+```
+
+```http
+POST /predict
+{"records": [{"session_key": 9472, "driver_number": 1,
+              "lap_number": 12, "lap_duration": 95.1, "tyre_age": 11,
+              "compound": "MEDIUM", "gap_to_leader_s": null, …}]}
+
+→ 200 {"target": "next_lap_time",
+       "model": {"uri": "models:/<nombre>/<versión>", "run_id": "<run de M7>"},
+       "predictions": [{"index": 0, "value": <predicción>,
+                        "keys": {"session_key": 9472, "driver_number": 1, "lap_number": 12}}]}
+
+→ 422 {"detail": [{"record": 0, "field": "next_lap_time",
+                   "error": "this column must never reach the model (target or leakage)"},
+                  {"record": 0, "field": "tyre_age",
+                   "error": "missing feature: send null if the value is unknown"}]}
+```
+
+| Código | Cuándo |
+|---|---|
+| 200 | Predicción correcta |
+| 422 | El cuerpo o algún registro incumple el contrato; se listan todos los problemas |
+| 500 | El modelo devolvió algo que no es un valor finito por registro |
+| 503 | El servicio no cargó (falta configuración, artefactos que no concuerdan, MLflow ausente…) |
+
+### Tests
+
+```bash
+pytest tests/unit/test_serving.py        # contrato, artefactos, paridad con M6, loader MLflow
+pytest tests/unit/test_serving_api.py    # capa HTTP; requiere el extra serve
+```
+
+Los tests generan artefactos auténticos de M6 ejecutando su runner sobre
+carreras sintéticas, y usan modelos *stub* que solo registran lo que reciben.
+No usan datos reales ni MLflow. `test_serving_api.py` se omite si FastAPI no
+está instalado, que es lo que ocurre hoy en CI.
