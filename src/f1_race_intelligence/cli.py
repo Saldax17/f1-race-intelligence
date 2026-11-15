@@ -5,14 +5,16 @@
     python -m f1_race_intelligence --stage m2 --year 2024 --session-key 9472
     python -m f1_race_intelligence --stage m3,m4,m5 --year 2024 --session-key 9472
     python -m f1_race_intelligence --stage m6
+    python -m f1_race_intelligence --stage m7 --m6-report data/modeling/reports/modeling_report_....json
     python -m f1_race_intelligence --stage plan --year 2024
     python -m f1_race_intelligence --stage m4 --session-key 9472 \\
         --storage-backend s3 --bucket my-bucket --prefix dev
 
 Stages: ``plan`` (list the session work units of a season), ``m2`` extraction,
 ``m3`` validation, ``m4`` consolidation, ``m5`` features, ``m6`` modelling
-datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), and
-``copy-raw`` (copy already-extracted raw data between stores).
+datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), ``m7``
+training and evaluation from a verified M6 report, and ``copy-raw`` (copy
+already-extracted raw data between stores).
 Several stages run in order when given as a comma-separated list; the first
 failure stops the chain.
 
@@ -51,7 +53,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "copy-raw")
+STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "copy-raw")
 
 
 @dataclass
@@ -105,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(where an orchestrator such as Step Functions can read them)",
     )
     config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
+    config.add_argument("--m6-report", help="Verified local M6 report to use as M7 training input")
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -328,6 +331,16 @@ def run_verify_m6(ctx: RunContext) -> StageOutcome:
     return StageOutcome(ok=result["ok"], summary=result, reason=reason)
 
 
+def run_m7(ctx: RunContext) -> StageOutcome:
+    from f1_race_intelligence.modeling.training import TrainingRunner
+
+    report_path = ctx.args.m6_report or ctx.settings.training.m6_report_path
+    if not report_path:
+        return StageOutcome(ok=False, reason="M7 requires --m6-report or training.m6_report_path")
+    result = TrainingRunner(ctx.settings, m6_report_path=report_path).run()
+    return StageOutcome(ok=True, summary=result.summary())
+
+
 def run_copy_raw(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.storage.migration import copy_raw
 
@@ -356,6 +369,7 @@ STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
     "m5": run_m5,
     "m6": run_m6,
     "verify-m6": run_verify_m6,
+    "m7": run_m7,
     "copy-raw": run_copy_raw,
 }
 
@@ -428,13 +442,23 @@ def main(
         stages = parse_stages(args.stage)
         if "verify-m6" in stages and (len(stages) != 1 or not args.report):
             raise ValueError("verify-m6 must be run alone and requires --report")
+        if "m7" in stages and len(stages) != 1:
+            raise ValueError("m7 must run alone against an explicit, already-produced M6 report")
         if args.report and "verify-m6" not in stages:
             raise ValueError("--report is only valid with --stage verify-m6")
+        if args.m6_report and "m7" not in stages:
+            raise ValueError("--m6-report is only valid with --stage m7")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
         if args.plan_output:
             parse_plan_destination(args.plan_output)  # fail before any OpenF1 call
         settings = load_settings(args.config, overrides=settings_overrides(args))
+        if "m7" in stages and not (args.m6_report or settings.training.m6_report_path):
+            raise ValueError("m7 requires --m6-report or training.m6_report_path")
+        if "m7" in stages and settings.storage.backend != "local":
+            raise ValueError("m7 supports local storage only")
+        if "m7" in stages and (args.input_storage or args.output_storage):
+            raise ValueError("m7 does not accept storage URI overrides; use local M6 artifacts")
         check_stage_inputs(stages, settings, args.year)
         input_store = resolve_store(settings, args.input_storage, args.input_layout)
         output_store = resolve_store(settings, args.output_storage, args.output_layout)

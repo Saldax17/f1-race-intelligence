@@ -25,6 +25,11 @@ dependencies = [
     # joblib persists the transformer fitted on the training races.
     "scikit-learn>=1.4",
     "joblib>=1.3",
+    # M7 uses the local SQLAlchemy-backed tracking store so model versions
+    # can be registered and loaded without an external service.
+    "mlflow==2.22.1",
+    # MLflow 2.22.1 imports a pool class removed in SQLAlchemy 2.1.
+    "SQLAlchemy>=2.0,<2.1",
 ]
 
 [project.optional-dependencies]

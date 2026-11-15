@@ -195,3 +195,13 @@ modeling:
 
   # Refuse to write anything when a leakage guard fails.
   fail_on_leakage: true
+
+# M7 consumes a verified M6 report and keeps MLflow tracking, registry,
+# artifacts, and run reports on local disk.
+training:
+  m6_report_path: null
+  tracking_db_path: "data/mlflow/tracking.db"
+  artifact_path: "data/mlflow/artifacts"
+  output_path: "data/modeling/training/reports"
+  experiment_name: "f1-race-intelligence"
+  registered_model_name: "f1-next-lap-linear-regression"
