@@ -18,18 +18,21 @@ import hashlib
 import io
 import json
 import re
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import joblib
 import numpy as np
 
+from f1_race_intelligence.modeling.model_package import ModelPackageError, read_model_package
 from f1_race_intelligence.modeling import preprocessing
 from f1_race_intelligence.modeling.runner import PREPROCESSOR_FILE
 from f1_race_intelligence.serving.contract import FEATURE_SCHEMA_FILE, ArtifactError, ContractError, FeatureContract
 from f1_race_intelligence.serving.model import LoadedModel, MlflowPyfuncLoader, ModelLoader
+from f1_race_intelligence.storage.backends.base import StorageBackend
 from f1_race_intelligence.storage.store import store_from_uri
 from f1_race_intelligence.utils.logging import get_logger
 
@@ -126,6 +129,106 @@ class PredictionService:
             max_records,
             provenance.get("m6_run_id") if provenance is not None else None,
             provenance.get("input_fingerprint") if provenance is not None else None,
+        )
+
+    @classmethod
+    def load_published_package(
+        cls,
+        *,
+        backend: StorageBackend,
+        prefix: str,
+        loader: ModelLoader,
+        max_records: int = DEFAULT_MAX_RECORDS,
+    ) -> "PredictionService":
+        """Load a verified published package without consulting MLflow.
+
+        The model is materialized to a temporary directory only while the
+        loader reads the MLflow pyfunc bundle. Its in-memory model, M6
+        preprocessor, and schema are then retained by the service.
+        """
+        if max_records < 1:
+            raise ValueError("max_records must be at least 1")
+        try:
+            package = read_model_package(backend, prefix)
+        except ModelPackageError as exc:
+            raise ArtifactError(f"published model package failed verification: {exc}") from exc
+
+        model_metadata = package.manifest["model"]
+        provenance_metadata = package.manifest["provenance"]
+        try:
+            provenance = json.loads(package.artifacts["data_provenance.json"].decode("utf-8"))
+            report = json.loads(package.artifacts["training_report.json"].decode("utf-8"))
+            schema_bytes = package.artifacts[f"m6/{FEATURE_SCHEMA_FILE}"]
+            schema = json.loads(schema_bytes.decode("utf-8"))
+            preprocessor_bytes = package.artifacts[f"m6/{PREPROCESSOR_FILE}"]
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ArtifactError(f"published model package has invalid M6/M7 metadata: {exc}") from exc
+
+        if (
+            not isinstance(provenance, dict)
+            or provenance.get("m6_run_id") != provenance_metadata["m6_run_id"]
+            or provenance.get("input_fingerprint") != provenance_metadata["input_fingerprint"]
+            or not isinstance(report, dict)
+            or report.get("run_id") != model_metadata["m7_run_id"]
+            or report.get("m6_run_id") != provenance_metadata["m6_run_id"]
+            or report.get("input_fingerprint") != provenance_metadata["input_fingerprint"]
+            or not isinstance(report.get("registered_model"), dict)
+            or report["registered_model"].get("uri") != model_metadata["uri"]
+        ):
+            raise ArtifactError("published package provenance does not bind the M6 artifacts to this M7 model")
+        _verify_m7_artifact_hash(provenance, FEATURE_SCHEMA_FILE, schema_bytes)
+        _verify_m7_artifact_hash(provenance, PREPROCESSOR_FILE, preprocessor_bytes)
+
+        contract = FeatureContract.from_schema(schema)
+        if contract.target != model_metadata["target"]:
+            raise ArtifactError("published package target differs from the M6 feature schema")
+        try:
+            fitted = joblib.load(io.BytesIO(preprocessor_bytes))
+        except Exception as exc:
+            raise ArtifactError(f"{PREPROCESSOR_FILE} in the published package could not be loaded: {exc}") from exc
+        _check_preprocessor_matches_schema(contract, fitted)
+
+        with tempfile.TemporaryDirectory(prefix="f1-model-package-") as directory:
+            model_directory = Path(directory) / "model"
+            for name, content in package.artifacts.items():
+                if not name.startswith("model/"):
+                    continue
+                relative = Path(*name.split("/")[1:])
+                destination = model_directory / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+            loaded = loader.load(str(model_directory))
+
+        if loaded.run_id != model_metadata["m7_run_id"]:
+            raise ArtifactError(
+                "published model artifact belongs to M7 run "
+                f"{loaded.run_id!r}, not manifest run {model_metadata['m7_run_id']!r}"
+            )
+        if loaded.input_names is None:
+            raise ArtifactError("published M7 model requires a named input signature")
+        if list(loaded.input_names) != model_metadata["input_signature"]:
+            raise ArtifactError("loaded model signature differs from the published package manifest")
+        model = replace(loaded, uri=model_metadata["uri"])
+        _check_model_matches_schema(contract, model)
+
+        logger.info(
+            "serving_loaded_published_package",
+            extra={
+                "package_uri": package.package_uri,
+                "model_uri": model.uri,
+                "model_run_id": model.run_id,
+                "encoded_features": len(contract.encoded_feature_names),
+                "input_signature_verified": True,
+            },
+        )
+        return cls(
+            contract,
+            fitted,
+            model,
+            package.package_uri,
+            max_records,
+            provenance_metadata["m6_run_id"],
+            provenance_metadata["input_fingerprint"],
         )
 
     def predict(self, records: Sequence[Mapping[str, Any]]) -> List[float]:
