@@ -77,7 +77,7 @@ explícitamente si termina (`available == false`) o sigue.
 | Red | VPC dedicada `10.42.0.0/24`, 2 subredes públicas en 2 AZ, Internet Gateway, security group sin entrada y salida solo TCP 443 |
 | SNS | topic de alertas críticas; política para CloudWatch de la misma cuenta; suscripción e-mail opcional |
 | ECR | tags inmutables, escaneo al subir, expira sin tag a 7 d, conserva 30 imágenes; `RetainExceptOnCreate` |
-| CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas |
+| CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas base y una condicional; dashboard operativo |
 
 ## IAM (mínimo privilegio)
 
@@ -110,7 +110,7 @@ idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
 | `ProjectName` | `f1-race-intelligence` | prefijo de nombres y tag |
 | `Environment` | `dev` | `dev` · `staging` · `prod` |
 | `S3BucketName` | vacío | vacío ⇒ `<project>-<env>-<account>-<region>` |
-| `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min |
+| `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min; la alarma sostenida solo se crea para 15/30 min |
 | `AvailabilityScheduleState` | `DISABLED` | `samconfig.toml` también lo fija en `DISABLED` (dev y prod); activarlo es una decisión explícita |
 | `PipelineEnabled` | `false` | `true` exige `PipelineImageUri` (regla `PipelineNeedsAnImage`); dejar en `false` hasta verificar una primera ejecución controlada |
 | `PipelineImageUri` | vacío | imagen batch **por digest** (`…/f1-race-intelligence-dev-pipeline@sha256:<64 hex>`); vacío ⇒ no se crea la task definition. No se guarda en `samconfig.toml` |
@@ -118,6 +118,87 @@ idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
 | `NoncurrentVersionExpirationDays` | `90` | |
 | `OpenF1BaseUrl` | `https://api.openf1.org/v1` | |
 | `AlertEmail` | vacío | vacío ⇒ **sin suscripción: nadie recibe las alertas**; ver "Alertas por correo" |
+
+## Observabilidad operativa
+
+Las tareas Fargate reciben `F1_PIPELINE_EXECUTION_ID` desde Step Functions. El
+formateador JSON añade `component`, `logger` y `pipeline_execution_id` a cada
+registro. `component` usa el vocabulario estable configurado por `F1_COMPONENT`
+(por defecto `f1-race-intelligence`; `pipeline` en ECS y
+`availability-checker` en Lambda); `logger` conserva el nombre Python real del
+módulo. El CLI ya registra `stage_started` y `stage_finished` con duración, estado,
+resumen y excepciones. En M3, `WARNING` se etiqueta `partial` y `FAIL` se
+registra como `failed` (y se muestra como fallo en modo no estricto); ninguno
+cambia el código de salida no estricto ni detiene la secuencia. Un M6
+`VALID_WITH_WARNINGS` se etiqueta como `partial`. El resumen M6 conserva `run_id` e
+`input_fingerprint`; así se puede enlazar ese artefacto con el ID de ejecución
+del pipeline sin cambiar el contrato del reporte M6. La Lambda registra el
+componente, el estado `completed`, hora de inicio/fin y duración. Un sondeo
+HTTP no disponible sigue siendo una invocación completada: no es un error de
+ejecución Lambda.
+
+Los logs se escriben en los tres grupos descritos arriba y retienen el periodo
+configurado. No se registran secretos, credenciales ni contenido de artefactos.
+Los IDs de ejecución, `run_id`, `input_fingerprint`, estados y rutas de
+artefactos son metadatos de diagnóstico, no sus contenidos. La ejecución M7 /
+MLflow y el prototipo M8 no forman parte de esta infraestructura desplegable;
+no hay métricas AWS de entrenamiento, publicación ni HTTP 5xx del serving.
+
+| Métrica | Namespace / dimensión | Unidad y estadística | Significado |
+|---|---|---|---|
+| `ExecutionsStarted`, `ExecutionsSucceeded`, `ExecutionsFailed`, `ExecutionsTimedOut`, `ExecutionsAborted` | `AWS/States`, `StateMachineArn=<pipeline>` | Count / Sum | Volumen y desenlace de ejecuciones |
+| `ExecutionTime` | `AWS/States`, `StateMachineArn=<pipeline>` | Milliseconds / Average, Maximum | Duración de las ejecuciones |
+| `Invocations`, `Errors`, `Throttles` | `AWS/Lambda`, `FunctionName=<availability checker>` | Count / Sum | Actividad, errores de ejecución y limitación de concurrencia |
+| `Duration` | `AWS/Lambda`, `FunctionName=<availability checker>` | Milliseconds / Average, Maximum | Duración de la Lambda |
+| `FailedInvocations` | `AWS/Events`, `RuleName`; para la regla de resultados también `EventBusName` | Count / Sum | Fallos al invocar la Lambda o iniciar Step Functions |
+| `OpenF1Available` | `f1-race-intelligence/<env>`, `Environment=<env>` | Count / Maximum (0 o 1) | Resultado del sondeo, emitido por EMF |
+| `OpenF1LatencyMs` | `f1-race-intelligence/<env>`, `Environment=<env>` | Milliseconds / Average | Latencia del sondeo, emitida por EMF |
+
+`<env>` y el prefijo del namespace se generan desde `ProjectName` y
+`Environment`. Las métricas `AWS/*` son métricas de servicio; las dos
+`OpenF1*` son las únicas métricas personalizadas. La Lambda emite EMF a su log
+group y no necesita `cloudwatch:PutMetricData`.
+
+### Alarmas y dashboard
+
+Las cuatro alarmas base y, cuando la cadencia lo permite, la alarma sostenida
+publican al mismo `AlertTopic`; las acciones `OKActions` también notifican la
+recuperación:
+
+| Alarma | Criterio | Datos faltantes |
+|---|---|---|
+| `AvailabilityCheckerErrorsAlarm` | ≥1 error Lambda en 1 h; incluye timeout de función | `notBreaching` |
+| `AvailabilityCheckerThrottlesAlarm` | ≥1 throttling Lambda en 1 h | `notBreaching` |
+| `PipelineExecutionsFailedAlarm` | ≥1 fallo, timeout o aborto de Step Functions en 1 h | `notBreaching` |
+| `OrchestrationRulesFailedInvocationsAlarm` | ≥1 fallo de invocación EventBridge en 1 h | `notBreaching` |
+| `OpenF1UnavailableSustainedAlarm` | Solo creada para sondeos cada 15/30 min; 6 de 6 periodos horarios con `OpenF1Available < 1` | `notBreaching` |
+
+El umbral de una incidencia para errores/throttling/fallos captura eventos
+operativos concretos sin generar alarmas por ausencia de ejecuciones. La métrica
+OpenF1 se emite en todas las cadencias, pero la alarma **no se crea** para
+`rate(1 hour)`, `rate(3 hours)`, `rate(6 hours)`, `rate(12 hours)` ni
+`rate(1 day)`: con esos intervalos no hay suficientes muestras horarias para
+garantizar seis evaluaciones consecutivas. Para las cadencias de 15/30 minutos,
+la alarma requiere seis horas continuas de indisponibilidad y evita alertar por
+restricciones de sesión en vivo o rate limits breves. La ausencia de
+`OpenF1Available` no significa indisponibilidad y no alarma. La regla de
+EventBridge sigue `DISABLED` por defecto; no habrá muestras ni alertas mientras
+esté deshabilitada, aunque se cree la alarma para una cadencia compatible.
+
+`<ProjectName>-<Environment>-operations` contiene gráficos de resultados y
+duración de Step Functions, errores/throttling y duración Lambda, resultados y
+latencia OpenF1 y fallos EventBridge. Usa solo métricas y dimensiones presentes
+en este stack. No hay un panel ni alarma de serving hasta que exista una
+integración de despliegue que emita métricas HTTP compatibles.
+
+El correo sigue siendo opcional. Crear `AlertEmailSubscription` con una
+dirección solo significa que se solicitó la suscripción: estará
+`PendingConfirmation` hasta que el destinatario acepte el correo de SNS. Solo
+un `SubscriptionArn` confirmado representa notificaciones efectivas. Con
+`AlertEmail` vacío, el topic y las alarmas existen, pero no hay destinatario.
+La Lambda también tiene destino `OnFailure` a SNS y Step Functions publica
+detalles en `NotifyPipelineFailure`; por tanto, un mismo fallo puede generar
+tanto la notificación directa como la de la alarma agregada.
 
 ## Tareas Fargate (Fase 1B)
 

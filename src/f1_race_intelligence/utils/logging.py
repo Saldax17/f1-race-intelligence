@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -29,22 +30,43 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 _RESERVED_RECORD_KEYS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys())
+_DEFAULT_COMPONENT = "f1-race-intelligence"
+_PROTECTED_JSON_FIELDS = {
+    "timestamp",
+    "level",
+    "message",
+    "component",
+    "logger",
+    "pipeline_execution_id",
+}
 
 _CONTEXT: ContextVar[Dict[str, Any]] = ContextVar("f1_log_context", default={})
+
+
+def _trusted_pipeline_execution_id() -> Any:
+    context_id = _CONTEXT.get().get("pipeline_execution_id")
+    if context_id is not None:
+        return context_id
+    return os.environ.get("F1_PIPELINE_EXECUTION_ID") or None
 
 
 class JSONFormatter(logging.Formatter):
     """Renders each log record as a single JSON line, including ``extra`` fields."""
 
     def format(self, record: logging.LogRecord) -> str:
+        component = os.environ.get("F1_COMPONENT", _DEFAULT_COMPONENT).strip() or _DEFAULT_COMPONENT
         payload: Dict[str, Any] = {
             "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
+            "component": component,
             "logger": record.name,
             "message": record.getMessage(),
         }
+        execution_id = _trusted_pipeline_execution_id()
+        if execution_id is not None:
+            payload["pipeline_execution_id"] = execution_id
         for key, value in record.__dict__.items():
-            if key not in _RESERVED_RECORD_KEYS:
+            if key not in _RESERVED_RECORD_KEYS and key not in _PROTECTED_JSON_FIELDS:
                 payload[key] = value
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
@@ -54,14 +76,19 @@ class JSONFormatter(logging.Formatter):
 class ContextFilter(logging.Filter):
     """Copies the active :func:`log_context` fields onto each record.
 
-    A field passed explicitly through ``extra`` wins over the context, so a
-    log call can always say something more specific than its surroundings.
+    Explicit ``extra`` fields override ordinary context fields. The pipeline
+    execution ID is protected and comes only from the context or environment.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         for key, value in _CONTEXT.get().items():
-            if not hasattr(record, key):
+            if key != "pipeline_execution_id" and not hasattr(record, key):
                 setattr(record, key, value)
+        execution_id = _trusted_pipeline_execution_id()
+        if execution_id is not None:
+            record.pipeline_execution_id = execution_id
+        else:
+            record.__dict__.pop("pipeline_execution_id", None)
         return True
 
 

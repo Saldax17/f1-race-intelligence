@@ -121,7 +121,13 @@
           "ContainerOverrides": [
             {
               "Name": "pipeline",
-              "Command.$": "States.Array('--stage', 'plan', '--plan-output', States.Format('s3://${DataBucketName}/manifests/plan/{}.json', $$.Execution.Name))"
+              "Command.$": "States.Array('--stage', 'plan', '--plan-output', States.Format('s3://${DataBucketName}/manifests/plan/{}.json', $$.Execution.Name))",
+              "Environment": [
+                {
+                  "Name": "F1_PIPELINE_EXECUTION_ID",
+                  "Value.$": "$$.Execution.Id"
+                }
+              ]
             }
           ]
         }
@@ -230,7 +236,13 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm2', '--year', States.Format('{}', $.session.year), '--meeting-key', States.Format('{}', $.session.meeting_key), '--session-key', States.Format('{}', $.session.session_key))"
+                    "Command.$": "States.Array('--stage', 'm2', '--year', States.Format('{}', $.session.year), '--meeting-key', States.Format('{}', $.session.meeting_key), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Environment": [
+                      {
+                        "Name": "F1_PIPELINE_EXECUTION_ID",
+                        "Value.$": "$$.Execution.Id"
+                      }
+                    ]
                   }
                 ]
               }
@@ -293,7 +305,13 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm3', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))"
+                    "Command.$": "States.Array('--stage', 'm3', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Environment": [
+                      {
+                        "Name": "F1_PIPELINE_EXECUTION_ID",
+                        "Value.$": "$$.Execution.Id"
+                      }
+                    ]
                   }
                 ]
               }
@@ -355,7 +373,13 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm4', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))"
+                    "Command.$": "States.Array('--stage', 'm4', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Environment": [
+                      {
+                        "Name": "F1_PIPELINE_EXECUTION_ID",
+                        "Value.$": "$$.Execution.Id"
+                      }
+                    ]
                   }
                 ]
               }
@@ -417,7 +441,13 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm5', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))"
+                    "Command.$": "States.Array('--stage', 'm5', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Environment": [
+                      {
+                        "Name": "F1_PIPELINE_EXECUTION_ID",
+                        "Value.$": "$$.Execution.Id"
+                      }
+                    ]
                   }
                 ]
               }
@@ -494,7 +524,13 @@
           "ContainerOverrides": [
             {
               "Name": "pipeline",
-              "Command": ["--stage", "m6"]
+              "Command": ["--stage", "m6"],
+              "Environment": [
+                {
+                  "Name": "F1_PIPELINE_EXECUTION_ID",
+                  "Value.$": "$$.Execution.Id"
+                }
+              ]
             }
           ]
         }

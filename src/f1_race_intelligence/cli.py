@@ -389,6 +389,16 @@ def _peak_memory_mb() -> Optional[float]:
     return round(peak / divisor, 1)
 
 
+def stage_status(outcome: StageOutcome) -> str:
+    """Classify reported outcomes without changing a stage's exit semantics."""
+    global_status = outcome.summary.get("global_status")
+    if not outcome.ok or global_status == "FAIL":
+        return "failed"
+    if global_status == "WARNING" or outcome.summary.get("verdict") == "VALID_WITH_WARNINGS":
+        return "partial"
+    return "succeeded"
+
+
 def run_stage(name: str, ctx: RunContext) -> StageOutcome:
     """Run one stage with its log context, timing and failure handling."""
     with log_context(stage=name, **ctx.scope.log_fields()):
@@ -416,11 +426,12 @@ def run_stage(name: str, ctx: RunContext) -> StageOutcome:
             )
             return StageOutcome(ok=False, reason=f"{type(exc).__name__}: {exc}")
 
+        status = stage_status(outcome)
         logger.log(
-            20 if outcome.ok else 40,
+            40 if status == "failed" else 20,
             "stage_finished",
             extra={
-                "status": "succeeded" if outcome.ok else "failed",
+                "status": status,
                 "reason": outcome.reason,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
                 "peak_memory_mb": _peak_memory_mb(),
@@ -486,7 +497,14 @@ def main(
         if not outcome.ok:
             print(f"{name}: FAILED - {outcome.reason}", file=sys.stderr)
             return EXIT_FAILED
-        print(f"{name}: OK {json.dumps(outcome.summary, default=str)}", file=sys.stderr)
+        status = stage_status(outcome)
+        if status == "failed":
+            label = "FAILED (non-strict; pipeline continues)"
+        elif status == "partial":
+            label = "PARTIAL"
+        else:
+            label = "OK"
+        print(f"{name}: {label} {json.dumps(outcome.summary, default=str)}", file=sys.stderr)
     return EXIT_OK
 
 
