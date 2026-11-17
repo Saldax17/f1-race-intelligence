@@ -1215,17 +1215,19 @@ POST /predict  {"records": [ {features de M5, sin transformar}, … ]}
 |---|---|
 | `serving/contract.py` | Contrato de entrada, leído del `feature_schema.json` de M6 (ninguna lista de features escrita a mano) |
 | `serving/model.py` | Interfaz `ModelLoader`; `MlflowPyfuncLoader` importa MLflow solo al cargar |
-| `serving/service.py` | Carga los artefactos con la capa de storage (local o `s3://`), comprueba que concuerdan y predice |
+| `serving/service.py` | Recupera artefactos M7 por `runs:/` (o M6 local/`s3://`), comprueba identidad y hashes, y predice |
 | `serving/app.py` | FastAPI: `GET /health`, `GET /model-info`, `POST /predict` |
 
-Al arrancar, el servicio comprueba que `preprocessor.joblib` y
-`feature_schema.json` son de la misma ejecución de M6, y que la firma del
-modelo, si la tiene, declara exactamente las columnas codificadas de esa
-ejecución. Si algo no concuerda, no acepta peticiones. Un test exige que la
-matriz que recibe el modelo sea idéntica, en train, validation y test, a la
-`features.parquet` que escribe el propio M6.
+Al arrancar, el servicio puede recuperar `preprocessor.joblib`,
+`feature_schema.json` y `data_provenance.json` del mismo run M7 que produjo el
+modelo. Comprueba el `run_id` del modelo, los SHA-256 declarados por M7 y que
+la firma enumere, en el mismo orden, las columnas codificadas de M6. La
+referencia de preprocesamiento es `runs:/<M7_run_id>/m6`; la del modelo es la
+versión exacta `models:/<nombre>/<versión>`. Si algo no concuerda, no acepta
+peticiones. Un test exige que la matriz que recibe el modelo sea idéntica, en
+train, validation y test, a la `features.parquet` que escribe el propio M6.
 
-### Contrato esperado del modelo de M7 (pendiente de confirmar con M7)
+### Contrato de integración con M7
 
 1. **Entrada:** un DataFrame con las columnas `encoded_feature_names` del
    `feature_schema.json` de la ejecución de M6 con la que se entrenó; es
@@ -1234,12 +1236,11 @@ matriz que recibe el modelo sea idéntica, en train, validation y test, a la
    (la de `lap_duration`). Si M7 transforma el target, la inversa debe ir
    dentro del modelo registrado.
 3. **Carga:** con `mlflow.pyfunc.load_model`, en cualquier flavor.
-4. **Firma:** registrada con nombres de columna. Sin firma la API arranca,
-   pero `/model-info` muestra `input_signature_verified: false`.
-5. **Trazabilidad:** debe poder saberse qué ejecución de M6 (`run_id`)
-   produjo los datos de entrenamiento, para apuntar
-   `F1_SERVING_PREPROCESSING_URI` a ella. Cómo registrarlo lo decide M7; la
-   API todavía no lo lee del modelo.
+4. **Firma:** registrada con nombres de columna en el orden de
+   `encoded_feature_names`. Si falta o no coincide, el servicio no está listo.
+5. **Trazabilidad:** el modelo debe exponer su `run_id` M7. Los artefactos M6
+   y `data_provenance.json` se recuperan desde ese mismo run; M7 enlaza el
+   `m6_run_id`, `input_fingerprint` y hashes verificados.
 
 Esta API no fija nombres de modelo registrado, alias ni experimentos: se
 pasan en `F1_SERVING_MODEL_URI` cuando M7 los defina.
@@ -1266,11 +1267,12 @@ pasan en `F1_SERVING_MODEL_URI` cuando M7 los defina.
 ### Ejecución local
 
 ```bash
-pip install -e ".[serve]"     # FastAPI + uvicorn
-pip install mlflow            # a la versión con la que M7 registre el modelo
+python -m pip install -r requirements/runtime-lock.txt
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -e ".[training,serve]" --no-deps
 export MLFLOW_TRACKING_URI=<tracking URI de M7>
-export F1_SERVING_PREPROCESSING_URI=data/modeling/preprocessing/runs/<run_id de M6>
-export F1_SERVING_MODEL_URI=models:/<nombre registrado por M7>/<versión>
+export F1_SERVING_PREPROCESSING_URI=runs:/<run_id de M7>/m6
+export F1_SERVING_MODEL_URI=models:/<nombre registrado por M7>/<versión exacta>
 uvicorn f1_race_intelligence.serving.app:app --host 127.0.0.1 --port 8000
 ```
 
@@ -1317,6 +1319,8 @@ pytest tests/unit/test_serving_api.py    # capa HTTP; requiere el extra serve
 ```
 
 Los tests generan artefactos auténticos de M6 ejecutando su runner sobre
-carreras sintéticas, y usan modelos *stub* que solo registran lo que reciben.
-No usan datos reales ni MLflow. `test_serving_api.py` se omite si FastAPI no
-está instalado, que es lo que ocurre hoy en CI.
+carreras sintéticas. La integración M7–M8 también entrena con esos fixtures,
+recupera el modelo por su versión exacta mediante pyfunc y verifica que los
+artefactos y el modelo pertenecen al mismo run M7. No consulta OpenF1 ni usa
+datos reales. CI instala los extras `training` y `serve` para ejecutar la
+integración y la capa HTTP.

@@ -7,29 +7,36 @@ races. The model receives exactly the encoded matrix M6 writes to
 ``features.parquet``, which is what M7 trains on.
 
 Three artifacts have to belong together: the feature schema, the fitted
-preprocessor and the model. Serving a model with the preprocessing of a
-different M6 run would silently shift every column, so the service checks
-that they agree before it accepts a single request.
+preprocessor and the model. M7's MLflow run URI binds the first two to the
+model's run ID and records their M6 hashes; the service checks that identity
+and content before it accepts a single request.
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
+import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+import joblib
 import numpy as np
 
 from f1_race_intelligence.modeling import preprocessing
 from f1_race_intelligence.modeling.runner import PREPROCESSOR_FILE
 from f1_race_intelligence.serving.contract import FEATURE_SCHEMA_FILE, ArtifactError, ContractError, FeatureContract
-from f1_race_intelligence.serving.model import LoadedModel, ModelLoader
+from f1_race_intelligence.serving.model import LoadedModel, MlflowPyfuncLoader, ModelLoader
 from f1_race_intelligence.storage.store import store_from_uri
 from f1_race_intelligence.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORDS = 1000
+_MLFLOW_PREPROCESSING_URI = re.compile(r"^runs:/([^/]+)/m6/?$")
 
 
 class PredictionError(RuntimeError):
@@ -43,6 +50,8 @@ class PredictionService:
     model: LoadedModel
     preprocessing_uri: str
     max_records: int = DEFAULT_MAX_RECORDS
+    m6_run_id: Optional[str] = None
+    input_fingerprint: Optional[str] = None
 
     @classmethod
     def load(
@@ -55,18 +64,32 @@ class PredictionService:
     ) -> "PredictionService":
         """Load and cross-check the M6 artifacts and the model.
 
-        ``preprocessing_uri`` is the M6 run directory that holds
-        ``preprocessor.joblib`` and ``feature_schema.json``
-        (``.../modeling/preprocessing/runs/<run_id>``), local or ``s3://``.
-        It is read through the project's storage layer, like every stage.
-        The preprocessor is a pickle: only point this at M6 output you trust.
+        ``preprocessing_uri`` may be ``runs:/<M7_run_id>/m6``, which downloads
+        the preprocessor and schema
+        associated with the model, and verifies their M7 provenance hashes.
+        A local or ``s3://`` M6 preprocessing run directory remains supported
+        for the standalone prototype. The preprocessor is a pickle: only point
+        this at artifacts you trust.
         """
         if max_records < 1:
             raise ValueError("max_records must be at least 1")
-        backend = store_from_uri(preprocessing_uri).backend
+        if preprocessing_uri.startswith("runs:/") and not _is_exact_model_version(model_uri):
+            raise ArtifactError(
+                "M7 serving requires an exact registered-model URI "
+                "models:/<registered_name>/<numeric_version>; aliases and latest are not accepted"
+            )
+        m7_run_id, artifact_directory, provenance = _resolve_m7_artifacts(preprocessing_uri)
+        if isinstance(loader, MlflowPyfuncLoader) and m7_run_id is None:
+            raise ArtifactError("MlflowPyfuncLoader requires preprocessing artifacts from the same M7 run")
+        backend = store_from_uri(artifact_directory).backend
         try:
-            schema = backend.read_json(FEATURE_SCHEMA_FILE)
-            fitted = backend.read_joblib(PREPROCESSOR_FILE)
+            schema_bytes = backend.read_bytes(FEATURE_SCHEMA_FILE)
+            preprocessor_bytes = backend.read_bytes(PREPROCESSOR_FILE)
+            if provenance is not None:
+                _verify_m7_artifact_hash(provenance, FEATURE_SCHEMA_FILE, schema_bytes)
+                _verify_m7_artifact_hash(provenance, PREPROCESSOR_FILE, preprocessor_bytes)
+            schema = json.loads(schema_bytes.decode("utf-8"))
+            fitted = joblib.load(io.BytesIO(preprocessor_bytes))
         except FileNotFoundError as exc:
             raise ArtifactError(
                 f"{preprocessing_uri!r} is not an M6 preprocessing run directory "
@@ -76,6 +99,13 @@ class PredictionService:
         contract = FeatureContract.from_schema(schema)
         _check_preprocessor_matches_schema(contract, fitted)
         model = loader.load(model_uri)
+        if m7_run_id is not None and model.run_id != m7_run_id:
+            raise ArtifactError(
+                f"preprocessor artifacts belong to M7 run {m7_run_id!r}, "
+                f"but model {model_uri!r} belongs to {model.run_id!r}"
+            )
+        if m7_run_id is not None and model.input_names is None:
+            raise ArtifactError("M7 serving requires a named model input signature")
         _check_model_matches_schema(contract, model)
 
         logger.info(
@@ -88,7 +118,15 @@ class PredictionService:
                 "input_signature_verified": model.input_names is not None,
             },
         )
-        return cls(contract, fitted, model, preprocessing_uri, max_records)
+        return cls(
+            contract,
+            fitted,
+            model,
+            preprocessing_uri,
+            max_records,
+            provenance.get("m6_run_id") if provenance is not None else None,
+            provenance.get("input_fingerprint") if provenance is not None else None,
+        )
 
     def predict(self, records: Sequence[Mapping[str, Any]]) -> List[float]:
         """One prediction of the target per record, in request order."""
@@ -123,6 +161,11 @@ class PredictionService:
                 "input_signature_verified": self.model.input_names is not None,
             },
             "preprocessing": {"uri": self.preprocessing_uri, **self.contract.describe()},
+            "provenance": {
+                "m7_run_id": self.model.run_id,
+                "m6_run_id": self.m6_run_id,
+                "input_fingerprint": self.input_fingerprint,
+            },
             "max_records": self.max_records,
         }
 
@@ -152,14 +195,67 @@ def _check_model_matches_schema(contract: FeatureContract, model: LoadedModel) -
             extra={"model_uri": model.uri, "detail": "column agreement with M6 cannot be verified"},
         )
         return
-    expected, declared = set(contract.encoded_feature_names), set(model.input_names)
+    expected, declared = contract.encoded_feature_names, model.input_names
     if expected != declared:
-        missing, extra = sorted(expected - declared), sorted(declared - expected)
+        missing, extra = sorted(set(expected) - set(declared)), sorted(set(declared) - set(expected))
+        order_differs = not missing and not extra
         raise ArtifactError(
-            f"model {model.uri!r} expects different columns than this M6 run encodes "
-            f"({len(missing)} missing from the model, {len(extra)} unknown to M6; "
-            f"e.g. missing {missing[:3]}, unknown {extra[:3]}): it was trained on another M6 run"
+            f"model {model.uri!r} has an input signature incompatible with this M6 run "
+            f"({len(missing)} missing from the model, {len(extra)} unknown to M6, "
+            f"order differs: {order_differs}; e.g. missing {missing[:3]}, "
+            f"unknown {extra[:3]}): it was trained on another M6 run"
         )
+
+
+def _resolve_m7_artifacts(preprocessing_uri: str):
+    """Download the preprocessing artifacts and provenance from one M7 run."""
+    if not preprocessing_uri.startswith("runs:/"):
+        return None, preprocessing_uri, None
+    match = _MLFLOW_PREPROCESSING_URI.fullmatch(preprocessing_uri)
+    if match is None:
+        raise ArtifactError("an MLflow preprocessing URI must have the form runs:/<M7_run_id>/m6")
+    run_id = match.group(1)
+    try:
+        from mlflow.artifacts import download_artifacts
+
+        artifact_directory = str(download_artifacts(artifact_uri=preprocessing_uri))
+        provenance_path = download_artifacts(artifact_uri=f"runs:/{run_id}/data_provenance.json")
+        provenance = json.loads(Path(provenance_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ArtifactError(f"could not download M6 artifacts and provenance from M7 run {run_id!r}: {exc}") from exc
+    if (
+        not isinstance(provenance, dict)
+        or not isinstance(provenance.get("m6_run_id"), str)
+        or not provenance["m6_run_id"]
+        or not isinstance(provenance.get("input_fingerprint"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", provenance["input_fingerprint"])
+    ):
+        raise ArtifactError(f"M7 run {run_id!r} has no valid data_provenance.json")
+    return run_id, artifact_directory, provenance
+
+
+def _is_exact_model_version(uri: str) -> bool:
+    if not uri.startswith("models:/"):
+        return False
+    registered_name, separator, version = uri[len("models:/") :].rpartition("/")
+    return bool(separator and registered_name and version.isdecimal())
+
+
+def _verify_m7_artifact_hash(provenance: Mapping[str, Any], artifact: str, content: bytes) -> None:
+    hashes = provenance.get("verified_artifact_hashes")
+    if not isinstance(hashes, list):
+        raise ArtifactError("M7 provenance has no verified artifact hashes")
+    declarations = [
+        item
+        for item in hashes
+        if isinstance(item, dict) and item.get("artifact") == artifact and item.get("split") is None
+    ]
+    if len(declarations) != 1 or not isinstance(declarations[0].get("sha256"), str):
+        raise ArtifactError(f"M7 provenance has no unique SHA-256 for {artifact}")
+    expected = declarations[0]["sha256"]
+    actual = hashlib.sha256(content).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected) or actual != expected:
+        raise ArtifactError(f"{artifact} SHA-256 does not match M7 run provenance")
 
 
 def _as_predictions(raw: Any, count: int) -> List[float]:

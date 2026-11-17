@@ -70,7 +70,7 @@ jobs:
           python -m pip install -r requirements/runtime-lock.txt
           python -m pip install -r requirements/training-lock.txt
           python -m pip install -r requirements/dev-lock.txt
-          python -m pip install --editable ".[training]" --no-deps --no-build-isolation
+          python -m pip install --editable ".[training,serve]" --no-deps --no-build-isolation
           python -m pip check
       - name: Run test suite
         run: python -m pytest -p no:cacheprovider -m "not integration" -ra --junitxml=pytest-results.xml

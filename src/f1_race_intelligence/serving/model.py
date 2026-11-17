@@ -5,6 +5,8 @@ loader goes through ``mlflow.pyfunc``, MLflow's flavour-independent inference
 interface, so whatever M7 logs (scikit-learn, boosting, a neural network)
 and however it is addressed (``models:/<name>/<version>``,
 ``models:/<name>@<alias>``, ``runs:/<run_id>/<path>``) loads the same way.
+The integrated M7 serving path further requires an exact numeric registry
+version and artifacts from that model's M7 run.
 MLflow is imported only when that loader runs: the rest of the package, and
 its tests, work without it.
 
@@ -60,7 +62,8 @@ class MlflowPyfuncLoader:
             from mlflow import pyfunc
         except ImportError as exc:
             raise ModelLoadError(
-                "Loading a registered model needs MLflow, at the version M7 used to log it: pip install mlflow"
+                'Loading a registered model needs the optional dependencies; install '
+                '`python -m pip install -e ".[training,serve]"` from the project checkout'
             ) from exc
 
         try:

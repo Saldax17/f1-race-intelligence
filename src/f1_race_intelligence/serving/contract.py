@@ -82,6 +82,9 @@ class FeatureContract:
         overlap = set(numeric) & set(categorical)
         if overlap:
             raise ArtifactError(f"{FEATURE_SCHEMA_FILE} lists features as both numeric and categorical: {sorted(overlap)}")
+        forbidden = (set(numeric) | set(categorical)) & (set(FORBIDDEN_AS_FEATURES) | {target})
+        if forbidden:
+            raise ArtifactError(f"{FEATURE_SCHEMA_FILE} includes target or leakage features: {sorted(forbidden)}")
         if not encoded:
             raise ArtifactError(f"{FEATURE_SCHEMA_FILE} lists no encoded features")
         return cls(numeric, categorical, encoded, target, traceability)
