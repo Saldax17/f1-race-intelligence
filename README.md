@@ -29,6 +29,8 @@ Kubernetes, ni entrenamiento real sin autorización.
 
 La arquitectura, configuración, comandos, validación sintética y pendientes
 de M7.1 están documentados en [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md).
+La publicación inmutable de versiones registradas de M7 y su carga verificada
+desde M8 se describe en [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md).
 
 > **Actualización (preparación cloud):** M1–M6 son *cloud-ready*: el
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
