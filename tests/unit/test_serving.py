@@ -75,6 +75,15 @@ def test_a_schema_that_is_not_from_m6_is_rejected() -> None:
         FeatureContract.from_schema(
             {"input_features": {"numeric": ["a"], "categorical": ["a"]}, "encoded_feature_names": ["a"], "target": "y"}
         )
+    for forbidden in ("next_lap_time", "pit_duration"):
+        with pytest.raises(ArtifactError, match="target or leakage"):
+            FeatureContract.from_schema(
+                {
+                    "input_features": {"numeric": [forbidden], "categorical": []},
+                    "encoded_feature_names": [forbidden],
+                    "target": "next_lap_time",
+                }
+            )
 
 
 def test_a_directory_without_m6_artifacts_is_rejected(tmp_path) -> None:
@@ -231,10 +240,9 @@ def test_a_model_without_a_signature_loads_but_says_so(m6_run) -> None:
     assert service.describe()["model"]["input_signature_verified"] is False
 
 
-def test_signature_order_does_not_matter(m6_run, schema) -> None:
-    service = load(m6_run, input_names=list(reversed(schema["encoded_feature_names"])))
-
-    assert service.describe()["model"]["input_signature_verified"] is True
+def test_signature_order_must_match_m6(m6_run, schema) -> None:
+    with pytest.raises(ArtifactError, match="order differs"):
+        load(m6_run, input_names=list(reversed(schema["encoded_feature_names"])))
 
 
 # -- model output -------------------------------------------------------------
@@ -319,5 +327,5 @@ def test_mlflow_failures_become_model_load_errors(monkeypatch) -> None:
 def test_without_mlflow_the_error_says_how_to_get_it(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "mlflow", None)  # makes the import fail
 
-    with pytest.raises(ModelLoadError, match="pip install mlflow"):
+    with pytest.raises(ModelLoadError, match=r"\[training,serve\]"):
         MlflowPyfuncLoader().load("models:/example/1")

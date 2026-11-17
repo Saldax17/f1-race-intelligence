@@ -1,9 +1,9 @@
 """FastAPI prototype for local inference (M8).
 
-Run it with the ``serve`` extra installed::
+Run it with the locked ``training`` and ``serve`` extras installed::
 
-    F1_SERVING_PREPROCESSING_URI=data/modeling/preprocessing/runs/<run_id> \
-    F1_SERVING_MODEL_URI=models:/<registered-name>/<version> \
+    F1_SERVING_PREPROCESSING_URI=runs:/<M7_run_id>/m6 \
+    F1_SERVING_MODEL_URI=models:/<registered-name>/<numeric-version> \
     uvicorn f1_race_intelligence.serving.app:app
 
 The service loads once, at startup. If loading fails the process still
