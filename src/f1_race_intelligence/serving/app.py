@@ -6,14 +6,16 @@ Run it with the locked ``training`` and ``serve`` extras installed::
     F1_SERVING_MODEL_URI=models:/<registered-name>/<numeric-version> \
     uvicorn f1_race_intelligence.serving.app:app
 
-The service loads once, at startup. If loading fails the process still
-starts: ``/health`` answers 503 with the reason and ``/predict`` refuses
-requests, so a misconfiguration is visible instead of a crash loop.
+The service loads once, at startup. ``/live`` reports process liveness;
+``/health`` reports model readiness without returning internal load errors.
+If loading fails, ``/predict`` refuses requests and a correlation ID connects
+the generic HTTP response to the technical server log.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional
 
@@ -58,12 +60,16 @@ def create_app(service_factory: Optional[Callable[[], PredictionService]] = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.service, app.state.load_error = None, None
+        app.state.service, app.state.load_error_id = None, None
         try:
             app.state.service = factory()
-        except Exception as exc:  # reported by /health, never swallowed silently
-            app.state.load_error = f"{type(exc).__name__}: {exc}"
-            logger.error("serving_load_failed", extra={"error": app.state.load_error})
+        except Exception:  # reported by /health, never swallowed silently
+            app.state.load_error_id = uuid.uuid4().hex
+            logger.exception(
+                "serving_load_failed error_id=%s",
+                app.state.load_error_id,
+                extra={"error_id": app.state.load_error_id},
+            )
         yield
 
     app = FastAPI(
@@ -74,10 +80,23 @@ def create_app(service_factory: Optional[Callable[[], PredictionService]] = None
     )
 
     def unavailable(request: Request) -> JSONResponse:
+        error_id = request.app.state.load_error_id
+        if error_id is None:
+            error_id = uuid.uuid4().hex
+            request.app.state.load_error_id = error_id
+            logger.error("serving_not_ready", extra={"error_id": error_id})
         return JSONResponse(
             status_code=503,
-            content={"status": "unavailable", "reason": request.app.state.load_error or "service not loaded"},
+            content={
+                "status": "unavailable",
+                "message": "Model service is not ready.",
+                "error_id": error_id,
+            },
         )
+
+    @app.get("/live")
+    def live():
+        return {"status": "ok"}
 
     @app.get("/health")
     def health(request: Request):

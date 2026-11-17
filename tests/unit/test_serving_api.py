@@ -45,6 +45,7 @@ def records(m6_run, count=2):
 
 def test_health_and_model_info_when_loaded(m6_run) -> None:
     with client_for(m6_run) as client:
+        assert client.get("/live").json() == {"status": "ok"}
         assert client.get("/health").json() == {"status": "ok"}
         info = client.get("/model-info").json()
 
@@ -111,16 +112,31 @@ def test_invalid_model_output_is_500(m6_run) -> None:
     assert "non-finite" in response.json()["detail"]
 
 
-def test_a_service_that_failed_to_load_reports_why_and_serves_nothing() -> None:
+def test_load_failure_details_are_logged_but_not_returned_over_http(caplog) -> None:
+    internal_details = r"C:\private\mlflow\tracking.db failed with credential=secret-token"
+
     def broken() -> PredictionService:
-        raise RuntimeError("set F1_SERVING_PREPROCESSING_URI and F1_SERVING_MODEL_URI")
+        raise RuntimeError(internal_details)
 
     with TestClient(create_app(broken)) as client:
+        live = client.get("/live")
         health = client.get("/health")
-        assert health.status_code == 503
-        assert "F1_SERVING_MODEL_URI" in health.json()["reason"]
-        assert client.get("/model-info").status_code == 503
-        assert client.post("/predict", json={"records": [{}]}).status_code == 503
+        model_info = client.get("/model-info")
+        prediction = client.post("/predict", json={"records": [{}]})
+
+    assert live.status_code == 200
+    assert live.json() == {"status": "ok"}
+    for response in (health, model_info, prediction):
+        assert response.status_code == 503
+        assert response.json()["status"] == "unavailable"
+        assert response.json()["message"] == "Model service is not ready."
+        assert response.json()["error_id"]
+        assert internal_details not in response.text
+        assert "secret-token" not in response.text
+    assert health.json()["error_id"] == model_info.json()["error_id"] == prediction.json()["error_id"]
+    assert internal_details in caplog.text
+    assert "secret-token" in caplog.text
+    assert health.json()["error_id"] in caplog.text
 
 
 def test_the_default_app_needs_both_locations(monkeypatch) -> None:
@@ -131,4 +147,6 @@ def test_the_default_app_needs_both_locations(monkeypatch) -> None:
         response = client.get("/health")
 
     assert response.status_code == 503
-    assert app_module.MODEL_URI_ENV in response.json()["reason"]
+    assert response.json()["message"] == "Model service is not ready."
+    assert response.json()["error_id"]
+    assert app_module.MODEL_URI_ENV not in response.text

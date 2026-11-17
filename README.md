@@ -1216,7 +1216,7 @@ POST /predict  {"records": [ {features de M5, sin transformar}, … ]}
 | `serving/contract.py` | Contrato de entrada, leído del `feature_schema.json` de M6 (ninguna lista de features escrita a mano) |
 | `serving/model.py` | Interfaz `ModelLoader`; `MlflowPyfuncLoader` importa MLflow solo al cargar |
 | `serving/service.py` | Recupera artefactos M7 por `runs:/` (o M6 local/`s3://`), comprueba identidad y hashes, y predice |
-| `serving/app.py` | FastAPI: `GET /health`, `GET /model-info`, `POST /predict` |
+| `serving/app.py` | FastAPI: `GET /live` (liveness), `GET /health` (readiness), `GET /model-info`, `POST /predict` |
 
 Al arrancar, el servicio puede recuperar `preprocessor.joblib`,
 `feature_schema.json` y `data_provenance.json` del mismo run M7 que produjo el
@@ -1284,7 +1284,10 @@ La documentación interactiva queda en `http://127.0.0.1:8000/docs`.
 ```http
 GET /health
 → 200 {"status": "ok"}
-→ 503 {"status": "unavailable", "reason": "RuntimeError: set F1_SERVING_MODEL_URI"}
+→ 503 {"status": "unavailable", "message": "Model service is not ready.", "error_id": "<id>"}
+
+GET /live
+→ 200 {"status": "ok"}   # liveness is independent of model readiness
 ```
 
 ```http
