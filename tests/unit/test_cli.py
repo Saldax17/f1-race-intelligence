@@ -206,7 +206,7 @@ def test_m3_m4_m5_chain_for_one_session_locally(build_raw, config_file, tmp_path
     report = json.loads(next((tmp_path / "validation").glob("validation_report_*.json")).read_text(encoding="utf-8"))
     assert report["source"]["filter"]["session_key"] == SESSION_KEY
     status_lines = capsys.readouterr().err
-    assert "m3: OK" in status_lines and "m5: OK" in status_lines
+    assert "m3: PARTIAL" in status_lines and "m5: OK" in status_lines
 
 
 def test_a_session_with_no_data_fails_the_job(config_file) -> None:
@@ -326,6 +326,50 @@ def test_an_unexpected_exception_is_reported_as_a_failed_stage(config_file, monk
     monkeypatch.setitem(cli.STAGE_RUNNERS, "m5", explode)
 
     assert cli.main(["--stage", "m5", "--config", str(config_file)]) == cli.EXIT_FAILED
+
+
+@pytest.mark.parametrize(
+    ("global_status", "expected_status", "expected_label"),
+    [
+        ("PASS", "succeeded", "m3: OK"),
+        ("WARNING", "partial", "m3: PARTIAL"),
+        ("FAIL", "failed", "m3: FAILED (non-strict; pipeline continues)"),
+    ],
+)
+def test_m3_global_status_is_not_reported_as_success_unless_pass(
+    config_file, monkeypatch, caplog, capsys, global_status, expected_status, expected_label
+) -> None:
+    monkeypatch.setitem(
+        cli.STAGE_RUNNERS,
+        "m3",
+        lambda ctx: cli.StageOutcome(ok=True, summary={"global_status": global_status}),
+    )
+
+    with caplog.at_level("INFO", logger="f1_race_intelligence.cli"):
+        assert cli.main(["--stage", "m3", "--config", str(config_file)]) == cli.EXIT_OK
+
+    finished = next(record for record in caplog.records if record.getMessage() == "stage_finished")
+    assert finished.status == expected_status
+    assert expected_label in capsys.readouterr().err
+
+
+def test_m6_warnings_are_logged_as_a_partial_stage(config_file, monkeypatch, caplog, capsys) -> None:
+    monkeypatch.setitem(
+        cli.STAGE_RUNNERS,
+        "m6",
+        lambda ctx: cli.StageOutcome(
+            ok=True,
+            summary={"verdict": "VALID_WITH_WARNINGS", "run_id": "m6-run-1"},
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="f1_race_intelligence.cli"):
+        assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_OK
+
+    finished = next(record for record in caplog.records if record.getMessage() == "stage_finished")
+    assert finished.status == "partial"
+    assert finished.summary["run_id"] == "m6-run-1"
+    assert "m6: PARTIAL" in capsys.readouterr().err
 
 
 def test_copy_raw_between_layouts(build_raw, config_file, raw_root, tmp_path) -> None:

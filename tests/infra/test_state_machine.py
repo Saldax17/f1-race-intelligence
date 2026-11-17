@@ -41,6 +41,13 @@ def definition(asl_text: str, pipeline_enabled: str = "false") -> Dict[str, Any]
     return json.loads(rendered)
 
 
+def walk_states(states: Dict[str, Any]):
+    for state in states.values():
+        yield state
+        if state.get("Type") == "Map":
+            yield from walk_states(state["ItemProcessor"]["States"])
+
+
 # -- JSONPath and intrinsic functions (the subset the definition uses) --------------
 
 _MISSING = object()
@@ -441,6 +448,22 @@ def test_available_and_enabled_runs_every_stage_of_every_session(asl_text) -> No
                            "CheckForConcurrentRun", "IsAnotherRunInProgress"]
     assert [name for name, _ in world.tasks].count("M2_Extraction") == len(SESSIONS)
     assert world.alerts == []
+
+
+def test_every_fargate_task_receives_the_pipeline_execution_id(asl_text) -> None:
+    asl = json.loads(asl_text)
+    tasks = [
+        state
+        for state in walk_states(asl["States"])
+        if state.get("Resource") == ECS_RUN_TASK_SYNC
+    ]
+
+    assert len(tasks) == 6
+    for task in tasks:
+        environment = task["Parameters"]["Overrides"]["ContainerOverrides"][0]["Environment"]
+        assert environment == [
+            {"Name": "F1_PIPELINE_EXECUTION_ID", "Value.$": "$$.Execution.Id"}
+        ]
 
 
 def test_a_concurrent_run_stops_before_starting_any_task(asl_text) -> None:

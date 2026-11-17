@@ -111,6 +111,35 @@ def test_schedule_is_disabled_by_default(template) -> None:
     assert rule["State"] == {"Ref": "AvailabilityScheduleState"}
 
 
+def test_sustained_unavailable_alarm_only_exists_for_sufficient_check_cadence(template) -> None:
+    supported = {"rate(15 minutes)", "rate(30 minutes)"}
+    condition = template["Conditions"]["AvailabilityAlarmCadence"]
+    assert condition == {
+        "Fn::Or": [
+            {"Fn::Equals": [{"Ref": "AvailabilitySchedule"}, "rate(15 minutes)"]},
+            {"Fn::Equals": [{"Ref": "AvailabilitySchedule"}, "rate(30 minutes)"]},
+        ]
+    }
+    configured_cadences = {
+        comparison["Fn::Equals"][1]
+        for comparison in condition["Fn::Or"]
+    }
+    assert configured_cadences == supported
+    assert template["Parameters"]["AvailabilitySchedule"]["Default"] in configured_cadences
+
+    alarm = template["Resources"]["OpenF1UnavailableSustainedAlarm"]
+    assert alarm["Condition"] == "AvailabilityAlarmCadence"
+    allowed = set(template["Parameters"]["AvailabilitySchedule"]["AllowedValues"])
+    assert supported <= allowed
+    assert allowed - configured_cadences == {
+        "rate(1 hour)",
+        "rate(3 hours)",
+        "rate(6 hours)",
+        "rate(12 hours)",
+        "rate(1 day)",
+    }
+
+
 @pytest.mark.parametrize("environment", DEPLOY_ENVIRONMENTS)
 def test_samconfig_keeps_the_schedule_and_the_pipeline_off(samconfig, environment) -> None:
     overrides = samconfig_overrides(samconfig, environment)
@@ -335,6 +364,7 @@ def test_availability_results_reach_the_state_machine_unmodified(template) -> No
     function = template["Resources"]["AvailabilityCheckerFunction"]["Properties"]
     rule = template["Resources"]["AvailabilityResultRule"]["Properties"]
 
+    assert function["Environment"]["Variables"]["F1_COMPONENT"] == "availability-checker"
     assert function["EventInvokeConfig"]["DestinationConfig"]["OnSuccess"]["Type"] == "EventBridge"
     assert function["EventInvokeConfig"]["DestinationConfig"]["OnFailure"] == {"Type": "SNS", "Destination": {"Ref": "AlertTopic"}}
     assert rule["Targets"][0]["InputPath"] == "$.detail.responsePayload"
@@ -343,11 +373,84 @@ def test_availability_results_reach_the_state_machine_unmodified(template) -> No
 
 @pytest.mark.parametrize("alarm", [
     "AvailabilityCheckerErrorsAlarm",
+    "AvailabilityCheckerThrottlesAlarm",
     "PipelineExecutionsFailedAlarm",
     "OrchestrationRulesFailedInvocationsAlarm",
+    "OpenF1UnavailableSustainedAlarm",
 ])
 def test_critical_alarms_notify_the_alert_topic(template, alarm) -> None:
     assert template["Resources"][alarm]["Properties"]["AlarmActions"] == [{"Ref": "AlertTopic"}]
+
+
+def test_lambda_throttles_alarm_uses_a_real_metric_and_conservative_missing_data(template) -> None:
+    alarm = template["Resources"]["AvailabilityCheckerThrottlesAlarm"]["Properties"]
+
+    assert alarm["Namespace"] == "AWS/Lambda"
+    assert alarm["MetricName"] == "Throttles"
+    assert alarm["Dimensions"] == [{"Name": "FunctionName", "Value": {"Ref": "AvailabilityCheckerFunction"}}]
+    assert (alarm["Statistic"], alarm["Period"], alarm["EvaluationPeriods"], alarm["Threshold"]) == ("Sum", 3600, 1, 1)
+    assert alarm["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
+    assert alarm["TreatMissingData"] == "notBreaching"
+    assert alarm["OKActions"] == [{"Ref": "AlertTopic"}]
+
+
+def test_pipeline_alarm_covers_failures_timeouts_and_aborts(template) -> None:
+    alarm = template["Resources"]["PipelineExecutionsFailedAlarm"]["Properties"]
+    metric_names = {
+        metric["MetricStat"]["Metric"]["MetricName"]
+        for metric in alarm["Metrics"]
+        if "MetricStat" in metric
+    }
+
+    assert metric_names == {"ExecutionsFailed", "ExecutionsTimedOut", "ExecutionsAborted"}
+    for metric in alarm["Metrics"]:
+        if "MetricStat" in metric:
+            assert metric["MetricStat"]["Metric"]["Namespace"] == "AWS/States"
+            assert metric["MetricStat"]["Metric"]["Dimensions"] == [
+                {"Name": "StateMachineArn", "Value": {"Ref": "PipelineStateMachine"}}
+            ]
+    assert alarm["Threshold"] == 1
+    assert alarm["EvaluationPeriods"] == 1
+    assert alarm["TreatMissingData"] == "notBreaching"
+
+
+def test_dashboard_only_references_metrics_emitted_by_deployed_components(template) -> None:
+    resource = template["Resources"]["ObservabilityDashboard"]
+    assert resource["Type"] == "AWS::CloudWatch::Dashboard"
+    body_template = resource["Properties"]["DashboardBody"]["Fn::Sub"]
+    placeholders = set(re.findall(r"\$\{([^}]+)\}", body_template))
+    assert placeholders == {
+        "AWS::Region",
+        "ProjectName",
+        "Environment",
+        "PipelineStateMachine",
+        "AvailabilityCheckerFunction",
+    }
+
+    body = json.loads(re.sub(r"\$\{[^}]+\}", "test-value", body_template))
+    assert len(body["widgets"]) == 7
+    metric_names = {
+        (metric[0], metric[1])
+        for widget in body["widgets"]
+        for metric in widget["properties"]["metrics"]
+    }
+    assert metric_names == {
+        ("AWS/States", "ExecutionsStarted"),
+        ("AWS/States", "ExecutionsSucceeded"),
+        ("AWS/States", "ExecutionsFailed"),
+        ("AWS/States", "ExecutionsTimedOut"),
+        ("AWS/States", "ExecutionsAborted"),
+        ("AWS/States", "ExecutionTime"),
+        ("AWS/Lambda", "Invocations"),
+        ("AWS/Lambda", "Errors"),
+        ("AWS/Lambda", "Throttles"),
+        ("AWS/Lambda", "Duration"),
+        ("AWS/Events", "FailedInvocations"),
+        ("test-value/test-value", "OpenF1Available"),
+        ("test-value/test-value", "OpenF1LatencyMs"),
+    }
+    assert "model-serving" not in json.dumps(body).lower()
+    assert template["Outputs"]["ObservabilityDashboardName"]["Value"] == {"Ref": "ObservabilityDashboard"}
 
 
 def test_no_model_hosting_or_training_resources(template) -> None:
@@ -402,6 +505,7 @@ def test_the_task_environment_selects_s3_and_holds_no_secret(template) -> None:
     environment = {item["Name"]: item["Value"] for item in pipeline_container(template)["Environment"]}
 
     assert environment["F1_ENVIRONMENT"] == "aws"
+    assert environment["F1_COMPONENT"] == "pipeline"
     assert environment["F1_CONFIG_PATH"] == "/app/configs/config.yaml"
     assert environment["F1_STORAGE_BUCKET"] == {"Ref": "DataBucket"}
     # The task role only grants the lake's root prefixes: no storage prefix.

@@ -65,7 +65,8 @@ Parameters:
     Description: >-
       How often the OpenF1 availability checker runs. Limited to non-aggressive
       frequencies on purpose: the check itself is one request, but OpenF1 is a shared
-      public API.
+      public API. The sustained-unavailability alarm is created only for the 15- and
+      30-minute cadences; slower cadences cannot reliably supply all six hourly periods.
 
   AvailabilityScheduleState:
     Type: String
@@ -120,6 +121,9 @@ Conditions:
   UseGeneratedBucketName: !Equals [!Ref S3BucketName, ""]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
   HasPipelineImage: !Not [!Equals [!Ref PipelineImageUri, ""]]
+  AvailabilityAlarmCadence: !Or
+    - !Equals [!Ref AvailabilitySchedule, "rate(15 minutes)"]
+    - !Equals [!Ref AvailabilitySchedule, "rate(30 minutes)"]
 
 Rules:
   # Enabling the pipeline without a task image would start executions that can
@@ -752,6 +756,7 @@ Resources:
           # Only non-secret settings; credentials come from the task role.
           Environment:
             - { Name: F1_ENVIRONMENT, Value: aws }
+            - { Name: F1_COMPONENT, Value: pipeline }
             - { Name: F1_CONFIG_PATH, Value: /app/configs/config.yaml }
             - { Name: F1_STORAGE_BUCKET, Value: !Ref DataBucket }
             - { Name: F1_STORAGE_REGION, Value: !Ref AWS::Region }
@@ -781,6 +786,7 @@ Resources:
       Environment:
         Variables:
           ENVIRONMENT: !Ref Environment
+          F1_COMPONENT: availability-checker
           OPENF1_BASE_URL: !Ref OpenF1BaseUrl
           OPENF1_PROBE_PATH: /sessions?session_key=7953
           OPENF1_TIMEOUT_SECONDS: "5"
@@ -906,6 +912,24 @@ Resources:
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
 
+  AvailabilityCheckerThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-availability-checker-throttles"
+      AlarmDescription: The availability checker was throttled at least once in the last hour.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref AvailabilityCheckerFunction }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
   PipelineExecutionsFailedAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -993,11 +1017,12 @@ Resources:
 
   OpenF1UnavailableSustainedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: AvailabilityAlarmCadence
     Properties:
       AlarmName: !Sub "${ProjectName}-${Environment}-openf1-unavailable-sustained"
       AlarmDescription: >-
-        Every availability check in the last 6 hours reported OpenF1 as unavailable.
-        Short outages (live sessions, rate limits) are expected and do not alarm.
+        Created only for 15- or 30-minute checks. Alerts after six consecutive hourly
+        periods report OpenF1 unavailable; short outages do not alarm.
       Namespace: !Sub "${ProjectName}/${Environment}"
       MetricName: OpenF1Available
       Dimensions:
@@ -1011,6 +1036,126 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
+
+  ObservabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${Environment}-operations"
+      DashboardBody: !Sub |2
+            {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Pipeline execution outcomes",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "${PipelineStateMachine}", {"label": "Started"}],
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${PipelineStateMachine}", {"label": "Succeeded"}],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${PipelineStateMachine}", {"label": "Failed"}],
+                  ["AWS/States", "ExecutionsTimedOut", "StateMachineArn", "${PipelineStateMachine}", {"label": "Timed out"}],
+                  ["AWS/States", "ExecutionsAborted", "StateMachineArn", "${PipelineStateMachine}", {"label": "Aborted"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Pipeline execution duration",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${PipelineStateMachine}", {"stat": "Average", "label": "Average (ms)"}],
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${PipelineStateMachine}", {"stat": "Maximum", "label": "Maximum (ms)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Availability checker requests and faults",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AvailabilityCheckerFunction}", {"label": "Invocations"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${AvailabilityCheckerFunction}", {"label": "Errors"}],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${AvailabilityCheckerFunction}", {"label": "Throttles"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Availability checker duration",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${AvailabilityCheckerFunction}", {"stat": "Average", "label": "Average (ms)"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${AvailabilityCheckerFunction}", {"stat": "Maximum", "label": "Maximum (ms)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "OpenF1 availability",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["${ProjectName}/${Environment}", "OpenF1Available", "Environment", "${Environment}", {"stat": "Maximum", "label": "Available (1=yes, 0=no)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "max": 1}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "OpenF1 probe latency",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["${ProjectName}/${Environment}", "OpenF1LatencyMs", "Environment", "${Environment}", {"stat": "Average", "label": "Average (ms)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "EventBridge invocation failures",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/Events", "FailedInvocations", "RuleName", "${ProjectName}-${Environment}-openf1-availability-schedule", {"label": "Availability schedule"}],
+                  ["AWS/Events", "FailedInvocations", "EventBusName", "${ProjectName}-${Environment}-orchestration", "RuleName", "${ProjectName}-${Environment}-availability-result", {"label": "Availability result"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            }
+          ]
+            }
 
 Outputs:
   DataBucketName:
@@ -1038,6 +1183,9 @@ Outputs:
     Description: SNS topic for critical infrastructure alerts.
     Value: !Ref AlertTopic
     Export: { Name: !Sub "${AWS::StackName}-AlertTopicArn" }
+  ObservabilityDashboardName:
+    Description: CloudWatch dashboard for pipeline and availability operations.
+    Value: !Ref ObservabilityDashboard
   PipelineImageRepositoryUri:
     Description: ECR repository for the M2-M6 batch image.
     Value: !GetAtt PipelineImageRepository.RepositoryUri

@@ -72,7 +72,7 @@ def check_availability(
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> Dict[str, Any]:
     """Probe ``url`` once and describe the outcome. Never raises for HTTP or network errors."""
-    checked_at = now().isoformat()
+    started_at = now()
     request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
     started = time.monotonic()
 
@@ -95,13 +95,18 @@ def check_availability(
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
         error = f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
 
+    duration_ms = round((time.monotonic() - started) * 1000, 1)
+    finished_at = now()
     result: Dict[str, Any] = {
         **classify(status_code),
         "status_code": status_code,
-        "checked_at": checked_at,
+        "checked_at": started_at.isoformat(),
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
         "source": SOURCE,
         "endpoint": url,
-        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        "latency_ms": duration_ms,
+        "duration_ms": duration_ms,
     }
     # Same verdict under the name the orchestration contract also uses.
     result["historical_available"] = result["available"]
@@ -154,7 +159,12 @@ def _log(result: Dict[str, Any]) -> None:
     extracted from the log line, which the function may already write.
     """
     namespace = os.environ.get("METRICS_NAMESPACE")
-    line: Dict[str, Any] = {"message": "openf1_availability_checked", **result}
+    line: Dict[str, Any] = {
+        "message": "openf1_availability_checked",
+        **result,
+        "component": os.environ.get("F1_COMPONENT", "availability-checker"),
+        "status": "completed",
+    }
     if namespace:
         line["_aws"] = {
             "Timestamp": int(time.time() * 1000),

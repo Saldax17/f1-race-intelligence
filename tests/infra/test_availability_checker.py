@@ -128,6 +128,9 @@ def test_the_result_is_json_serialisable_and_stamped_in_utc() -> None:
     assert json.loads(json.dumps(result)) == result
     assert result["checked_at"] == "2026-09-16T12:00:00+00:00"
     assert isinstance(result["latency_ms"], float)
+    assert result["started_at"] == "2026-09-16T12:00:00+00:00"
+    assert result["finished_at"] == "2026-09-16T12:00:00+00:00"
+    assert result["duration_ms"] == result["latency_ms"]
 
 
 def test_handler_uses_environment_configuration_and_logs_an_emf_metric(monkeypatch, capsys) -> None:
@@ -135,6 +138,7 @@ def test_handler_uses_environment_configuration_and_logs_an_emf_metric(monkeypat
         monkeypatch.setenv("OPENF1_BASE_URL", base + "/v1/")
         monkeypatch.setenv("OPENF1_PROBE_PATH", "/sessions?session_key=7953")
         monkeypatch.setenv("ENVIRONMENT", "dev")
+        monkeypatch.setenv("F1_COMPONENT", "availability-checker")
         monkeypatch.setenv("METRICS_NAMESPACE", "f1-race-intelligence/dev")
 
         result = app.handler({"source": "aws.events"}, SimpleNamespace(aws_request_id="req-1"))
@@ -146,8 +150,16 @@ def test_handler_uses_environment_configuration_and_logs_an_emf_metric(monkeypat
 
     log = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert log["message"] == "openf1_availability_checked"
+    assert log["component"] == "availability-checker"
+    assert log["status"] == "completed"
     assert log["OpenF1Available"] == 0
-    assert log["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "f1-race-intelligence/dev"
+    metric_definition = log["_aws"]["CloudWatchMetrics"][0]
+    assert metric_definition["Namespace"] == "f1-race-intelligence/dev"
+    assert metric_definition["Dimensions"] == [["Environment"]]
+    assert metric_definition["Metrics"] == [
+        {"Name": "OpenF1Available", "Unit": "Count"},
+        {"Name": "OpenF1LatencyMs", "Unit": "Milliseconds"},
+    ]
 
 
 def test_handler_defaults_do_not_depend_on_optional_variables(monkeypatch, capsys) -> None:
@@ -157,7 +169,14 @@ def test_handler_defaults_do_not_depend_on_optional_variables(monkeypatch, capsy
         calls.append((url, timeout))
         return {**app.classify(200), "status_code": 200, "checked_at": "x", "source": "openf1", "endpoint": url, "latency_ms": 1.0, "historical_available": True}
 
-    for name in ("OPENF1_BASE_URL", "OPENF1_PROBE_PATH", "OPENF1_TIMEOUT_SECONDS", "METRICS_NAMESPACE", "ENVIRONMENT"):
+    for name in (
+        "OPENF1_BASE_URL",
+        "OPENF1_PROBE_PATH",
+        "OPENF1_TIMEOUT_SECONDS",
+        "METRICS_NAMESPACE",
+        "ENVIRONMENT",
+        "F1_COMPONENT",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(app, "check_availability", fake_check)
 
@@ -165,7 +184,9 @@ def test_handler_defaults_do_not_depend_on_optional_variables(monkeypatch, capsy
 
     assert calls == [("https://api.openf1.org/v1/sessions?session_key=7953", 5.0)]
     assert result["environment"] == "unknown"
-    assert "_aws" not in json.loads(capsys.readouterr().out)
+    log = json.loads(capsys.readouterr().out)
+    assert log["component"] == "availability-checker"
+    assert "_aws" not in log
 
 
 def test_the_function_never_starts_anything_or_touches_aws() -> None:
