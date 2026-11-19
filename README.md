@@ -6,8 +6,9 @@ pilotos de Fórmula 1 a partir de datos históricos de la API pública
 [OpenF1](https://openf1.org/) (documentación: https://openf1.org/docs/).
 
 La unidad de análisis objetivo es **Piloto × Carrera × Vuelta**, con la meta
-futura de predecir `next_lap_time` (tiempo de la siguiente vuelta). Esa parte
-predictiva **no** está implementada todavía — ver [Limitaciones actuales](#limitaciones-actuales).
+de predecir `next_lap_time` (tiempo de la siguiente vuelta). M7 incorpora un
+pipeline reproducible de regresión lineal y evaluación sobre los splits M6;
+el entrenamiento con datos reales sigue pendiente de autorización.
 
 ## 1. Objetivo de esta primera etapa
 
@@ -23,15 +24,21 @@ Esta etapa construye únicamente la base de ingeniería de datos del proyecto:
   descubre meetings y sesiones desde la API y registra cada ejecución en un
   manifest (ver [Pipeline de extracción histórica](#9-pipeline-de-extracción-histórica)).
 
-No se implementa (todavía) Machine Learning, Deep Learning, feature
-engineering, entrenamiento, MLflow, FastAPI, Docker, Kubernetes, AWS,
-CI/CD ni dashboards.
+No se implementan LSTM/GRU, métodos estadísticos avanzados, FastAPI,
+Kubernetes, ni entrenamiento real sin autorización.
 
-> **Actualización (preparación cloud):** M1–M6 ya son *cloud-ready*: el
+La arquitectura, configuración, comandos, validación sintética y pendientes
+de M7.1 están documentados en [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md).
+La publicación inmutable de versiones registradas de M7 y su carga verificada
+desde M8 se describe en [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md).
+
+> **Actualización (preparación cloud):** M1–M6 son *cloud-ready*: el
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
-> job batch independiente (por sesión) y existe una imagen Docker. **AWS
-> todavía NO está desplegado**: no hay bucket, roles ni infraestructura
-> creados. Ver [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
+> job batch independiente y existe una imagen Docker. El estado de diseño,
+> código, validación local y despliegue se mantiene en
+> [infra/aws_status.json](infra/aws_status.json); los estados de despliegue y
+> pruebas reales son **NO VERIFICABLES** sin evidencia humana. Ver
+> [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
 
 ## 2. Arquitectura
 
@@ -104,7 +111,7 @@ completamente desacoplada del transporte HTTP.
 | `validation/specs.py` | Qué se espera de cada endpoint, de forma declarativa | Ajustar una regla es editar datos, no lógica |
 | `validation/validators.py` | Las comprobaciones, genéricas sobre las specs | Una sola pasada por archivo, sin importar cuántas reglas haya |
 | `validation/runner.py` | Orquestar la validación y producir el reporte | Streaming: la memoria no depende del tamaño del dataset |
-| `utils/files.py` | Escrituras que no pierden archivos | Ni sobrescritura silenciosa ni archivos a medio escribir |
+| `storage/backends/` | Escrituras que no pierden archivos y JSON idéntico byte a byte | Ni sobrescritura silenciosa, ni archivos a medio escribir, ni bytes que dependan del sistema operativo |
 
 ### Decisiones respecto a la estructura sugerida
 
@@ -139,7 +146,8 @@ f1-race-intelligence/
 │   └── config.aws.yaml        # overlay para environment=aws (solo diferencias)
 │
 ├── requirements/
-│   └── runtime-lock.txt       # versiones exactas para la imagen Docker
+│   ├── runtime-lock.txt       # runtime M1-M6 e imagen Docker
+│   └── training-lock.txt      # cierre exacto para el extra M7
 │
 ├── data/
 │   ├── raw/
@@ -200,9 +208,11 @@ f1-race-intelligence/
 │       │
 │       ├── consolidation/ features/ modeling/   # M4, M5, M6
 │       │
+│       ├── serving/                   # prototipo local de inferencia (M8, sección 19)
+│       │
 │       └── utils/
 │           ├── __init__.py
-│           ├── files.py
+│           ├── files.py                   # Compatibilidad deprecada; usar storage/backends
 │           └── logging.py                 # JSON a stdout + log_context(stage, year, session…)
 │
 └── tests/
@@ -222,6 +232,14 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -e ".[dev]"
+```
+
+M7 es opcional: para entrenamiento local instala el lock específico y activa
+el extra, sin añadir MLflow al runtime batch M1-M6:
+
+```bash
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -e ".[training]" --no-deps
 ```
 
 Dependencias principales: `httpx` (HTTP), `tenacity` (retries con backoff),
@@ -714,7 +732,9 @@ listos para entrenar. **No entrena ningún modelo.**
 python -m f1_race_intelligence.modeling.runner
 ```
 
-Salida en `data/modeling/`, con el reporte en `data/modeling/reports/`.
+Salida en `data/modeling/`, versionada bajo `runs/<run_id>/` dentro de cada
+prefijo de split y de preprocessing. El reporte queda en
+`data/modeling/reports/`.
 
 ### Orden de las operaciones
 
@@ -765,7 +785,8 @@ como ceros en vez de romper el pipeline.
 
 ### Guardas anti-leakage
 
-Doce comprobaciones, once bloqueantes. Las tres centrales funcionan
+Las comprobaciones de M6 incluyen la completitud de los tres splits y las
+guardas anti-leakage existentes. Las tres centrales funcionan
 **re-ajustando**: se entrena un transformador nuevo solo con train y otro con
 train + validation, y el que está en uso debe coincidir con el primero y
 diferir del segundo. Una guarda que solo inspeccionara nuestra intención
@@ -774,18 +795,32 @@ estaría de acuerdo con nosotros incluso estando equivocados.
 Si la comparación no puede distinguir ambos ajustes, se reporta como
 **inconcluyente**, no como aprobada.
 
-Un run que falle una guarda bloqueante **no escribe nada**.
+Un split vacío, una guarda bloqueante omitida o un resultado inconcluyente
+impiden el veredicto válido y la publicación. Con `fail_on_leakage=false`,
+los fallos de guardas sí pueden dejar artefactos para diagnóstico, pero el
+veredicto sigue siendo `INVALID`/`INCOMPLETE`/`INCONCLUSIVE` y M6 sale con
+código distinto de cero.
 
 ### Salida
 
 ```
 data/modeling/
-├── train/dataset.parquet     # filas con trazabilidad, sin transformar
-├── train/features.parquet    # matriz codificada + target + claves key_*
-├── validation/ , test/       # idem
-├── preprocessing/preprocessor.joblib   # el transformador ajustado con train
+├── train/runs/<run_id>/{dataset,features}.parquet
+├── validation/runs/<run_id>/… ; test/runs/<run_id>/…
+├── preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
 └── reports/
 ```
+
+Las rutas de los prefijos configurados y de cada split se conservan; cada
+ejecución escribe en su propio directorio para no sobrescribir artefactos
+anteriores. El reporte contiene el `run_id`, SHA-256 de lock y configuración,
+commit de origen, estado de limpieza del checkout, fingerprint de entradas,
+estados de guardas, veredicto global y hashes de artefactos releídos. Si el
+commit o la limpieza del checkout no pueden determinarse, o falta el lock,
+el reporte deja el dato explícitamente ausente y M6 no informa éxito.
+`verify-m6` permite comprobar
+un reporte y sus artefactos sin reescribirlos:
+`python -m f1_race_intelligence --stage verify-m6 --report <ruta>`.
 
 Cada split se escribe dos veces: sin transformar, para poder rastrear
 cualquier fila hasta M5 y de ahí al raw, y codificado, que es lo que lee un
@@ -796,12 +831,61 @@ combustible — y sin el prefijo la clave sobrescribiría a la feature.
 Todo en `data/modeling/` está fuera de Git y se reproduce volviendo a
 ejecutar el módulo.
 
+### Huellas de contenido en el reporte
+
+Una ruta dice dónde estaba un dato; un hash dice qué era. El reporte de M6
+registra el SHA-256 de los bytes reales, de modo que cualquiera puede
+volver a calcularlo y comprobarlo:
+
+| campo | contenido |
+|---|---|
+| `schema_version` / `verdict` | versión 2 y estado global: `VALID`, `VALID_WITH_WARNINGS`, `INCOMPLETE`, `INCONCLUSIVE`, `INVALID` o `ABORTED` |
+| `run_id` | identificador único que también versiona las rutas de artefactos |
+| `source_commit` / `source_dirty` | revisión real de Git y estado de limpieza, si están disponibles |
+| `dependency_lock_sha256` | SHA-256 de `requirements/runtime-lock.txt` |
+| `config_fingerprint` | SHA-256 de la configuración M6 sin ubicaciones de storage |
+| `source.inputs` | cada archivo de M5 leído: `input` (`session_<s>.parquet`), `year`, `session_key`, `sha256`, `size_bytes` |
+| `source.input_fingerprint` | huella agregada de las entradas, `sha256:<hex>` (también en `summary`) |
+| `source.input_fingerprint_scheme` | versión del algoritmo: `m6-input-fingerprint/v1` |
+| `artifact_files` | cada objeto escrito: `artifact`, `split`, `path`, `sha256`, `size_bytes` |
+
+- Cada entrada se lee **una sola vez**; se hashea y se parsea desde esos
+  mismos bytes, así que la huella describe exactamente lo que se modeló. Los
+  archivos cuyas filas descartan después los filtros `years`/`session_keys`
+  también se leyeron, y figuran.
+- `artifact_files` cubre los seis Parquet (`dataset.parquet` y
+  `features.parquet` por split), `preprocessor.joblib` y
+  `feature_schema*.json`. Cada hash se calcula releyendo el objeto del
+  almacenamiento después de escribirlo. Con las mismas entradas y la misma
+  configuración, los ocho hashes son iguales en disco local y en S3
+  simulado en las pruebas ejecutadas en Windows. La paridad en Linux queda
+  pendiente de ejecutarse en un entorno Linux real.
+- `input_fingerprint` es el SHA-256 de este documento JSON canónico (claves
+  ordenadas, sin espacios, `ensure_ascii`):
+  `{"inputs": [{"input", "year", "session_key", "sha256"}, …], "scheme": "m6-input-fingerprint/v1"}`,
+  con las entradas ordenadas por `year` (`null` primero), `session_key`,
+  `input` y `sha256`. No incluye URIs, rutas, bucket, backend, fechas ni
+  números de ejecución: los mismos archivos dan la misma huella en disco
+  local y en S3, en cualquier orden de listado.
+- Un run abortado (guarda bloqueante, train vacío, sin filas con target)
+  conserva `source.inputs` de lo que sí leyó, y deja `artifacts` y
+  `artifact_files` vacíos, porque no escribió nada. Si falla una lectura o
+  una escritura del almacenamiento, el error se propaga y no se escribe
+  reporte, como hasta ahora.
+- Los reportes nuevos usan `schema_version: 2` y estados `PASS`, `FAIL`,
+  `INCONCLUSIVE` o `SKIPPED` (con motivo). La CLI oficial solo devuelve éxito
+  con veredicto `VALID` o `VALID_WITH_WARNINGS`. Reportes v1 se pueden verificar
+  sin reescritura.
+- La estrategia de split actual se conserva. La separación futura por
+  `meeting_key`, el corte UTC del 1 de julio de 2025 y el tratamiento de Sprint
+  dependen de la aprobación académica pendiente.
+
 ## 14. Preparación para la nube (AWS-ready)
 
-> **AWS todavía NO está desplegado.** No existe bucket, rol IAM, imagen en
-> ECR ni ninguna otra infraestructura. Esta sección describe cómo quedó
-> preparado el código para que un despliegue posterior (CloudFormation/SAM)
-> no requiera tocar la lógica de M1–M6.
+> El estado de AWS se registra únicamente en
+> [infra/aws_status.json](infra/aws_status.json). El diseño, el código y la
+> validación local se distinguen del despliegue y de las pruebas reales; estos
+> últimos permanecen **NO VERIFICABLES** sin comprobación humana.
 
 La lógica funcional, estadística y anti-leakage de M4/M5/M6 **no cambió**.
 Se verificó ejecutando el pipeline nuevo sobre los datos locales y
@@ -850,6 +934,17 @@ Sobre esas primitivas la interfaz ofrece JSON, Parquet, joblib y nombres
   Ambos son `OSError`, así que los manejadores existentes siguen valiendo.
 - Parquet se lee siempre desde un buffer: pyarrow no puede inventar columnas
   a partir de directorios `year=…`.
+- Un documento JSON tiene una sola representación binaria: una función lo
+  serializa (UTF-8 sin BOM, sangría de dos espacios, saltos de línea LF, sin
+  salto final) y ambos backends guardan esos bytes tal cual, siempre en modo
+  binario. Las pruebas ejecutadas en Windows verifican la igualdad entre
+  disco local y S3 simulado; la ejecución equivalente en Linux sigue
+  pendiente. Los archivos escritos en Windows por versiones anteriores llevan
+  CRLF: siguen siendo legibles y no se reescriben, pero su hash es distinto
+  del que tendría el mismo documento escrito hoy.
+- El plan local que escribe `cli.py:233` sigue fuera de este contrato y de los
+  artefactos fingerprintados de M6. Usa modo texto y se tratará como una tarea
+  independiente si pasa a requerir reproducibilidad de bytes.
 
 `boto3` es opcional (`pip install ".[aws]"`, ≥ 1.35.2 por las escrituras
 condicionales) y solo se importa al crear un cliente S3.
@@ -866,8 +961,8 @@ s3://<bucket>/<prefix>/
 ├── validated/validation_report_<ts>.json                        (M3 global)
 ├── consolidated/year=<y>/session=<s>/session_<s>.parquet        (M4)
 ├── features/year=<y>/session=<s>/session_<s>.parquet            (M5)
-├── modeling/split=<train|validation|test>/{dataset,features}.parquet   (M6)
-├── modeling/preprocessing/{preprocessor.joblib, feature_schema.json}
+├── modeling/split=<train|validation|test>/runs/<run_id>/{dataset,features}.parquet (M6)
+├── modeling/preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
 ├── manifests/extraction/[year=<y>/session=<s>/]manifest_<ts>.json
 ├── manifests/{consolidation,features,modeling}/<stage>_report_<ts>.json
 ├── models/   (reservado para M7)
@@ -962,7 +1057,16 @@ opcional (`logging.file_path` / `F1_LOG_FILE`) y nada depende de él.
 ### 14.7 Docker
 
 ```bash
-docker build -t f1-race-intelligence:dev .
+# Imagen trazable: solo desde un árbol limpio, con el SHA completo del commit
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+    echo "Hay cambios sin commit: no se construye la imagen." >&2
+    false
+else
+    docker build --platform linux/amd64 \
+        --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+        --build-arg F1_GIT_DIRTY=false \
+        -t f1-race-intelligence:dev .
+fi
 
 # Prueba local sobre los datos del repo, escribiendo en data/smoke (layout lake)
 docker run --rm -v "$PWD/data:/app/data" f1-race-intelligence:dev \
@@ -977,6 +1081,14 @@ docker run --rm -v "$PWD/data:/app/data" \
 - Usuario sin privilegios (`uid 10001`); solo `/app/data` es escribible. Con
   un volumen montado en Linux, añadir `--user "$(id -u):$(id -g)"` si el
   directorio del host no es escribible para ese uid.
+- La receta solo construye desde un árbol limpio
+  (`git status --porcelain --untracked-files=all` vacío: incluye los archivos
+  sin seguimiento aunque `status.showUntrackedFiles` los oculte) e inyecta
+  `F1_GIT_COMMIT` con el SHA completo (`git rev-parse HEAD`) y
+  `F1_GIT_DIRTY=false`. Una imagen construida sin esos build args no es
+  trazable: la imagen no incluye `.git/`,
+  así que el reporte deja la revisión explícitamente nula; el hash del lock se
+  calcula desde el archivo incluido en la imagen.
 - Sin datasets, `.env` ni credenciales (`.dockerignore`).
 - Configuración por variables de entorno (`F1_ENVIRONMENT`, `F1_STORAGE_*`).
 - `F1_CONFIG_PATH` es explícito: el paquete instalado no puede ubicar
@@ -987,17 +1099,21 @@ docker run --rm -v "$PWD/data:/app/data" \
 > Imagen construida y probada en local con Docker Engine (WSL, `linux/amd64`):
 > `--help`, `pip check`, uid 10001, rutas de configuración inexistentes
 > (código 2), configuración AWS/S3 sin red, y `copy-raw` + M3→M5 de una sesión
-> sin red con `--memory 512m --cpus 0.5`. Todavía no se ha subido a ECR.
+> sin red con `--memory 512m --cpus 0.5`. La publicación en ECR es
+> **NO VERIFICABLE** desde el repositorio (ver
+> [infra/aws_status.json](infra/aws_status.json)).
 
 ### 14.8 Infraestructura como código
 
 La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
 Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
-[infra/](infra/README.md). **No está desplegada.** M2–M6 figuran en la state
-machine como estados placeholder y el paso al pipeline está desactivado
-(`PipelineEnabled=false`).
+[infra/](infra/README.md). `infra/aws_status.json` es la fuente de verdad
+versionada: el estado de despliegue y de pruebas en AWS real permanece
+**NO VERIFICABLE** sin comprobación humana. La Fase 1B define M2–M6 como
+tareas Fargate endurecidas (raíz de solo lectura, sin capacidades Linux,
+usuario 10001, imagen fijada por digest) orquestadas por Step Functions.
 
-### 14.9 Arquitectura AWS propuesta (futura, no desplegada)
+### 14.9 Arquitectura AWS propuesta
 
 ```
 EventBridge Scheduler
@@ -1077,9 +1193,14 @@ salida; contexto de logging.
 - La extracción respeta el límite de OpenF1 por cliente: varios jobs M2 en
   paralelo comparten ese límite, así que M2 no escala con más contenedores.
 - `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
-- **AWS no está desplegado**; el backend S3 solo se ha probado contra un
-  cliente simulado.
-- No hay CI configurado.
+- **El despliegue AWS es NO VERIFICABLE** según
+  [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
+  contra un cliente simulado.
+- CI con GitHub Actions (`.github/workflows/ci.yml`): en pull requests y
+  pushes a `master`, revisa espacios en blanco y ejecuta
+  `pytest -m "not integration"` (incluye `tests/infra`) en Ubuntu y Windows,
+  y compara los hashes de M6 entre ambos. No ejecuta `cfn-lint` ni
+  `sam validate`, no construye la imagen y no despliega (sin CD).
 
 ## 18. Licencia y uso de datos
 
@@ -1096,9 +1217,146 @@ bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir
   `next_lap_time`.
 - Tracking de experimentos con MLflow y model registry.
-- Servir el modelo vía FastAPI.
+- Servir el modelo vía FastAPI: existe un prototipo local (sección 19); falta
+  el modelo registrado por M7 y cualquier despliegue.
 - Despliegue en AWS (CloudFormation/SAM) de la arquitectura propuesta en la
   sección 14.9 (la base ya está definida en `infra/`); construir y publicar
   la imagen Docker en ECR.
 - CI/CD.
 - Dashboard y monitoreo de drift.
+
+## 19. Prototipo de serving (M8)
+
+> Prototipo **local**. No entrena modelos ni despliega en AWS/SageMaker.
+> Mientras M7 no registre un modelo no hay predicciones reales: los valores
+> de los ejemplos de esta sección son **ilustrativos**.
+
+### Arquitectura
+
+```
+POST /predict  {"records": [ {features de M5, sin transformar}, … ]}
+  │
+  ├─ serving/contract.py   valida contra feature_schema.json de M6:
+  │                        nombres, tipos, ausentes, campos prohibidos
+  ├─ M6: prepare_matrix + preprocessor.joblib (ajustado solo con train)
+  │                        ← código y artefacto oficiales de M6, sin copias
+  ├─ modelo cargado con mlflow.pyfunc (models:/… o runs:/…)  ← artefacto de M7
+  └─ una predicción de next_lap_time por registro, en el orden recibido
+```
+
+| Módulo | Responsabilidad |
+|---|---|
+| `serving/contract.py` | Contrato de entrada, leído del `feature_schema.json` de M6 (ninguna lista de features escrita a mano) |
+| `serving/model.py` | Interfaz `ModelLoader`; `MlflowPyfuncLoader` importa MLflow solo al cargar |
+| `serving/service.py` | Recupera artefactos M7 por `runs:/` (o M6 local/`s3://`), comprueba identidad y hashes, y predice |
+| `serving/app.py` | FastAPI: `GET /live` (liveness), `GET /health` (readiness), `GET /model-info`, `POST /predict` |
+
+Al arrancar, el servicio puede recuperar `preprocessor.joblib`,
+`feature_schema.json` y `data_provenance.json` del mismo run M7 que produjo el
+modelo. Comprueba el `run_id` del modelo, los SHA-256 declarados por M7 y que
+la firma enumere, en el mismo orden, las columnas codificadas de M6. La
+referencia de preprocesamiento es `runs:/<M7_run_id>/m6`; la del modelo es la
+versión exacta `models:/<nombre>/<versión>`. Si algo no concuerda, no acepta
+peticiones. Un test exige que la matriz que recibe el modelo sea idéntica, en
+train, validation y test, a la `features.parquet` que escribe el propio M6.
+
+### Contrato de integración con M7
+
+1. **Entrada:** un DataFrame con las columnas `encoded_feature_names` del
+   `feature_schema.json` de la ejecución de M6 con la que se entrenó; es
+   decir, `features.parquet` sin `next_lap_time` ni las columnas `key_*`.
+2. **Salida:** un valor de `next_lap_time` por fila, en su escala original
+   (la de `lap_duration`). Si M7 transforma el target, la inversa debe ir
+   dentro del modelo registrado.
+3. **Carga:** con `mlflow.pyfunc.load_model`, en cualquier flavor.
+4. **Firma:** registrada con nombres de columna en el orden de
+   `encoded_feature_names`. Si falta o no coincide, el servicio no está listo.
+5. **Trazabilidad:** el modelo debe exponer su `run_id` M7. Los artefactos M6
+   y `data_provenance.json` se recuperan desde ese mismo run; M7 enlaza el
+   `m6_run_id`, `input_fingerprint` y hashes verificados.
+
+Esta API no fija nombres de modelo registrado, alias ni experimentos: se
+pasan en `F1_SERVING_MODEL_URI` cuando M7 los defina.
+
+### Contrato de entrada
+
+- **Features:** exactamente `input_features.numeric` + `input_features.categorical`
+  del esquema de M6, sin transformar (con el catálogo actual de M5, hasta 51,
+  de ellas 3 categóricas: `compound`, `driver_acronym`, `team_name`).
+  `GET /model-info` devuelve la lista exacta.
+- **Tipos:** numéricas, número finito, booleano o `null`; categóricas,
+  texto o `null`.
+- **Todas obligatorias como clave.** `null` significa desconocido: M6 lo
+  imputa con la mediana de train y conserva el indicador de ausencia. Una
+  categoría no vista en train se codifica como ceros.
+- **Opcionales:** las columnas de trazabilidad (`year`, `meeting_key`,
+  `session_key`, `driver_number`, `lap_number`, `session_date`). Se devuelven
+  en `keys` y no llegan al modelo salvo que también sean features
+  (`lap_number`).
+- **Rechazados:** campos desconocidos y columnas prohibidas (el target y
+  `FORBIDDEN_AS_FEATURES`, como `pit_duration`).
+- **Lote:** de 1 a `F1_SERVING_MAX_RECORDS` registros (1000 por defecto).
+
+### Ejecución local
+
+```bash
+python -m pip install -r requirements/runtime-lock.txt
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -e ".[training,serve]" --no-deps
+export MLFLOW_TRACKING_URI=<tracking URI de M7>
+export F1_SERVING_PREPROCESSING_URI=runs:/<run_id de M7>/m6
+export F1_SERVING_MODEL_URI=models:/<nombre registrado por M7>/<versión exacta>
+uvicorn f1_race_intelligence.serving.app:app --host 127.0.0.1 --port 8000
+```
+
+En PowerShell, las variables se definen con `$env:F1_SERVING_MODEL_URI = "..."`.
+La documentación interactiva queda en `http://127.0.0.1:8000/docs`.
+
+### Ejemplos (valores ilustrativos)
+
+```http
+GET /health
+→ 200 {"status": "ok"}
+→ 503 {"status": "unavailable", "message": "Model service is not ready.", "error_id": "<id>"}
+
+GET /live
+→ 200 {"status": "ok"}   # liveness is independent of model readiness
+```
+
+```http
+POST /predict
+{"records": [{"session_key": 9472, "driver_number": 1,
+              "lap_number": 12, "lap_duration": 95.1, "tyre_age": 11,
+              "compound": "MEDIUM", "gap_to_leader_s": null, …}]}
+
+→ 200 {"target": "next_lap_time",
+       "model": {"uri": "models:/<nombre>/<versión>", "run_id": "<run de M7>"},
+       "predictions": [{"index": 0, "value": <predicción>,
+                        "keys": {"session_key": 9472, "driver_number": 1, "lap_number": 12}}]}
+
+→ 422 {"detail": [{"record": 0, "field": "next_lap_time",
+                   "error": "this column must never reach the model (target or leakage)"},
+                  {"record": 0, "field": "tyre_age",
+                   "error": "missing feature: send null if the value is unknown"}]}
+```
+
+| Código | Cuándo |
+|---|---|
+| 200 | Predicción correcta |
+| 422 | El cuerpo o algún registro incumple el contrato; se listan todos los problemas |
+| 500 | El modelo devolvió algo que no es un valor finito por registro |
+| 503 | El servicio no cargó (falta configuración, artefactos que no concuerdan, MLflow ausente…) |
+
+### Tests
+
+```bash
+pytest tests/unit/test_serving.py        # contrato, artefactos, paridad con M6, loader MLflow
+pytest tests/unit/test_serving_api.py    # capa HTTP; requiere el extra serve
+```
+
+Los tests generan artefactos auténticos de M6 ejecutando su runner sobre
+carreras sintéticas. La integración M7–M8 también entrena con esos fixtures,
+recupera el modelo por su versión exacta mediante pyfunc y verifica que los
+artefactos y el modelo pertenecen al mismo run M7. No consulta OpenF1 ni usa
+datos reales. CI instala los extras `training` y `serve` para ejecutar la
+integración y la capa HTTP.

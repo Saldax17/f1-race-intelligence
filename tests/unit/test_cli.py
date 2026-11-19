@@ -10,6 +10,7 @@ import yaml
 
 from f1_race_intelligence import cli
 from f1_race_intelligence.modeling import checks
+from f1_race_intelligence.storage.backends.s3 import S3StorageBackend
 from factories import MEETING_KEY, SESSION_KEY, YEAR, car_data_record
 from test_consolidation import build_raw  # noqa: F401 - fixture
 from test_historical_extraction import make_client
@@ -65,8 +66,43 @@ def fake_client_factory(client):
 
 def test_stages_are_parsed_in_order() -> None:
     assert cli.parse_stages("m3, M4,m5") == ["m3", "m4", "m5"]
+    assert cli.parse_stages("m7") == ["m7"]
     with pytest.raises(ValueError):
-        cli.parse_stages("m7")
+        cli.parse_stages("m7,unknown")
+
+
+def test_m7_requires_an_m6_report(config_file) -> None:
+    assert cli.main(["--stage", "m7", "--config", str(config_file)]) == cli.EXIT_USAGE
+
+
+def test_m7_rejects_s3_storage(config_file) -> None:
+    assert cli.main(
+        [
+            "--stage",
+            "m7",
+            "--m6-report",
+            "m6-report.json",
+            "--storage-backend",
+            "s3",
+            "--bucket",
+            "not-used",
+            "--config",
+            str(config_file),
+        ]
+    ) == cli.EXIT_USAGE
+
+
+def test_m7_must_run_against_an_existing_m6_report(config_file) -> None:
+    assert cli.main(
+        [
+            "--stage",
+            "m6,m7",
+            "--m6-report",
+            "m6-report.json",
+            "--config",
+            str(config_file),
+        ]
+    ) == cli.EXIT_USAGE
 
 
 def test_unknown_stage_is_a_usage_error(config_file) -> None:
@@ -170,7 +206,7 @@ def test_m3_m4_m5_chain_for_one_session_locally(build_raw, config_file, tmp_path
     report = json.loads(next((tmp_path / "validation").glob("validation_report_*.json")).read_text(encoding="utf-8"))
     assert report["source"]["filter"]["session_key"] == SESSION_KEY
     status_lines = capsys.readouterr().err
-    assert "m3: OK" in status_lines and "m5: OK" in status_lines
+    assert "m3: PARTIAL" in status_lines and "m5: OK" in status_lines
 
 
 def test_a_session_with_no_data_fails_the_job(config_file) -> None:
@@ -218,6 +254,32 @@ def test_plan_lists_work_units(config_file, tmp_path, capsys) -> None:
     assert units == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
 
 
+def test_plan_can_be_written_to_s3_for_the_orchestrator(config_file, monkeypatch) -> None:
+    # Step Functions cannot read a container's stdout: on AWS the plan is read
+    # back from S3 by the state machine (LoadPlan).
+    from s3_fakes import FakeS3Client
+
+    s3 = FakeS3Client()
+    monkeypatch.setattr(cli, "S3StorageBackend", lambda bucket, **kwargs: S3StorageBackend(bucket, **{**kwargs, "client": s3}))
+
+    code = cli.main(
+        ["--stage", "plan", "--year", "2023", "--config", str(config_file), "--plan-output", "s3://plans-bucket/manifests/plan/exec-1.json"],
+        client_factory=fake_client_factory(make_client()),
+    )
+
+    assert code == cli.EXIT_OK
+    stored = json.loads(s3.get_object(Bucket="plans-bucket", Key="manifests/plan/exec-1.json")["Body"].read())
+    assert stored == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
+
+
+@pytest.mark.parametrize("destination", ["s3://plans-bucket", "s3://plans-bucket/manifests/plan/", "gs://bucket/plan.json"])
+def test_an_unusable_plan_output_is_rejected_before_calling_openf1(config_file, destination, capsys) -> None:
+    code = cli.main(["--stage", "plan", "--year", "2023", "--config", str(config_file), "--plan-output", destination], client_factory=never_called)
+
+    assert code == cli.EXIT_USAGE
+    assert "--plan-output" in capsys.readouterr().err
+
+
 def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch) -> None:
     for session_key, year, offset in ((1, 2023, 0), (2, 2024, 365), (3, 2025, 730)):
         frame = pd.DataFrame(feature_rows(session_key, year, offset))
@@ -232,6 +294,31 @@ def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch
     assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
 
 
+def test_m6_blocking_guard_still_fails_pipeline_when_leakage_stop_is_disabled(
+    config_file, tmp_path, monkeypatch
+) -> None:
+    for session_key, year, offset in ((1, 2023, 0), (2, 2024, 365), (3, 2025, 730)):
+        frame = pd.DataFrame(feature_rows(session_key, year, offset))
+        (tmp_path / "features" / str(year)).mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(tmp_path / "features" / str(year) / f"session_{session_key}.parquet", index=False)
+    config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    config["modeling"]["fail_on_leakage"] = False
+    config_file.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    monkeypatch.setattr(
+        checks, "check_chronological_split", lambda assignments: checks.CheckResult("chronological_split", False, "forced")
+    )
+    assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
+
+
+def test_verify_m6_requires_a_report_and_accepts_a_legacy_report(config_file, tmp_path) -> None:
+    assert cli.main(["--stage", "verify-m6", "--config", str(config_file)]) == cli.EXIT_USAGE
+    report = tmp_path / "m6-v1.json"
+    report.write_text(json.dumps({"artifact_files": []}), encoding="utf-8")
+
+    assert cli.main(["--stage", "verify-m6", "--report", str(report), "--config", str(config_file)]) == cli.EXIT_OK
+
+
 def test_an_unexpected_exception_is_reported_as_a_failed_stage(config_file, monkeypatch) -> None:
     def explode(ctx):
         raise RuntimeError("boom")
@@ -239,6 +326,50 @@ def test_an_unexpected_exception_is_reported_as_a_failed_stage(config_file, monk
     monkeypatch.setitem(cli.STAGE_RUNNERS, "m5", explode)
 
     assert cli.main(["--stage", "m5", "--config", str(config_file)]) == cli.EXIT_FAILED
+
+
+@pytest.mark.parametrize(
+    ("global_status", "expected_status", "expected_label"),
+    [
+        ("PASS", "succeeded", "m3: OK"),
+        ("WARNING", "partial", "m3: PARTIAL"),
+        ("FAIL", "failed", "m3: FAILED (non-strict; pipeline continues)"),
+    ],
+)
+def test_m3_global_status_is_not_reported_as_success_unless_pass(
+    config_file, monkeypatch, caplog, capsys, global_status, expected_status, expected_label
+) -> None:
+    monkeypatch.setitem(
+        cli.STAGE_RUNNERS,
+        "m3",
+        lambda ctx: cli.StageOutcome(ok=True, summary={"global_status": global_status}),
+    )
+
+    with caplog.at_level("INFO", logger="f1_race_intelligence.cli"):
+        assert cli.main(["--stage", "m3", "--config", str(config_file)]) == cli.EXIT_OK
+
+    finished = next(record for record in caplog.records if record.getMessage() == "stage_finished")
+    assert finished.status == expected_status
+    assert expected_label in capsys.readouterr().err
+
+
+def test_m6_warnings_are_logged_as_a_partial_stage(config_file, monkeypatch, caplog, capsys) -> None:
+    monkeypatch.setitem(
+        cli.STAGE_RUNNERS,
+        "m6",
+        lambda ctx: cli.StageOutcome(
+            ok=True,
+            summary={"verdict": "VALID_WITH_WARNINGS", "run_id": "m6-run-1"},
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="f1_race_intelligence.cli"):
+        assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_OK
+
+    finished = next(record for record in caplog.records if record.getMessage() == "stage_finished")
+    assert finished.status == "partial"
+    assert finished.summary["run_id"] == "m6-run-1"
+    assert "m6: PARTIAL" in capsys.readouterr().err
 
 
 def test_copy_raw_between_layouts(build_raw, config_file, raw_root, tmp_path) -> None:

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from f1_race_intelligence.pipelines.manifest import ExecutionManifest, ExtractionStatus, ManifestEntry
+from f1_race_intelligence.validation.manifest_index import ManifestIndex
 
 
 def make_manifest(**overrides) -> ExecutionManifest:
@@ -67,6 +68,35 @@ def test_save_writes_a_timestamped_file_per_execution(tmp_path: Path) -> None:
 
     assert first_path != second_path
     assert first_path.name.startswith("manifest_20230305T120000")
+
+
+def test_saved_manifests_use_lf_line_endings_on_every_operating_system(tmp_path: Path) -> None:
+    manifest = make_manifest(started_at=datetime(2023, 3, 5, 12, 0, tzinfo=timezone.utc))
+    manifest.record_session(9158)
+
+    stored = manifest.save(tmp_path / "manifests").read_bytes()
+
+    assert b"\r" not in stored
+    assert stored == json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def test_a_manifest_written_with_crlf_by_an_earlier_version_is_still_found_and_read(tmp_path: Path) -> None:
+    """Manifests saved on Windows before the fix carry CRLF; M3 must still be able to use them."""
+    manifest = make_manifest(started_at=datetime(2023, 3, 5, 12, 0, tzinfo=timezone.utc))
+    manifest.record_session(9158)
+    manifest.add(ManifestEntry(endpoint="pit", status=ExtractionStatus.FAILED, session_key=9158, status_code=404))
+    text = json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2, default=str)
+    historical = text.replace("\n", "\r\n").encode("utf-8")
+    directory = tmp_path / "manifests"
+    directory.mkdir()
+    (directory / "manifest_20230305T120000000000Z.json").write_bytes(historical)
+
+    index = ManifestIndex.load_latest(directory)
+
+    assert index is not None
+    assert index.sessions_processed == [9158]
+    assert index.failure_for("pit", 9158)["status_code"] == 404
+    assert (directory / "manifest_20230305T120000000000Z.json").read_bytes() == historical
 
 
 def test_two_runs_starting_on_the_same_clock_tick_keep_both_manifests(tmp_path: Path) -> None:

@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from f1_race_intelligence.modeling.fingerprints import ArtifactFile
+from f1_race_intelligence.modeling.traceability import new_run_id
+from f1_race_intelligence.validation.states import RunVerdict
+
 
 @dataclass
 class SplitArtifacts:
@@ -41,6 +45,13 @@ class ModelingReport:
 
     pipeline_name: str
     pipeline_version: str
+    schema_version: int = 2
+    run_id: str = field(default_factory=new_run_id)
+    source_commit: Optional[str] = None
+    source_dirty: Optional[bool] = None
+    dependency_lock_sha256: Optional[str] = None
+    config_fingerprint: Optional[str] = None
+    verdict: RunVerdict = RunVerdict.ABORTED
     config: Dict[str, Any] = field(default_factory=dict)
     source: Dict[str, Any] = field(default_factory=dict)
     target: Dict[str, Any] = field(default_factory=dict)
@@ -48,6 +59,8 @@ class ModelingReport:
     split: Dict[str, Any] = field(default_factory=dict)
     preprocessing: Dict[str, Any] = field(default_factory=dict)
     artifacts: List[SplitArtifacts] = field(default_factory=list)
+    # Only objects this run wrote and read back; empty when it aborted.
+    artifact_files: List[ArtifactFile] = field(default_factory=list)
     checks: List[Dict[str, Any]] = field(default_factory=list)
     blocking_failures: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -64,20 +77,31 @@ class ModelingReport:
     def summary(self) -> Dict[str, Any]:
         by_split = {item.name: item.rows for item in self.artifacts}
         return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "verdict": self.verdict.value,
             "rows_in": self.source.get("rows_in", 0),
             "rows_modelled": self.source.get("rows_out", 0),
             "rows_dropped_without_target": self.source.get("rows_dropped_without_target", 0),
             "sessions": self.source.get("sessions", 0),
+            "input_fingerprint": self.source.get("input_fingerprint"),
             "rows_by_split": by_split,
             "numeric_features": len(self.features.get("numeric", [])),
             "categorical_features": len(self.features.get("categorical", [])),
             "encoded_feature_count": self.preprocessing.get("output_feature_count", 0),
-            "checks_passed": not self.blocking_failures,
+            "checks_passed": self.verdict in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS),
             "warnings": len(self.warnings),
         }
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "source_commit": self.source_commit,
+            "source_dirty": self.source_dirty,
+            "dependency_lock_sha256": self.dependency_lock_sha256,
+            "config_fingerprint": self.config_fingerprint,
+            "verdict": self.verdict.value,
             "pipeline_name": self.pipeline_name,
             "pipeline_version": self.pipeline_version,
             "started_at": self.started_at.isoformat(),
@@ -91,6 +115,7 @@ class ModelingReport:
             "split": self.split,
             "preprocessing": self.preprocessing,
             "artifacts": [item.to_dict() for item in self.artifacts],
+            "artifact_files": [item.to_dict() for item in self.artifact_files],
             "checks": self.checks,
             "blocking_failures": self.blocking_failures,
             "warnings": self.warnings,

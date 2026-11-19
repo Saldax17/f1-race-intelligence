@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "components": {
+    "architecture": {
+      "status": "DISEÑADO",
+      "evidence": [
+        "infra/template.yaml",
+        "infra/statemachine/pipeline.asl.json"
+      ]
+    },
+    "implementation": {
+      "status": "IMPLEMENTADO EN CÓDIGO",
+      "evidence": [
+        "infra/template.yaml",
+        "infra/functions/availability_checker/app.py",
+        "infra/statemachine/pipeline.asl.json"
+      ]
+    },
+    "local_validation": {
+      "status": "VALIDADO LOCALMENTE",
+      "evidence": [
+        "tests/infra"
+      ]
+    },
+    "deployment": {
+      "status": "NO VERIFICABLE",
+      "evidence": [],
+      "reason": "No se consultó AWS ni se recibió evidencia humana verificable en esta implementación."
+    },
+    "real_environment_test": {
+      "status": "NO VERIFICABLE",
+      "evidence": [],
+      "reason": "No se ejecutaron pruebas contra un entorno AWS real."
+    }
+  }
+}

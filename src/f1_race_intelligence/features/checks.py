@@ -27,6 +27,7 @@ from f1_race_intelligence.features.selection import (
     TARGET_COLUMN,
 )
 from f1_race_intelligence.features.temporal import MIN_PERIODS_SPREAD, RELATIVE_WINDOW
+from f1_race_intelligence.validation.states import CheckStatus
 
 # Rows sampled for the truncated recomputation. The check is O(rows x window)
 # per sampled row, so a bounded, deterministic sample keeps it affordable
@@ -45,14 +46,38 @@ class CheckResult:
     description: str
     blocking: bool = True
     details: Dict[str, Any] = field(default_factory=dict)
+    status: Optional[CheckStatus] = None
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.status is None:
+            if self.details.get("skipped"):
+                self.status = CheckStatus.SKIPPED
+            elif self.details.get("inconclusive"):
+                self.status = CheckStatus.INCONCLUSIVE
+            else:
+                self.status = CheckStatus.PASS if self.passed else CheckStatus.FAIL
+        elif not isinstance(self.status, CheckStatus):
+            self.status = CheckStatus(self.status)
+        if self.status is CheckStatus.PASS and not self.passed:
+            raise ValueError(f"Passing check {self.name!r} must have passed=True")
+        if self.status is CheckStatus.FAIL and self.passed:
+            raise ValueError(f"Failed check {self.name!r} must have passed=False")
+        self.passed = self.status is CheckStatus.PASS
+        if self.status is CheckStatus.SKIPPED:
+            self.reason = self.reason or self.details.get("reason") or self.description
+            if not self.reason.strip():
+                raise ValueError(f"Skipped check {self.name!r} must include a reason")
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
             "check": self.name,
-            "status": "PASS" if self.passed else "FAIL",
+            "status": self.status.value,
             "blocking": self.blocking,
             "description": self.description,
         }
+        if self.reason:
+            payload["reason"] = self.reason
         if self.details:
             payload["details"] = self.details
         return payload
@@ -131,7 +156,10 @@ def check_last_lap_has_no_target(frame: pd.DataFrame) -> CheckResult:
             "last_lap_has_no_target",
             True,
             "Skipped: the source did not mark last laps",
-            details={"skipped": True},
+            blocking=False,
+            details={"skipped": True, "reason": "Source has no last-lap marker"},
+            status=CheckStatus.SKIPPED,
+            reason="Source has no last-lap marker",
         )
 
     last = frame["is_last_lap_for_driver"].fillna(False).astype(bool)
@@ -291,7 +319,9 @@ def check_correlation_with_target(
             True,
             "Skipped: no rows have a target",
             blocking=False,
-            details={"skipped": True},
+            details={"skipped": True, "reason": "No rows have a target"},
+            status=CheckStatus.SKIPPED,
+            reason="No rows have a target",
         )
 
     target = pd.to_numeric(with_target[TARGET_COLUMN], errors="coerce").astype("float64")
@@ -317,4 +347,4 @@ def check_correlation_with_target(
 
 
 def blocking_failures(results: Sequence[CheckResult]) -> List[str]:
-    return [item.name for item in results if item.blocking and not item.passed]
+    return [item.name for item in results if item.blocking and item.status is not CheckStatus.PASS]

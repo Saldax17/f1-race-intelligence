@@ -1,8 +1,8 @@
 # Overlay merged over config.yaml when environment is "aws"
 # (F1_ENVIRONMENT=aws). Only what differs from the base file lives here.
 #
-# NOT DEPLOYED YET: no AWS resource exists. This file only describes how the
-# pipeline will be configured once it runs in AWS.
+# Deployment status: NO VERIFICABLE, as recorded in infra/aws_status.json.
+# This file only describes how the pipeline is configured when it runs in AWS.
 #
 # The bucket is deliberately absent: it is injected by the job definition as
 # F1_STORAGE_BUCKET. No credentials here — the container uses its IAM role.

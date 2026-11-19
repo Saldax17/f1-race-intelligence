@@ -9,6 +9,7 @@ at modelling time.
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -17,6 +18,13 @@ import pandas as pd
 
 from f1_race_intelligence.features import selection
 from f1_race_intelligence.features.selection import TARGET_COLUMN
+from f1_race_intelligence.modeling.fingerprints import (
+    INPUT_FINGERPRINT_SCHEME,
+    InputFile,
+    input_fingerprint,
+    sha256_hex,
+)
+from f1_race_intelligence.storage.backends.base import key_name
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
 
@@ -30,10 +38,15 @@ class LoadedDataset:
     rows_without_target: int = 0
     sessions: int = 0
     files: List[str] = field(default_factory=list)
+    inputs: List[InputFile] = field(default_factory=list)
 
     @property
     def rows_out(self) -> int:
         return len(self.frame)
+
+    @property
+    def input_fingerprint(self) -> str:
+        return input_fingerprint(self.inputs)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -42,6 +55,9 @@ class LoadedDataset:
             "rows_dropped_without_target": self.rows_without_target,
             "sessions": self.sessions,
             "files": self.files,
+            "inputs": [item.to_dict() for item in self.inputs],
+            "input_fingerprint": self.input_fingerprint,
+            "input_fingerprint_scheme": INPUT_FINGERPRINT_SCHEME,
         }
 
 
@@ -78,17 +94,37 @@ class FeatureDatasetLoader:
         or score a model, so it is dropped here and counted. M5 kept it on
         purpose; dropping it is a modelling decision, made once, in the
         open.
+
+        Every file is read once, hashed, and parsed from those same bytes,
+        so the fingerprint describes exactly what was modelled. Files whose
+        rows the ``years``/``session_keys`` filters then discard were still
+        read, and are still listed.
         """
         backend, layout = self._store.backend, self._store.layout
-        files = [
-            key
+        sessions = [
+            (key, parsed)
             for key in backend.list(layout.session_dataset_listing_prefix(self._root))
-            if layout.parse_session_dataset_key(self._root, key) is not None
+            if (parsed := layout.parse_session_dataset_key(self._root, key)) is not None
         ]
-        if not files:
+        if not sessions:
             return LoadedDataset(frame=_empty_frame())
 
-        frames = [backend.read_parquet(key) for key in files]
+        frames: List[pd.DataFrame] = []
+        inputs: List[InputFile] = []
+        for key, (year, session_key) in sessions:
+            data = backend.read_bytes(key)
+            inputs.append(
+                InputFile(
+                    input=key_name(key),
+                    year=year,
+                    session_key=session_key,
+                    sha256=sha256_hex(data),
+                    size_bytes=len(data),
+                )
+            )
+            # From a buffer, never a path: see StorageBackend.read_parquet.
+            frames.append(pd.read_parquet(io.BytesIO(data), engine="pyarrow"))
+        files = [key for key, _ in sessions]
         combined = pd.concat(frames, ignore_index=True)
 
         if years:
@@ -110,6 +146,7 @@ class FeatureDatasetLoader:
             rows_without_target=rows_in - len(modelling),
             sessions=int(modelling["session_key"].nunique()) if not modelling.empty else 0,
             files=[backend.uri(key) for key in files],
+            inputs=inputs,
         )
 
 

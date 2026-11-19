@@ -5,15 +5,18 @@
     python -m f1_race_intelligence --stage m2 --year 2024 --session-key 9472
     python -m f1_race_intelligence --stage m3,m4,m5 --year 2024 --session-key 9472
     python -m f1_race_intelligence --stage m6
+    python -m f1_race_intelligence --stage m7 --m6-report data/modeling/reports/modeling_report_....json
     python -m f1_race_intelligence --stage plan --year 2024
     python -m f1_race_intelligence --stage m4 --session-key 9472 \\
         --storage-backend s3 --bucket my-bucket --prefix dev
 
 Stages: ``plan`` (list the session work units of a season), ``m2`` extraction,
 ``m3`` validation, ``m4`` consolidation, ``m5`` features, ``m6`` modelling
-datasets, ``copy-raw`` (copy already-extracted raw data between stores), and
-the race model: ``m7-train``, ``m7-evaluate`` (``--split``, ``--promote``),
-``m7-update`` and ``m7-forecast`` (``--session-key``, ``--lap``, ``--source``)::
+datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), ``m7``
+training and evaluation from a verified M6 report, ``copy-raw`` (copy
+already-extracted raw data between stores), and the in-race position model:
+``m7-train``, ``m7-evaluate`` (``--split``, ``--promote``), ``m7-update`` and
+``m7-forecast`` (``--session-key``, ``--lap``, ``--source``)::
 
     python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote
     python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
@@ -44,9 +47,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from f1_race_intelligence.config.settings import AppSettings, load_settings
+from f1_race_intelligence.config.settings import AppSettings, StorageSettings, load_settings
 from f1_race_intelligence.scope import SessionScope
-from f1_race_intelligence.storage.store import DataStore, store_from_uri
+from f1_race_intelligence.storage.backends.s3 import S3StorageBackend
+from f1_race_intelligence.storage.store import S3_SCHEME, DataStore, store_from_uri
 from f1_race_intelligence.utils.logging import configure_logging, get_logger, log_context
 
 logger = get_logger("f1_race_intelligence.cli")
@@ -55,7 +59,10 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "copy-raw", "m7-train", "m7-evaluate", "m7-update", "m7-forecast")
+STAGES = (
+    "plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "copy-raw",
+    "m7-train", "m7-evaluate", "m7-update", "m7-forecast",
+)
 
 
 @dataclass
@@ -103,7 +110,13 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--environment", choices=["local", "aws"])
     config.add_argument("--overwrite", action="store_true", help="Rebuild outputs that already exist (m2, m4, m5, copy-raw)")
     config.add_argument("--strict", action="store_true", help="Exit non-zero when validation (m3) comes back FAIL")
-    config.add_argument("--plan-output", help="Also write the plan's work units to this JSON file")
+    config.add_argument(
+        "--plan-output",
+        help="Also write the plan's work units as JSON to this local file or s3://bucket/key "
+        "(where an orchestrator such as Step Functions can read them)",
+    )
+    config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
+    config.add_argument("--m6-report", help="Verified local M6 report to use as M7 training input")
 
     model = parser.add_argument_group("race model (m7-*)")
     model.add_argument("--lap", type=int, help="m7-forecast: forecast from the end of this lap (default: latest)")
@@ -203,10 +216,45 @@ def run_plan(ctx: RunContext) -> StageOutcome:
         units = pipeline.plan(years)
 
     if ctx.args.plan_output:
-        Path(ctx.args.plan_output).parent.mkdir(parents=True, exist_ok=True)
-        Path(ctx.args.plan_output).write_text(json.dumps(units, indent=2), encoding="utf-8")
+        location = write_plan(ctx.args.plan_output, units, ctx.settings.storage)
+        logger.info("plan_written", extra={"location": location, "work_units": len(units)})
     print(json.dumps(units))
     return StageOutcome(ok=True, summary={"work_units": len(units)})
+
+
+def parse_plan_destination(destination: str) -> Optional[tuple]:
+    """``(bucket, key)`` for ``s3://bucket/key``, ``None`` for a local path.
+
+    Raises:
+        ValueError: an S3 URI that names no object, or another scheme.
+    """
+    if destination.startswith(S3_SCHEME):
+        bucket, _, key = destination[len(S3_SCHEME) :].partition("/")
+        if not bucket or not key or key.endswith("/"):
+            raise ValueError(f"--plan-output must name an object, e.g. s3://bucket/manifests/plan/run.json; got {destination!r}")
+        return bucket, key
+    if "://" in destination:
+        raise ValueError(f"Unsupported --plan-output {destination!r}: use a local path or s3://bucket/key")
+    return None
+
+
+def write_plan(destination: str, units: List[Dict[str, Any]], storage: StorageSettings, *, client: Any = None) -> str:
+    """Store the plan's work units at a local path or ``s3://bucket/key``.
+
+    A container's stdout cannot be read by an orchestrator, so on AWS the
+    plan goes to S3 and the state machine reads it from there. Returns where
+    it was written.
+    """
+    s3_object = parse_plan_destination(destination)
+    if s3_object:
+        bucket, key = s3_object
+        backend = S3StorageBackend(bucket, client=client, region_name=storage.region, endpoint_url=storage.endpoint_url)
+        backend.write_json(key, units)
+        return backend.uri(key)
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(units, indent=2), encoding="utf-8")
+    return str(path)
 
 
 def run_m2(ctx: RunContext) -> StageOutcome:
@@ -281,12 +329,34 @@ def run_m5(ctx: RunContext) -> StageOutcome:
 
 def run_m6(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.modeling.runner import ModelingRunner
+    from f1_race_intelligence.validation.states import RunVerdict
 
     if not ctx.scope.is_empty:
         logger.warning("m6_ignores_scope", extra={"reason": "the split needs the whole history; use modeling.years"})
     report = ModelingRunner(ctx.settings, store=ctx.input_store, output_store=ctx.output_store).run()
     summary = report.summary()
-    return StageOutcome(ok=report.aborted is None, summary=summary, reason=report.aborted)
+    successful = report.verdict in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS)
+    details = report.aborted or ", ".join(report.blocking_failures) or "; ".join(report.warnings)
+    reason = None if successful else f"M6 verdict is {report.verdict.value}: {details}"
+    return StageOutcome(ok=successful, summary=summary, reason=reason)
+
+
+def run_verify_m6(ctx: RunContext) -> StageOutcome:
+    from f1_race_intelligence.modeling.verification import verify_report
+
+    result = verify_report(ctx.args.report, storage=ctx.settings.storage)
+    reason = None if result["ok"] else "; ".join(result["errors"])
+    return StageOutcome(ok=result["ok"], summary=result, reason=reason)
+
+
+def run_m7(ctx: RunContext) -> StageOutcome:
+    from f1_race_intelligence.modeling.training import TrainingRunner
+
+    report_path = ctx.args.m6_report or ctx.settings.training.m6_report_path
+    if not report_path:
+        return StageOutcome(ok=False, reason="M7 requires --m6-report or training.m6_report_path")
+    result = TrainingRunner(ctx.settings, m6_report_path=report_path).run()
+    return StageOutcome(ok=True, summary=result.summary())
 
 
 def run_copy_raw(ctx: RunContext) -> StageOutcome:
@@ -368,6 +438,8 @@ STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
     "m4": run_m4,
     "m5": run_m5,
     "m6": run_m6,
+    "verify-m6": run_verify_m6,
+    "m7": run_m7,
     "copy-raw": run_copy_raw,
 }
 
@@ -385,6 +457,16 @@ def _peak_memory_mb() -> Optional[float]:
     # Linux reports kilobytes, macOS bytes.
     divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
     return round(peak / divisor, 1)
+
+
+def stage_status(outcome: StageOutcome) -> str:
+    """Classify reported outcomes without changing a stage's exit semantics."""
+    global_status = outcome.summary.get("global_status")
+    if not outcome.ok or global_status == "FAIL":
+        return "failed"
+    if global_status == "WARNING" or outcome.summary.get("verdict") == "VALID_WITH_WARNINGS":
+        return "partial"
+    return "succeeded"
 
 
 def run_stage(name: str, ctx: RunContext) -> StageOutcome:
@@ -414,11 +496,12 @@ def run_stage(name: str, ctx: RunContext) -> StageOutcome:
             )
             return StageOutcome(ok=False, reason=f"{type(exc).__name__}: {exc}")
 
+        status = stage_status(outcome)
         logger.log(
-            20 if outcome.ok else 40,
+            40 if status == "failed" else 20,
             "stage_finished",
             extra={
-                "status": "succeeded" if outcome.ok else "failed",
+                "status": status,
                 "reason": outcome.reason,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
                 "peak_memory_mb": _peak_memory_mb(),
@@ -438,9 +521,25 @@ def main(
 
     try:
         stages = parse_stages(args.stage)
+        if "verify-m6" in stages and (len(stages) != 1 or not args.report):
+            raise ValueError("verify-m6 must be run alone and requires --report")
+        if "m7" in stages and len(stages) != 1:
+            raise ValueError("m7 must run alone against an explicit, already-produced M6 report")
+        if args.report and "verify-m6" not in stages:
+            raise ValueError("--report is only valid with --stage verify-m6")
+        if args.m6_report and "m7" not in stages:
+            raise ValueError("--m6-report is only valid with --stage m7")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
+        if args.plan_output:
+            parse_plan_destination(args.plan_output)  # fail before any OpenF1 call
         settings = load_settings(args.config, overrides=settings_overrides(args))
+        if "m7" in stages and not (args.m6_report or settings.training.m6_report_path):
+            raise ValueError("m7 requires --m6-report or training.m6_report_path")
+        if "m7" in stages and settings.storage.backend != "local":
+            raise ValueError("m7 supports local storage only")
+        if "m7" in stages and (args.input_storage or args.output_storage):
+            raise ValueError("m7 does not accept storage URI overrides; use local M6 artifacts")
         check_stage_inputs(stages, settings, args.year)
         input_store = resolve_store(settings, args.input_storage, args.input_layout)
         output_store = resolve_store(settings, args.output_storage, args.output_layout)
@@ -468,7 +567,14 @@ def main(
         if not outcome.ok:
             print(f"{name}: FAILED - {outcome.reason}", file=sys.stderr)
             return EXIT_FAILED
-        print(f"{name}: OK {json.dumps(outcome.summary, default=str)}", file=sys.stderr)
+        status = stage_status(outcome)
+        if status == "failed":
+            label = "FAILED (non-strict; pipeline continues)"
+        elif status == "partial":
+            label = "PARTIAL"
+        else:
+            label = "OK"
+        print(f"{name}: {label} {json.dumps(outcome.summary, default=str)}", file=sys.stderr)
     return EXIT_OK
 
 

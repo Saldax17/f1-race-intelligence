@@ -6,8 +6,8 @@ import logging
 from f1_race_intelligence.utils.logging import ContextFilter, JSONFormatter, current_log_context, log_context
 
 
-def render(message: str, **extra) -> dict:
-    record = logging.LogRecord("f1.test", logging.INFO, __file__, 1, message, (), None)
+def render(event_message: str, **extra) -> dict:
+    record = logging.LogRecord("f1.test", logging.INFO, __file__, 1, event_message, (), None)
     for key, value in extra.items():
         setattr(record, key, value)
     ContextFilter().filter(record)
@@ -19,10 +19,59 @@ def test_context_fields_are_stamped_on_every_record() -> None:
         payload = render("session_consolidated", records=1058)
 
     assert payload["stage"] == "m4"
+    assert payload["component"] == "f1-race-intelligence"
+    assert payload["logger"] == "f1.test"
     assert payload["year"] == 2024
     assert payload["session_key"] == 9472
     assert payload["records"] == 1058
     assert "meeting_key" not in payload, "None values are not logged"
+
+
+def test_component_is_configurable_and_logger_keeps_the_module_name(monkeypatch) -> None:
+    monkeypatch.delenv("F1_COMPONENT", raising=False)
+    default_payload = render("stage_started")
+    assert default_payload["component"] == "f1-race-intelligence"
+    assert default_payload["logger"] == "f1.test"
+
+    monkeypatch.setenv("F1_COMPONENT", "pipeline")
+    configured_payload = render("stage_started", component="spoofed", logger="spoofed")
+    assert configured_payload["component"] == "pipeline"
+    assert configured_payload["logger"] == "f1.test"
+
+
+def test_json_formatter_protects_structural_fields_but_keeps_other_extras(monkeypatch) -> None:
+    monkeypatch.delenv("F1_COMPONENT", raising=False)
+    monkeypatch.delenv("F1_PIPELINE_EXECUTION_ID", raising=False)
+    payload = render(
+        "trusted-message",
+        timestamp="spoofed-timestamp",
+        level="SPOOFED",
+        message="spoofed-message",
+        component="spoofed-component",
+        logger="spoofed-logger",
+        pipeline_execution_id="spoofed-execution",
+        request_id="request-1",
+    )
+
+    assert payload["timestamp"] != "spoofed-timestamp"
+    assert payload["level"] == "INFO"
+    assert payload["message"] == "trusted-message"
+    assert payload["component"] == "f1-race-intelligence"
+    assert payload["logger"] == "f1.test"
+    assert "pipeline_execution_id" not in payload
+    assert payload["request_id"] == "request-1"
+    assert "spoofed" not in json.dumps(payload)
+
+
+def test_pipeline_execution_id_is_added_without_overriding_explicit_context(monkeypatch) -> None:
+    monkeypatch.setenv("F1_PIPELINE_EXECUTION_ID", "arn:aws:states:region:account:execution:pipeline:run-1")
+
+    payload = render("stage_finished", pipeline_execution_id="spoofed-extra")
+    assert payload["pipeline_execution_id"].endswith(":run-1")
+
+    with log_context(pipeline_execution_id="explicit-run"):
+        payload = render("stage_finished", pipeline_execution_id="spoofed-extra")
+    assert payload["pipeline_execution_id"] == "explicit-run"
 
 
 def test_an_explicit_extra_wins_over_the_context() -> None:

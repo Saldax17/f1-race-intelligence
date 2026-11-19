@@ -365,13 +365,19 @@ def test_m6_on_s3_writes_the_same_artifacts_as_on_disk(lake, s3, tmp_path) -> No
     assert on_s3.aborted is None and on_disk.aborted is None
     assert on_s3.split["assignments"] == on_disk.split["assignments"]
     assert on_s3.checks == on_disk.checks
-    for split in (TRAIN, VALIDATION, TEST):
-        for name in ("dataset.parquet", "features.parquet"):
+    s3_base = lake.backend.uri("").rstrip("/") + "/"
+    local_artifacts = {(item.split, item.artifact): item for item in on_disk.artifact_files}
+    for item in on_s3.artifact_files:
+        local_item = local_artifacts[(item.split, item.artifact)]
+        s3_key = item.path.removeprefix(s3_base)
+        assert lake.backend.read_bytes(s3_key) == Path(local_item.path).read_bytes()
+        if item.artifact.endswith(".parquet"):
             pd.testing.assert_frame_equal(
-                lake.backend.read_parquet(f"modeling/split={split}/{name}"),
-                pd.read_parquet(tmp_path / "modeling" / split / name),
+                lake.backend.read_parquet(s3_key),
+                pd.read_parquet(local_item.path),
             )
-    preprocessor = lake.backend.read_joblib("modeling/preprocessing/preprocessor.joblib")
+    preprocessor_file = next(item for item in on_s3.artifact_files if item.artifact == "preprocessor.joblib")
+    preprocessor = lake.backend.read_joblib(preprocessor_file.path.removeprefix(s3_base))
     assert list(preprocessor.get_feature_names_out()) == on_disk.preprocessing["output_feature_names"]
-    assert objects(s3, "modeling/preprocessing/feature_schema")
+    assert any(item.artifact == "feature_schema.json" for item in on_s3.artifact_files)
     assert len(objects(s3, "manifests/modeling/modeling_report_")) == 1

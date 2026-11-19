@@ -1,6 +1,7 @@
 # Batch image for the F1 Race Intelligence pipeline (M2-M6).
 #
-# Build:  docker build -t f1-race-intelligence:dev .
+# Build (traceable; refuses uncommitted changes; full recipe in infra/README.md):
+#   test -z "$(git status --porcelain --untracked-files=all)" && docker build --platform linux/amd64 --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" --build-arg F1_GIT_DIRTY=false -t f1-race-intelligence:dev .
 # Run:    docker run --rm f1-race-intelligence:dev --stage m4 --year 2024 --session-key 9472
 #
 # The image holds code and configuration only: no datasets, no .env, no
@@ -22,6 +23,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Supply these at build time when building from a source checkout. Without a
+# commit argument, the runtime records no commit rather than inventing one.
+ARG F1_GIT_COMMIT
+ARG F1_GIT_DIRTY
+
 # Unprivileged user with a fixed UID, so file ownership on mounted volumes is
 # predictable.
 RUN groupadd --system --gid 10001 f1 \
@@ -41,11 +47,22 @@ RUN pip install --no-deps . \
     && mkdir -p /app/data \
     && chown -R f1:f1 /app/data
 
+# Hardening: no setuid/setgid executables. The pipeline never needs them, and
+# they are the local privilege-escalation path of the base image's unpatched
+# util-linux (mount) and glibc (ld.so AT_SECURE) findings. -xdev keeps find on
+# the image filesystem; a failing chmod fails the build. The second find proves
+# nothing is left.
+RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+    && test -z "$(find / -xdev -type f -perm /6000)"
+
 # The installed package cannot locate configs/ relative to its own source
 # file, so the config path is explicit. Storage and environment are chosen
 # with F1_ENVIRONMENT / F1_STORAGE_* at run time.
 ENV F1_CONFIG_PATH=/app/configs/config.yaml \
-    F1_ENVIRONMENT=local
+    F1_ENVIRONMENT=local \
+    F1_GIT_COMMIT=${F1_GIT_COMMIT} \
+    F1_GIT_DIRTY=${F1_GIT_DIRTY} \
+    F1_DEPENDENCY_LOCK_PATH=/app/requirements/runtime-lock.txt
 
 USER f1
 

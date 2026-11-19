@@ -3,9 +3,10 @@ Transform: AWS::Serverless-2016-10-31
 Description: >-
   F1 Race Intelligence - base infrastructure and availability-gated orchestration.
   Creates the data lake bucket, the OpenF1 availability checker, the pipeline state
-  machine (M2-M6 as placeholders), alerting, logs, ECR and least-privilege IAM roles,
-  and - once their images are pushed and tagged - the race model (M7): Fargate
-  training/update tasks behind a state machine, and a forecast Lambda.
+  machine with M2-M6 as hardened Fargate tasks, their network, alerting, logs, ECR and
+  least-privilege IAM roles, and the race model (M7): Fargate training/update tasks on
+  the same cluster and image behind their own state machine, and a forecast Lambda.
+  Nothing runs while PipelineEnabled is false and the model schedules are DISABLED.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -16,10 +17,12 @@ Metadata:
         Parameters: [S3BucketName, NoncurrentVersionExpirationDays]
       - Label: { default: Orchestration }
         Parameters: [AvailabilitySchedule, AvailabilityScheduleState, PipelineEnabled, OpenF1BaseUrl]
+      - Label: { default: Batch tasks }
+        Parameters: [PipelineImageUri]
       - Label: { default: Observability }
         Parameters: [LogRetentionDays, AlertEmail]
       - Label: { default: Race model (M7) }
-        Parameters: [ModelImageTag, ModelVpcId, ModelSubnetIds, ModelTrainingSchedule, ModelUpdateSchedule, ModelScheduleState, ForecastImageTag, LiveForecastScheduleState]
+        Parameters: [ModelTrainingSchedule, ModelUpdateSchedule, ModelScheduleState, ForecastImageUri, LiveForecastScheduleState]
 
 Parameters:
   ProjectName:
@@ -65,7 +68,8 @@ Parameters:
     Description: >-
       How often the OpenF1 availability checker runs. Limited to non-aggressive
       frequencies on purpose: the check itself is one request, but OpenF1 is a shared
-      public API.
+      public API. The sustained-unavailability alarm is created only for the 15- and
+      30-minute cadences; slower cadences cannot reliably supply all six hourly periods.
 
   AvailabilityScheduleState:
     Type: String
@@ -81,9 +85,19 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: >-
-      Whether an available OpenF1 lets the state machine continue into M2-M6. Keep
-      "false" until the batch jobs are deployed and verified; today M2-M6 are
-      placeholders either way.
+      Whether an available OpenF1 lets the state machine continue into M2-M6 (Fargate
+      tasks). Keep "false" until a first controlled run has been verified; "true"
+      requires PipelineImageUri (rule PipelineNeedsAnImage).
+
+  PipelineImageUri:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
+    ConstraintDescription: Empty, or an ECR image pinned by digest (repository@sha256:<64 hex>). Tags are not accepted.
+    Description: >-
+      The M2-M6 batch image, pinned by manifest digest so a task always runs exactly the
+      image that was tested. Empty (the default) creates no task definition; the pipeline
+      cannot be enabled until an image is supplied.
 
   OpenF1BaseUrl:
     Type: String
@@ -106,28 +120,9 @@ Parameters:
       then alarms and Lambda failures publish to a topic nobody receives. A real address
       gets a confirmation e-mail; alerts are delivered only after it is confirmed.
 
-  # --- Race model (M7). Everything below is off until its image exists. ---
-  ModelImageTag:
-    Type: String
-    Default: ""
-    AllowedPattern: "^$|^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
-    Description: >-
-      Tag of the batch image (PipelineImageRepository) the race-model tasks run. Empty
-      creates no ECS cluster, task definition or model state machine.
-
-  ModelVpcId:
-    Type: String
-    Default: ""
-    AllowedPattern: "^$|^vpc-[0-9a-f]+$"
-    Description: VPC of the race-model Fargate tasks (the default VPC is fine). Required with ModelImageTag.
-
-  ModelSubnetIds:
-    Type: CommaDelimitedList
-    Default: ""
-    Description: >-
-      Public subnets for the race-model Fargate tasks (they need egress to S3, ECR and
-      CloudWatch; a public IP avoids a NAT gateway). Required with ModelImageTag.
-
+  # --- Race model (M7). Its Fargate tasks run the same batch image as M2-M6
+  # (PipelineImageUri) on the same cluster and network; nothing is created
+  # until that image is supplied. ---
   ModelTrainingSchedule:
     Type: String
     Default: cron(0 6 1 * ? *)
@@ -144,13 +139,14 @@ Parameters:
     AllowedValues: [ENABLED, DISABLED]
     Description: Both model schedules. DISABLED by default; runs can always be started by hand.
 
-  ForecastImageTag:
+  ForecastImageUri:
     Type: String
     Default: ""
-    AllowedPattern: "^$|^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+    AllowedPattern: "^$|^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
+    ConstraintDescription: Empty, or an ECR image pinned by digest (repository@sha256:<64 hex>). Tags are not accepted.
     Description: >-
-      Tag of the forecast image (ForecastImageRepository, Dockerfile.forecast). Empty
-      creates no forecast Lambda.
+      The forecast Lambda image (ForecastImageRepository, Dockerfile.forecast), pinned by
+      digest like PipelineImageUri. Empty creates no forecast Lambda.
 
   LiveForecastScheduleState:
     Type: String
@@ -164,11 +160,20 @@ Parameters:
 Conditions:
   UseGeneratedBucketName: !Equals [!Ref S3BucketName, ""]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
-  HasModelCompute: !And
-    - !Not [!Equals [!Ref ModelImageTag, ""]]
-    - !Not [!Equals [!Ref ModelVpcId, ""]]
-    - !Not [!Equals [!Join ["", !Ref ModelSubnetIds], ""]]
-  HasForecastFunction: !Not [!Equals [!Ref ForecastImageTag, ""]]
+  HasPipelineImage: !Not [!Equals [!Ref PipelineImageUri, ""]]
+  HasForecastFunction: !Not [!Equals [!Ref ForecastImageUri, ""]]
+  AvailabilityAlarmCadence: !Or
+    - !Equals [!Ref AvailabilitySchedule, "rate(15 minutes)"]
+    - !Equals [!Ref AvailabilitySchedule, "rate(30 minutes)"]
+
+Rules:
+  # Enabling the pipeline without a task image would start executions that can
+  # only fail; CloudFormation rejects that combination before changing anything.
+  PipelineNeedsAnImage:
+    RuleCondition: !Equals [!Ref PipelineEnabled, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PipelineImageUri, ""]]
+        AssertDescription: PipelineEnabled=true requires PipelineImageUri (an ECR image pinned by digest).
 
 Globals:
   Function:
@@ -423,7 +428,7 @@ Resources:
   DataProcessingLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      # For the future M2-M6 container tasks.
+      # Container logs of the M2-M6 Fargate tasks (stdout, JSON lines).
       LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-pipeline"
       RetentionInDays: !Ref LogRetentionDays
       Tags:
@@ -476,8 +481,8 @@ Resources:
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-pipeline-states"
       Description: >-
-        Execution role of the pipeline state machine. Today it can only publish alerts and
-        write its logs; ECS RunTask and PassRole are added when the M2-M6 jobs exist.
+        Execution role of the pipeline state machine: run and watch the M2-M6 Fargate tasks,
+        read the session plan, check for a concurrent run, publish alerts and write its logs.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -513,6 +518,54 @@ Resources:
                   - logs:DescribeResourcePolicies
                   - logs:DescribeLogGroups
                 Resource: "*"
+        # ARNs are built from names (not !Ref/!GetAtt) where referencing the
+        # resource would make this role depend on it and close a cycle.
+        - PolicyName: run-pipeline-tasks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunPipelineTaskDefinitionOnTheClusterOnly
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-${Environment}-pipeline:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt PipelineCluster.Arn
+              # runTask.sync polls and, on timeout or abort, stops the task.
+              # AWS's generated policy uses "*"; tasks of this cluster suffice.
+              - Sid: WatchAndStopPipelineTasks
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}-${Environment}-pipeline/*"
+              # The managed rule through which runTask.sync learns that a task stopped.
+              - Sid: TaskCompletionEvents
+                Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+              - Sid: PassOnlyThePipelineTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt DataProcessingTaskRole.Arn
+                  - !GetAtt DataProcessingExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+        - PolicyName: read-session-plan
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The plan task writes manifests/plan/<execution>.json; nothing else is readable.
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DataBucket.Arn}/manifests/plan/*"
+        - PolicyName: detect-concurrent-run
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:ListExecutions
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-pipeline"
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
@@ -543,15 +596,14 @@ Resources:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
 
-  # Future data-processing roles (M2-M6 container tasks). Created now so their
-  # permissions are reviewed together with the rest; nothing assumes them yet.
+  # Data-processing roles of the M2-M6 Fargate tasks (PipelineTaskDefinition).
   DataProcessingTaskRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-data-processing"
       Description: >-
-        Future task role of the M2-M6 batch jobs: read/write the pipeline prefixes of the
-        data lake. No delete, no access to models/.
+        Task role of the M2-M6 batch tasks: read/write the pipeline prefixes of the data
+        lake. No delete, no access to models/.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -594,7 +646,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-data-processing-exec"
-      Description: Future ECS task execution role - pull the pipeline image and write container logs.
+      Description: ECS task execution role of the batch tasks - pull the pipeline image and write container logs.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -629,6 +681,184 @@ Resources:
         - { Key: Environment, Value: !Ref Environment }
 
   # ---------------------------------------------------------------------------
+  # Network for the batch tasks
+  # ---------------------------------------------------------------------------
+  # A dedicated VPC with public subnets: the tasks reach OpenF1, ECR, S3 and
+  # CloudWatch Logs over HTTPS through an Internet Gateway, with a public IP per
+  # running task. No NAT Gateway and no interface endpoints: both bill by the
+  # hour even when nothing runs. The VPC, subnets, route table and gateway cost
+  # nothing by themselves; a task's public IPv4 address is billed while the
+  # task runs. Nothing can connect in: the security group has no ingress rule.
+  PipelineVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PipelineVpc
+      InternetGatewayId: !Ref PipelineInternetGateway
+
+  # Two Availability Zones, so a task can still start when one is short of
+  # Fargate capacity. Public IPs are requested per task (AssignPublicIp), not
+  # by default on the subnet.
+  PipelineSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PipelineVpc
+      CidrBlock: 10.42.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-a" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PipelineVpc
+      CidrBlock: 10.42.0.64/26
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-b" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelinePublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PipelineVpc
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-public" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  PipelineDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: PipelineGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PipelinePublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref PipelineInternetGateway
+
+  PipelineSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PipelineSubnetA
+      RouteTableId: !Ref PipelinePublicRouteTable
+
+  PipelineSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PipelineSubnetB
+      RouteTableId: !Ref PipelinePublicRouteTable
+
+  PipelineTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: M2-M6 batch tasks - no inbound traffic, outbound HTTPS only.
+      VpcId: !Ref PipelineVpc
+      # No SecurityGroupIngress: the container serves nothing.
+      # Egress replaces the default allow-all: only HTTPS (OpenF1, ECR, S3,
+      # CloudWatch Logs, STS). Name resolution goes to the VPC's Amazon DNS
+      # resolver, which security groups do not filter.
+      SecurityGroupEgress:
+        - Description: HTTPS to OpenF1 and AWS service endpoints
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-pipeline-tasks" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ---------------------------------------------------------------------------
+  # ECS / Fargate: the batch tasks (M2-M6)
+  # ---------------------------------------------------------------------------
+  PipelineCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-pipeline"
+      # Container Insights bills per metric; the task logs and the state
+      # machine's own metrics are enough for a batch pipeline.
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  # One task definition for every stage: the image runs
+  # `python -m f1_race_intelligence --stage ...` and the state machine
+  # overrides the command per stage. Created only once an image digest is
+  # supplied (PipelineImageUri).
+  PipelineTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasPipelineImage
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-pipeline"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # Measured locally: about 160-185 MB peak per stage; 1 GB leaves room for
+      # larger sessions.
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt DataProcessingExecutionRole.Arn
+      TaskRoleArn: !GetAtt DataProcessingTaskRole.Arn
+      # No volumes: with a read-only root filesystem every stage was verified
+      # to run without any writable path (no /tmp either); all data goes to S3.
+      ContainerDefinitions:
+        - Name: pipeline
+          Image: !Ref PipelineImageUri
+          Essential: true
+          User: "10001:10001"
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+            InitProcessEnabled: true
+          Command: ["--help"]
+          # Only non-secret settings; credentials come from the task role.
+          Environment:
+            - { Name: F1_ENVIRONMENT, Value: aws }
+            - { Name: F1_COMPONENT, Value: pipeline }
+            - { Name: F1_CONFIG_PATH, Value: /app/configs/config.yaml }
+            - { Name: F1_STORAGE_BUCKET, Value: !Ref DataBucket }
+            - { Name: F1_STORAGE_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DataProcessingLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: pipeline
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  # ---------------------------------------------------------------------------
   # Availability checker
   # ---------------------------------------------------------------------------
   AvailabilityCheckerFunction:
@@ -643,6 +873,7 @@ Resources:
       Environment:
         Variables:
           ENVIRONMENT: !Ref Environment
+          F1_COMPONENT: availability-checker
           OPENF1_BASE_URL: !Ref OpenF1BaseUrl
           OPENF1_PROBE_PATH: /sessions?session_key=7953
           OPENF1_TIMEOUT_SECONDS: "5"
@@ -728,6 +959,13 @@ Resources:
         PipelineEnabled: !Ref PipelineEnabled
         DataBucketName: !Ref DataBucket
         AlertTopicArn: !Ref AlertTopic
+        ClusterArn: !GetAtt PipelineCluster.Arn
+        # Without an image there is no task definition; the PipelineNeedsAnImage
+        # rule keeps the pipeline disabled in that case, so it is never used.
+        TaskDefinitionArn: !If [HasPipelineImage, !Ref PipelineTaskDefinition, "not-configured"]
+        SubnetA: !Ref PipelineSubnetA
+        SubnetB: !Ref PipelineSubnetB
+        TaskSecurityGroupId: !Ref PipelineTaskSecurityGroup
       Role: !GetAtt PipelineStateMachineRole.Arn
       Logging:
         Level: ALL
@@ -847,50 +1085,41 @@ Resources:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
 
-  RaceModelCluster:
-    Type: AWS::ECS::Cluster
-    Condition: HasModelCompute
-    Properties:
-      ClusterName: !Sub "${ProjectName}-${Environment}-race-model"
-      CapacityProviders: [FARGATE, FARGATE_SPOT]
-      ClusterSettings:
-        - { Name: containerInsights, Value: disabled }
-      Tags:
-        - { Key: Project, Value: !Ref ProjectName }
-        - { Key: Environment, Value: !Ref Environment }
-
-  RaceModelSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Condition: HasModelCompute
-    Properties:
-      GroupDescription: Race-model Fargate tasks - no inbound, HTTPS out only.
-      VpcId: !Ref ModelVpcId
-      SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: S3, ECR, CloudWatch Logs }
-      Tags:
-        - { Key: Project, Value: !Ref ProjectName }
-        - { Key: Environment, Value: !Ref Environment }
-
+  # The race-model tasks share the M2-M6 image, cluster, subnets and security
+  # group (PipelineCluster, PipelineSubnetA/B, PipelineTaskSecurityGroup), with
+  # the same container hardening, and their own roles and log group.
   RaceModelTaskDefinition:
     Type: AWS::ECS::TaskDefinition
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       Family: !Sub "${ProjectName}-${Environment}-race-model"
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
+      # Training replays 69 races and runs about 1,500 forecasts of 4,000 draws;
+      # measured locally at about 6 minutes and well under 2 GB.
       Cpu: "2048"
       Memory: "8192"
-      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
-      TaskRoleArn: !GetAtt RaceModelTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt RaceModelExecutionRole.Arn
+      TaskRoleArn: !GetAtt RaceModelTaskRole.Arn
+      # No volumes: the race-model stages read and write only through S3.
       ContainerDefinitions:
         - Name: race-model
-          Image: !Sub "${PipelineImageRepository.RepositoryUri}:${ModelImageTag}"
+          Image: !Ref PipelineImageUri
           Essential: true
+          User: "10001:10001"
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+            InitProcessEnabled: true
           Command: ["--stage", "m7-train"]
-          ReadonlyRootFilesystem: false
           Environment:
             - { Name: F1_ENVIRONMENT, Value: aws }
+            - { Name: F1_COMPONENT, Value: race-model }
+            - { Name: F1_CONFIG_PATH, Value: /app/configs/config.yaml }
             - { Name: F1_STORAGE_BUCKET, Value: !Ref DataBucket }
             - { Name: F1_STORAGE_REGION, Value: !Ref AWS::Region }
           LogConfiguration:
@@ -902,13 +1131,14 @@ Resources:
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
 
   RaceModelStateMachineRole:
     Type: AWS::IAM::Role
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-race-model-states"
-      Description: Runs the race-model Fargate tasks, waits for them (.sync) and publishes failures.
+      Description: Runs the race-model Fargate tasks on the pipeline cluster, waits for them (.sync) and publishes failures.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -923,22 +1153,30 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: RunTask
+              - Sid: RunRaceModelTaskDefinitionOnTheClusterOnly
                 Effect: Allow
                 Action: ecs:RunTask
-                Resource: !Ref RaceModelTaskDefinition
-              - Sid: TrackTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-${Environment}-race-model:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt PipelineCluster.Arn
+              - Sid: WatchAndStopClusterTasks
                 Effect: Allow
-                Action: [ecs:StopTask, ecs:DescribeTasks]
-                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RaceModelCluster}/*"
-              - Sid: PassTaskRoles
-                Effect: Allow
-                Action: iam:PassRole
-                Resource: [!GetAtt RaceModelTaskRole.Arn, !GetAtt RaceModelExecutionRole.Arn]
-              - Sid: SyncIntegrationRule  # the managed rule Step Functions uses for runTask.sync
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}-${Environment}-pipeline/*"
+              - Sid: TaskCompletionEvents
                 Effect: Allow
                 Action: [events:PutTargets, events:PutRule, events:DescribeRule]
                 Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+              - Sid: PassOnlyTheRaceModelTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt RaceModelTaskRole.Arn
+                  - !GetAtt RaceModelExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
         - PolicyName: publish-critical-alerts
           PolicyDocument:
             Version: "2012-10-17"
@@ -967,19 +1205,18 @@ Resources:
 
   RaceModelStateMachine:
     Type: AWS::Serverless::StateMachine
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       Name: !Sub "${ProjectName}-${Environment}-race-model"
       Type: STANDARD
       DefinitionUri: statemachine/model.asl.json
       DefinitionSubstitutions:
         Environment: !Ref Environment
-        ClusterArn: !GetAtt RaceModelCluster.Arn
+        ClusterArn: !GetAtt PipelineCluster.Arn
         TaskDefinitionArn: !Ref RaceModelTaskDefinition
-        SecurityGroupId: !GetAtt RaceModelSecurityGroup.GroupId
-        SubnetIdsJson: !Sub
-          - '["${Ids}"]'
-          - Ids: !Join ['","', !Ref ModelSubnetIds]
+        SubnetA: !Ref PipelineSubnetA
+        SubnetB: !Ref PipelineSubnetB
+        TaskSecurityGroupId: !Ref PipelineTaskSecurityGroup
         AlertTopicArn: !Ref AlertTopic
       Role: !GetAtt RaceModelStateMachineRole.Arn
       Logging:
@@ -995,7 +1232,7 @@ Resources:
 
   RaceModelScheduleRole:
     Type: AWS::IAM::Role
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       RoleName: !Sub "${ProjectName}-${Environment}-race-model-schedule"
       Description: Lets EventBridge start the race-model state machine on its schedules.
@@ -1022,7 +1259,7 @@ Resources:
 
   RaceModelTrainingScheduleRule:
     Type: AWS::Events::Rule
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       Name: !Sub "${ProjectName}-${Environment}-race-model-train"
       Description: Retrains the race model; the new version is promoted only if it beats the baseline.
@@ -1036,7 +1273,7 @@ Resources:
 
   RaceModelUpdateScheduleRule:
     Type: AWS::Events::Rule
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       Name: !Sub "${ProjectName}-${Environment}-race-model-update"
       Description: Feeds the last race into the season state (frozen hyperparameters).
@@ -1111,7 +1348,7 @@ Resources:
       Description: In-race finishing-position forecast (M7) for one race and lap, or the race running now.
       PackageType: Image
       Code:
-        ImageUri: !Sub "${ForecastImageRepository.RepositoryUri}:${ForecastImageTag}"
+        ImageUri: !Ref ForecastImageUri
       Architectures: [x86_64]
       MemorySize: 3008
       Timeout: 120
@@ -1183,7 +1420,7 @@ Resources:
 
   RaceModelExecutionsFailedAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Properties:
       AlarmName: !Sub "${ProjectName}-${Environment}-race-model-executions-failed"
       AlarmDescription: A race-model run failed (training, evaluation/promotion or update).
@@ -1210,6 +1447,24 @@ Resources:
       AlarmDescription: The availability checker crashed or timed out (HTTP problems are not errors).
       Namespace: AWS/Lambda
       MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref AvailabilityCheckerFunction }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  AvailabilityCheckerThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-availability-checker-throttles"
+      AlarmDescription: The availability checker was throttled at least once in the last hour.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
       Dimensions:
         - { Name: FunctionName, Value: !Ref AvailabilityCheckerFunction }
       Statistic: Sum
@@ -1308,11 +1563,12 @@ Resources:
 
   OpenF1UnavailableSustainedAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: AvailabilityAlarmCadence
     Properties:
       AlarmName: !Sub "${ProjectName}-${Environment}-openf1-unavailable-sustained"
       AlarmDescription: >-
-        Every availability check in the last 6 hours reported OpenF1 as unavailable.
-        Short outages (live sessions, rate limits) are expected and do not alarm.
+        Created only for 15- or 30-minute checks. Alerts after six consecutive hourly
+        periods report OpenF1 unavailable; short outages do not alarm.
       Namespace: !Sub "${ProjectName}/${Environment}"
       MetricName: OpenF1Available
       Dimensions:
@@ -1326,6 +1582,126 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
+
+  ObservabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${Environment}-operations"
+      DashboardBody: !Sub |2
+            {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Pipeline execution outcomes",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "${PipelineStateMachine}", {"label": "Started"}],
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${PipelineStateMachine}", {"label": "Succeeded"}],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${PipelineStateMachine}", {"label": "Failed"}],
+                  ["AWS/States", "ExecutionsTimedOut", "StateMachineArn", "${PipelineStateMachine}", {"label": "Timed out"}],
+                  ["AWS/States", "ExecutionsAborted", "StateMachineArn", "${PipelineStateMachine}", {"label": "Aborted"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Pipeline execution duration",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${PipelineStateMachine}", {"stat": "Average", "label": "Average (ms)"}],
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${PipelineStateMachine}", {"stat": "Maximum", "label": "Maximum (ms)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Availability checker requests and faults",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AvailabilityCheckerFunction}", {"label": "Invocations"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${AvailabilityCheckerFunction}", {"label": "Errors"}],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${AvailabilityCheckerFunction}", {"label": "Throttles"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Availability checker duration",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${AvailabilityCheckerFunction}", {"stat": "Average", "label": "Average (ms)"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${AvailabilityCheckerFunction}", {"stat": "Maximum", "label": "Maximum (ms)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "OpenF1 availability",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["${ProjectName}/${Environment}", "OpenF1Available", "Environment", "${Environment}", {"stat": "Maximum", "label": "Available (1=yes, 0=no)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "max": 1}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "OpenF1 probe latency",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "metrics": [
+                  ["${ProjectName}/${Environment}", "OpenF1LatencyMs", "Environment", "${Environment}", {"stat": "Average", "label": "Average (ms)"}]
+                ],
+                "yAxis": {"left": {"min": 0, "label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "EventBridge invocation failures",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/Events", "FailedInvocations", "RuleName", "${ProjectName}-${Environment}-openf1-availability-schedule", {"label": "Availability schedule"}],
+                  ["AWS/Events", "FailedInvocations", "EventBusName", "${ProjectName}-${Environment}-orchestration", "RuleName", "${ProjectName}-${Environment}-availability-result", {"label": "Availability result"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            }
+          ]
+            }
 
 Outputs:
   DataBucketName:
@@ -1353,23 +1729,39 @@ Outputs:
     Description: SNS topic for critical infrastructure alerts.
     Value: !Ref AlertTopic
     Export: { Name: !Sub "${AWS::StackName}-AlertTopicArn" }
+  ObservabilityDashboardName:
+    Description: CloudWatch dashboard for pipeline and availability operations.
+    Value: !Ref ObservabilityDashboard
   PipelineImageRepositoryUri:
     Description: ECR repository for the M2-M6 batch image.
     Value: !GetAtt PipelineImageRepository.RepositoryUri
   DataProcessingTaskRoleArn:
-    Description: Future task role for the M2-M6 container jobs.
+    Description: Task role of the M2-M6 Fargate tasks.
     Value: !GetAtt DataProcessingTaskRole.Arn
   DataProcessingExecutionRoleArn:
-    Description: Future ECS task execution role (image pull, container logs).
+    Description: ECS task execution role of the batch tasks (image pull, container logs).
     Value: !GetAtt DataProcessingExecutionRole.Arn
   ForecastImageRepositoryUri:
     Description: ECR repository for the forecast Lambda image (Dockerfile.forecast).
     Value: !GetAtt ForecastImageRepository.RepositoryUri
   RaceModelStateMachineArn:
-    Condition: HasModelCompute
+    Condition: HasPipelineImage
     Description: Race-model lifecycle (input {"action":"train"} or {"action":"update"}).
     Value: !Ref RaceModelStateMachine
   ForecastFunctionName:
     Condition: HasForecastFunction
     Description: Forecast Lambda (event {"session_key":..,"lap":..} or {"mode":"live"}).
     Value: !Ref ForecastFunction
+  PipelineClusterName:
+    Description: ECS cluster the batch tasks run on.
+    Value: !Ref PipelineCluster
+  PipelineTaskDefinitionArn:
+    Condition: HasPipelineImage
+    Description: Fargate task definition of the M2-M6 batch tasks (image pinned by digest).
+    Value: !Ref PipelineTaskDefinition
+  PipelineSubnetIds:
+    Description: Public subnets of the batch tasks (comma separated).
+    Value: !Join [",", [!Ref PipelineSubnetA, !Ref PipelineSubnetB]]
+  PipelineTaskSecurityGroupId:
+    Description: Security group of the batch tasks (no ingress, HTTPS egress only).
+    Value: !Ref PipelineTaskSecurityGroup

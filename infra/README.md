@@ -1,14 +1,16 @@
 # Infraestructura AWS (SAM / CloudFormation)
 
-> **Estado: NO desplegado.** Este directorio define la infraestructura base y la
-> orquestación inicial. No crea datos, no ejecuta extracciones, no entrena ni
-> publica modelos (sin M7, sin SageMaker). M2–M6 existen en la state machine
-> solo como estados *placeholder*.
+> **Estado:** `aws_status.json` es la fuente única de verdad versionada. La
+> arquitectura y su código están definidos, y la validación local está
+> registrada allí. El estado de despliegue y las pruebas en AWS real son
+> **NO VERIFICABLES** en ausencia de comprobación humana; este documento no
+> reemplaza esa evidencia. No entrena ni publica modelos (sin M7, sin SageMaker).
 
 ## Estructura
 
 ```
 infra/
+├── aws_status.json                       # estado técnico AWS: fuente única de verdad
 ├── template.yaml                          # stack SAM (CloudFormation + Transform)
 ├── samconfig.toml                         # parámetros por entorno (dev, prod); confirma changesets
 ├── functions/
@@ -40,15 +42,21 @@ tests/infra/                               # tests de la Lambda, la state machin
         IsAvailabilityResultValid ── no ─► Fail        │   · OpenF1 no disponible 6 h seguidas (EMF)
         IsOpenF1Available ── false ─► OpenF1Unavailable (Succeed)
         IsPipelineEnabled ── false ─► PipelineDisabled (Succeed)   ← valor por defecto
-        PlanSessions                          (placeholder)
-        PerSessionPipeline  Map, concurrencia 1
-          M2_Extraction → M3_Validation → M4_Consolidation → M5_Features   (placeholders)
-        M6_ModelingDataset                    (placeholder)
-        Catch (solo en el Map) ─► NotifyPipelineFailure ─┘ ─► PipelineFailed
+        CheckForConcurrentRun ── otra ejecución RUNNING ─► AnotherRunInProgress (Succeed)
+        PlanSessions        Fargate --stage plan --plan-output s3://…/manifests/plan/<ejecución>.json
+        LoadPlan            s3:getObject del plan → $.plan.sessions
+        PerSessionPipeline  Map, concurrencia 1, una tarea Fargate por etapa
+          M2_Extraction → M3_Validation → M4_Consolidation → M5_Features
+        M6_ModelingDataset  Fargate --stage m6 (global)
+        cada tarea: Retry (arranque / ejecución) + Choice sobre el exit code
+        Catch ─► NotifyPipelineFailure ─┘ ─► PipelineFailed
 
   S3 data lake <p>-<env>-<account>-<region>      ECR <p>-<env>-pipeline      CloudWatch Logs (retención parametrizada)
-  raw/ validated/ consolidated/ features/        (imagen batch M2–M6)        /aws/lambda/…  /aws/vendedlogs/states/…
-  modeling/ models/ manifests/                                               /aws/ecs/… (jobs futuros)
+  raw/ validated/ consolidated/ features/        (imagen batch M2–M6,        /aws/lambda/…  /aws/vendedlogs/states/…
+  modeling/ models/ manifests/                    fijada por digest)          /aws/ecs/<p>-<env>-pipeline (tareas)
+
+  VPC 10.42.0.0/24 (dedicada): 2 subredes públicas, Internet Gateway, sin NAT ni endpoints
+  ECS cluster <p>-<env>-pipeline (sin Container Insights) · task definition Fargate x86_64 0,5 vCPU / 1 GB
 ```
 
 Por qué la Lambda no llama a Step Functions: se limita a responder. Su
@@ -64,20 +72,22 @@ explícitamente si termina (`available == false`) o sigue.
 | S3 `DataBucket` | versionado; SSE-S3; bloqueo total de acceso público; `BucketOwnerEnforced`; política que niega tráfico sin TLS; lifecycle: aborta multipart a 7 d, expira versiones no actuales (parámetro, 90 d), limpia delete markers, `raw/` a Intelligent-Tiering a 30 d, `manifests/` a 90 d, `logs/` expira a 365 d; **nunca expira datasets actuales**; `DeletionPolicy: RetainExceptOnCreate`, `UpdateReplacePolicy: Retain` |
 | Lambda `openf1-availability` | Python 3.12 arm64, 128 MB, 15 s; sin VPC; sin reintentos asíncronos; destinos OnSuccess→bus, OnFailure→SNS; métricas EMF `OpenF1Available`, `OpenF1LatencyMs` |
 | EventBridge | regla programada (parámetros `AvailabilitySchedule`, `AvailabilityScheduleState`); bus propio + regla de resultados |
-| Step Functions | STANDARD; logs `ALL` a CloudWatch; M2–M6 como `Pass` |
+| Step Functions | STANDARD; logs `ALL` a CloudWatch; timeout global 12 h; plan y M2–M6 como `ecs:runTask.sync` (ver "Tareas Fargate") |
+| ECS | cluster sin Container Insights; task definition Fargate `X86_64`, 512 CPU / 1024 MB, usuario `10001:10001`, raíz de solo lectura, `capabilities.drop: [ALL]`, sin puertos ni volúmenes; solo si `PipelineImageUri` tiene valor |
+| Red | VPC dedicada `10.42.0.0/24`, 2 subredes públicas en 2 AZ, Internet Gateway, security group sin entrada y salida solo TCP 443 |
 | SNS | topic de alertas críticas; política para CloudWatch de la misma cuenta; suscripción e-mail opcional |
 | ECR | tags inmutables, escaneo al subir, expira sin tag a 7 d, conserva 30 imágenes; `RetainExceptOnCreate` |
-| CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas |
+| CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas base y una condicional; dashboard operativo |
 
 ## IAM (mínimo privilegio)
 
 | Rol | Confía en | Permisos |
 |---|---|---|
 | `…-availability-lambda` | `lambda.amazonaws.com` | escribir en su log group; `events:PutEvents` en el bus de orquestación; `sns:Publish` en el topic de alertas. **Sin S3.** |
-| `…-pipeline-states` | `states.amazonaws.com` | `sns:Publish` en el topic; APIs de entrega de logs (`Resource: "*"` exigido por AWS). **Sin S3, sin ECS todavía.** |
+| `…-pipeline-states` | `states.amazonaws.com` | `sns:Publish` en el topic; APIs de entrega de logs (`Resource: "*"` exigido por AWS); `ecs:RunTask` solo de la familia `<p>-<env>-pipeline` y con condición `ecs:cluster`; `ecs:DescribeTasks`/`StopTask` solo sobre tareas del cluster; `events:PutRule/PutTargets/DescribeRule` solo sobre la regla administrada `StepFunctionsGetEventsForECSTaskRule`; `iam:PassRole` solo de los dos roles de tarea y con `iam:PassedToService=ecs-tasks.amazonaws.com`; `s3:GetObject` solo en `manifests/plan/*`; `states:ListExecutions` solo sobre esta state machine |
 | `…-availability-to-states` | `events.amazonaws.com` | `states:StartExecution` solo sobre la state machine |
-| `…-data-processing` (futuro) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` en `raw/ validated/ consolidated/ features/ modeling/ manifests/`. Sin `Delete*`, sin `models/`. |
-| `…-data-processing-exec` (futuro) | `ecs-tasks.amazonaws.com` | pull de la imagen del repositorio ECR (`GetAuthorizationToken` requiere `*`); escribir en `/aws/ecs/…` |
+| `…-data-processing` (tarea) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` en `raw/ validated/ consolidated/ features/ modeling/ manifests/`. Sin `Delete*`, sin `models/`. |
+| `…-data-processing-exec` (ejecución) | `ecs-tasks.amazonaws.com` | pull de la imagen del repositorio ECR (`GetAuthorizationToken` requiere `*`); escribir en `/aws/ecs/…` |
 
 Todas las relaciones de confianza llevan `aws:SourceAccount`, salvo la del rol
 de la Lambda, que usa la confianza estándar de `lambda.amazonaws.com`: no se
@@ -85,10 +95,9 @@ pudo verificar que Lambda admita esa condición en roles de ejecución, y si no 
 admite `CreateFunction` podría fallar. No hay políticas administradas de AWS ni
 `AdministratorAccess`.
 
-`PlanSessions` y `M6_ModelingDataset` son estados `Pass` y Step Functions no
-admite `Retry`/`Catch` en ellos; hoy solo el `Map` captura errores. Al
-convertirlos en `Task` de ECS hay que añadirles `Retry` y `Catch` hacia
-`NotifyPipelineFailure`.
+`ecs:DescribeTasks`/`StopTask` se limitan a `task/<cluster>/*` aunque la
+política que genera AWS usa `"*"`; la condición `ecs:cluster` y ese ámbito se
+verifican en la primera ejecución controlada.
 
 `s3:ListBucket` no se restringe por `s3:prefix` a propósito: sin ese permiso,
 `HeadObject` sobre una clave inexistente devuelve 403 en vez de 404 y la
@@ -101,13 +110,153 @@ idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
 | `ProjectName` | `f1-race-intelligence` | prefijo de nombres y tag |
 | `Environment` | `dev` | `dev` · `staging` · `prod` |
 | `S3BucketName` | vacío | vacío ⇒ `<project>-<env>-<account>-<region>` |
-| `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min |
+| `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min; la alarma sostenida solo se crea para 15/30 min |
 | `AvailabilityScheduleState` | `DISABLED` | `samconfig.toml` también lo fija en `DISABLED` (dev y prod); activarlo es una decisión explícita |
-| `PipelineEnabled` | `false` | dejar en `false` hasta desplegar los jobs |
+| `PipelineEnabled` | `false` | `true` exige `PipelineImageUri` (regla `PipelineNeedsAnImage`); dejar en `false` hasta verificar una primera ejecución controlada |
+| `PipelineImageUri` | vacío | imagen batch **por digest** (`…/f1-race-intelligence-dev-pipeline@sha256:<64 hex>`); vacío ⇒ no se crea la task definition. No se guarda en `samconfig.toml` |
 | `LogRetentionDays` | `30` | valores válidos de CloudWatch |
 | `NoncurrentVersionExpirationDays` | `90` | |
 | `OpenF1BaseUrl` | `https://api.openf1.org/v1` | |
 | `AlertEmail` | vacío | vacío ⇒ **sin suscripción: nadie recibe las alertas**; ver "Alertas por correo" |
+
+## Observabilidad operativa
+
+Las tareas Fargate reciben `F1_PIPELINE_EXECUTION_ID` desde Step Functions. El
+formateador JSON añade `component`, `logger` y `pipeline_execution_id` a cada
+registro. `component` usa el vocabulario estable configurado por `F1_COMPONENT`
+(por defecto `f1-race-intelligence`; `pipeline` en ECS y
+`availability-checker` en Lambda); `logger` conserva el nombre Python real del
+módulo. El CLI ya registra `stage_started` y `stage_finished` con duración, estado,
+resumen y excepciones. En M3, `WARNING` se etiqueta `partial` y `FAIL` se
+registra como `failed` (y se muestra como fallo en modo no estricto); ninguno
+cambia el código de salida no estricto ni detiene la secuencia. Un M6
+`VALID_WITH_WARNINGS` se etiqueta como `partial`. El resumen M6 conserva `run_id` e
+`input_fingerprint`; así se puede enlazar ese artefacto con el ID de ejecución
+del pipeline sin cambiar el contrato del reporte M6. La Lambda registra el
+componente, el estado `completed`, hora de inicio/fin y duración. Un sondeo
+HTTP no disponible sigue siendo una invocación completada: no es un error de
+ejecución Lambda.
+
+Los logs se escriben en los tres grupos descritos arriba y retienen el periodo
+configurado. No se registran secretos, credenciales ni contenido de artefactos.
+Los IDs de ejecución, `run_id`, `input_fingerprint`, estados y rutas de
+artefactos son metadatos de diagnóstico, no sus contenidos. La ejecución M7 /
+MLflow y el prototipo M8 no forman parte de esta infraestructura desplegable;
+no hay métricas AWS de entrenamiento, publicación ni HTTP 5xx del serving.
+
+| Métrica | Namespace / dimensión | Unidad y estadística | Significado |
+|---|---|---|---|
+| `ExecutionsStarted`, `ExecutionsSucceeded`, `ExecutionsFailed`, `ExecutionsTimedOut`, `ExecutionsAborted` | `AWS/States`, `StateMachineArn=<pipeline>` | Count / Sum | Volumen y desenlace de ejecuciones |
+| `ExecutionTime` | `AWS/States`, `StateMachineArn=<pipeline>` | Milliseconds / Average, Maximum | Duración de las ejecuciones |
+| `Invocations`, `Errors`, `Throttles` | `AWS/Lambda`, `FunctionName=<availability checker>` | Count / Sum | Actividad, errores de ejecución y limitación de concurrencia |
+| `Duration` | `AWS/Lambda`, `FunctionName=<availability checker>` | Milliseconds / Average, Maximum | Duración de la Lambda |
+| `FailedInvocations` | `AWS/Events`, `RuleName`; para la regla de resultados también `EventBusName` | Count / Sum | Fallos al invocar la Lambda o iniciar Step Functions |
+| `OpenF1Available` | `f1-race-intelligence/<env>`, `Environment=<env>` | Count / Maximum (0 o 1) | Resultado del sondeo, emitido por EMF |
+| `OpenF1LatencyMs` | `f1-race-intelligence/<env>`, `Environment=<env>` | Milliseconds / Average | Latencia del sondeo, emitida por EMF |
+
+`<env>` y el prefijo del namespace se generan desde `ProjectName` y
+`Environment`. Las métricas `AWS/*` son métricas de servicio; las dos
+`OpenF1*` son las únicas métricas personalizadas. La Lambda emite EMF a su log
+group y no necesita `cloudwatch:PutMetricData`.
+
+### Alarmas y dashboard
+
+Las cuatro alarmas base y, cuando la cadencia lo permite, la alarma sostenida
+publican al mismo `AlertTopic`; las acciones `OKActions` también notifican la
+recuperación:
+
+| Alarma | Criterio | Datos faltantes |
+|---|---|---|
+| `AvailabilityCheckerErrorsAlarm` | ≥1 error Lambda en 1 h; incluye timeout de función | `notBreaching` |
+| `AvailabilityCheckerThrottlesAlarm` | ≥1 throttling Lambda en 1 h | `notBreaching` |
+| `PipelineExecutionsFailedAlarm` | ≥1 fallo, timeout o aborto de Step Functions en 1 h | `notBreaching` |
+| `OrchestrationRulesFailedInvocationsAlarm` | ≥1 fallo de invocación EventBridge en 1 h | `notBreaching` |
+| `OpenF1UnavailableSustainedAlarm` | Solo creada para sondeos cada 15/30 min; 6 de 6 periodos horarios con `OpenF1Available < 1` | `notBreaching` |
+
+El umbral de una incidencia para errores/throttling/fallos captura eventos
+operativos concretos sin generar alarmas por ausencia de ejecuciones. La métrica
+OpenF1 se emite en todas las cadencias, pero la alarma **no se crea** para
+`rate(1 hour)`, `rate(3 hours)`, `rate(6 hours)`, `rate(12 hours)` ni
+`rate(1 day)`: con esos intervalos no hay suficientes muestras horarias para
+garantizar seis evaluaciones consecutivas. Para las cadencias de 15/30 minutos,
+la alarma requiere seis horas continuas de indisponibilidad y evita alertar por
+restricciones de sesión en vivo o rate limits breves. La ausencia de
+`OpenF1Available` no significa indisponibilidad y no alarma. La regla de
+EventBridge sigue `DISABLED` por defecto; no habrá muestras ni alertas mientras
+esté deshabilitada, aunque se cree la alarma para una cadencia compatible.
+
+`<ProjectName>-<Environment>-operations` contiene gráficos de resultados y
+duración de Step Functions, errores/throttling y duración Lambda, resultados y
+latencia OpenF1 y fallos EventBridge. Usa solo métricas y dimensiones presentes
+en este stack. No hay un panel ni alarma de serving hasta que exista una
+integración de despliegue que emita métricas HTTP compatibles.
+
+El correo sigue siendo opcional. Crear `AlertEmailSubscription` con una
+dirección solo significa que se solicitó la suscripción: estará
+`PendingConfirmation` hasta que el destinatario acepte el correo de SNS. Solo
+un `SubscriptionArn` confirmado representa notificaciones efectivas. Con
+`AlertEmail` vacío, el topic y las alarmas existen, pero no hay destinatario.
+La Lambda también tiene destino `OnFailure` a SNS y Step Functions publica
+detalles en `NotifyPipelineFailure`; por tanto, un mismo fallo puede generar
+tanto la notificación directa como la de la alarma agregada.
+
+## Tareas Fargate (Fase 1B)
+
+Todas las etapas usan **la misma imagen y la misma task definition**; la state
+machine solo cambia el comando (`python -m f1_race_intelligence …`). Cada
+etapa lee sus entradas de S3 y escribe sus salidas en S3 (layout `lake`), así
+que ninguna tarea depende del disco de otra.
+
+| Estado | Comando | Lee | Escribe |
+|---|---|---|---|
+| `PlanSessions` | `--stage plan --plan-output s3://<bucket>/manifests/plan/<ejecución>.json` | OpenF1 (`meetings`, `sessions`) | `raw/…/endpoint=meetings|sessions/`, `manifests/extraction/`, el plan |
+| `M2_Extraction` | `--stage m2 --year Y --meeting-key M --session-key S` | OpenF1 | `raw/year=Y/meeting=M/session=S/…`, `manifests/extraction/year=Y/session=S/` |
+| `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
+| `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
+| `M5_Features` | `--stage m5 --year Y --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
+| `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/runs/<run_id>/`, `modeling/preprocessing/runs/<run_id>/`, `manifests/modeling/` |
+
+Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
+generan esos comandos y los pasan por el parser real de la CLI.
+
+**Endurecimiento**
+
+- Imagen: sin ejecutables setuid/setgid (se retiran y se verifica en el build).
+- Tarea: usuario `10001:10001`, `readonlyRootFilesystem: true`,
+  `capabilities.drop: ["ALL"]`, sin puertos, sin secretos en el entorno.
+- Sin volúmenes: con la raíz de solo lectura se comprobó en local que plan,
+  M3–M6 y el modo AWS no escriben en ningún directorio (tampoco en `/tmp`).
+  `tmpfs` no existe en Fargate; si una etapa futura necesitara espacio
+  temporal, se añadiría un volumen de tarea montado en `/tmp`.
+
+Estas medidas **mitigan** la explotación local; **no corrigen** los paquetes
+vulnerables de la imagen base Debian 12 (sin parche publicado en bookworm).
+
+**Red y costes**
+
+VPC dedicada con subredes públicas e Internet Gateway; cada tarea recibe una
+IP pública (`AssignPublicIp: ENABLED`) para salir por HTTPS a OpenF1, ECR, S3
+y CloudWatch Logs. Se descartó NAT Gateway y VPC endpoints de interfaz porque
+facturan por hora aunque no se ejecute nada. La VPC, subredes, tabla de rutas,
+gateway y cluster no tienen coste propio; sí lo tienen la **IPv4 pública** de
+cada tarea mientras corre, el cómputo Fargate (0,5 vCPU / 1 GB, mínimo de un
+minuto por tarea), los logs y la transferencia de datos. La conectividad real
+no se ha probado: se verifica en la primera ejecución controlada.
+
+**Publicar y activar (fase posterior, con aprobación)**
+
+1. Publicar la imagen y anotar su **digest de manifiesto**.
+2. Desplegar con `PipelineImageUri=<repositorio>@sha256:<digest>` (añadirlo a
+   la lista completa de parámetros de "Alertas por correo"), manteniendo
+   `PipelineEnabled=false`, y revisar el change set.
+3. Primera ejecución controlada **manual** de una sesión, comprobando en el
+   historial: que un exit code ≠ 0 se detecta (la documentación no aclara si
+   `runTask.sync` falla el estado o termina con éxito; la definición cubre
+   ambos casos), el formato de `Containers[0].ExitCode` en la salida, la
+   respuesta de `listExecutions` (`Executions`) y que el ámbito IAM de
+   `DescribeTasks`/`StopTask` basta.
+4. Solo después, `PipelineEnabled=true`; el calendario sigue siendo una
+   decisión aparte.
 
 ## Validar (sin tocar AWS)
 
@@ -165,12 +314,37 @@ aws lambda invoke --function-name f1-race-intelligence-dev-openf1-availability \
 Para publicar la imagen batch en ECR (cuando corresponda):
 
 ```bash
-REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
-  --query "Stacks[0].Outputs[?OutputKey=='PipelineImageRepositoryUri'].OutputValue" --output text)
-aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}"
-docker build -t "$REPO:$(git rev-parse --short HEAD)" .
-docker push "$REPO:$(git rev-parse --short HEAD)"
+# Solo desde un árbol limpio: cualquier cambio sin commit, incluidos archivos
+# sin seguimiento, impide construir y publicar. La imagen registra el SHA
+# completo del commit (F1_GIT_COMMIT) y F1_GIT_DIRTY=false.
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "Hay cambios sin commit: no se construye ni se publica la imagen." >&2
+  false
+else
+  REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
+    --query "Stacks[0].Outputs[?OutputKey=='PipelineImageRepositoryUri'].OutputValue" --output text)
+  TAG=$(git rev-parse --short HEAD)
+  aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%%/*}" &&
+  docker build --platform linux/amd64 \
+    --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg F1_GIT_DIRTY=false \
+    -t "$REPO:$TAG" . &&
+  docker push "$REPO:$TAG" &&
+  # Imagen de la Lambda de pronóstico (M7): mismo código y commit.
+  FORECAST_REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
+    --query "Stacks[0].Outputs[?OutputKey=='ForecastImageRepositoryUri'].OutputValue" --output text) &&
+  docker build --platform linux/amd64 \
+    --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg F1_GIT_DIRTY=false \
+    -f Dockerfile.forecast -t "$FORECAST_REPO:$TAG" . &&
+  docker push "$FORECAST_REPO:$TAG"
+fi
 ```
+
+`--platform linux/amd64` coincide con la task definition (`X86_64`). La
+etiqueta corta solo nombra la imagen; el commit exacto queda en la imagen y
+en los reportes de M6. El digest que se pasa en `PipelineImageUri` es el que
+devuelve `docker push`.
 
 ## Alertas por correo (`AlertEmail`)
 
@@ -279,12 +453,12 @@ toma sustituyendo `DISABLED` en el despliegue correspondiente.
 El modelo (`src/f1_race_intelligence/race_model/`, matemática en
 `f1-model-math.md`) se despliega en dos piezas, cada una creada **solo cuando su
 imagen ya está en ECR** (parámetros vacíos ⇒ el stack no crea nada de M7 salvo el
-repositorio ECR del pronóstico y los roles):
+repositorio ECR del pronóstico, los roles y los log groups):
 
 | Pieza | Recurso | Se crea si | Qué hace |
 |---|---|---|---|
-| Entrenamiento / actualización | ECS Fargate (`RaceModelTaskDefinition`, imagen batch) + Step Functions `…-race-model` | `ModelImageTag`, `ModelVpcId` y `ModelSubnetIds` no vacíos | `{"action":"train"}`: `m7-train` → `m7-evaluate --promote`. `{"action":"update"}`: `m7-update` |
-| Pronóstico | Lambda imagen `…-race-forecast` (`Dockerfile.forecast`) | `ForecastImageTag` no vacío | `{"session_key":…, "lap":…}` o `{"mode":"live"}` → `forecasts/m7/…` |
+| Entrenamiento / actualización | ECS Fargate (`RaceModelTaskDefinition`, imagen batch, `PipelineCluster`) + Step Functions `…-race-model` | `PipelineImageUri` no vacío | `{"action":"train"}`: `m7-train` → `m7-evaluate --promote`. `{"action":"update"}`: `m7-update` |
+| Pronóstico | Lambda imagen `…-race-forecast` (`Dockerfile.forecast`) | `ForecastImageUri` no vacío | `{"session_key":…, "lap":…}` o `{"mode":"live"}` → `forecasts/m7/…` |
 
 Datos en el lake (contrato, ver `storage/layout.py`):
 
@@ -319,44 +493,31 @@ solo `forecasts/m7/`. Ninguno puede borrar.
 
 ### Publicar imágenes y desplegar
 
+Las dos imágenes (batch y pronóstico) se construyen y publican con el bloque
+protegido de "Para publicar la imagen batch en ECR": solo desde un árbol limpio
+y con el SHA completo del commit. Las tareas del modelo usan **la misma imagen
+batch** (`PipelineImageUri`), el mismo cluster, las mismas subredes y el mismo
+security group que M2-M6; la Lambda usa `ForecastImageUri`. Ambas van **por
+digest** (el que devuelve `docker push`), nunca por tag.
+
 ```bash
-STACK=f1-race-intelligence-dev
-TAG=$(git rev-parse --short HEAD)
-out() { aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
-BATCH_REPO=$(out PipelineImageRepositoryUri)
-FORECAST_REPO=$(out ForecastImageRepositoryUri)
-aws ecr get-login-password | docker login --username AWS --password-stdin "${BATCH_REPO%%/*}"
-docker build --platform linux/amd64 -t "$BATCH_REPO:$TAG" . && docker push "$BATCH_REPO:$TAG"
-docker build --platform linux/amd64 -f Dockerfile.forecast -t "$FORECAST_REPO:$TAG" . && docker push "$FORECAST_REPO:$TAG"
-
-# VPC por defecto y sus subredes públicas (las tareas necesitan salida a S3/ECR/Logs)
-VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
-SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC" --query "Subnets[].SubnetId" --output text | tr '\t' ',')
-
 : "${ALERT_EMAIL:?Define ALERT_EMAIL con la dirección real del destinatario}"
+: "${PIPELINE_IMAGE:?Define PIPELINE_IMAGE=<repositorio>@sha256:<digest> de la imagen batch}"
+: "${FORECAST_IMAGE:?Define FORECAST_IMAGE=<repositorio>@sha256:<digest> de la imagen de pronóstico}"
 cd infra && sam build
-sam deploy --config-env dev --parameter-overrides \
-  ParameterKey=ProjectName,ParameterValue=f1-race-intelligence \
-  ParameterKey=Environment,ParameterValue=dev \
-  'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"' \
-  ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED \
-  ParameterKey=PipelineEnabled,ParameterValue=false \
-  ParameterKey=LogRetentionDays,ParameterValue=30 \
-  "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}" \
-  "ParameterKey=ModelImageTag,ParameterValue=${TAG}" \
-  "ParameterKey=ForecastImageTag,ParameterValue=${TAG}" \
-  "ParameterKey=ModelVpcId,ParameterValue=${VPC}" \
-  "ParameterKey=ModelSubnetIds,ParameterValue='${SUBNETS}'" \
-  ParameterKey=ModelScheduleState,ParameterValue=DISABLED \
-  ParameterKey=LiveForecastScheduleState,ParameterValue=DISABLED
+sam deploy --config-env dev --parameter-overrides   ParameterKey=ProjectName,ParameterValue=f1-race-intelligence   ParameterKey=Environment,ParameterValue=dev   'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"'   ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED   ParameterKey=PipelineEnabled,ParameterValue=false   ParameterKey=LogRetentionDays,ParameterValue=30   "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}"   "ParameterKey=PipelineImageUri,ParameterValue=${PIPELINE_IMAGE}"   "ParameterKey=ForecastImageUri,ParameterValue=${FORECAST_IMAGE}"   ParameterKey=ModelScheduleState,ParameterValue=DISABLED   ParameterKey=LiveForecastScheduleState,ParameterValue=DISABLED
 ```
 
-En PowerShell, el mismo despliegue sigue el patrón protegido de "Alertas por
-correo" añadiendo los seis parámetros `Model*`/`Forecast*`/`LiveForecast*`.
+`PipelineEnabled=false` sigue apagando M2-M6: el modelo corre con su propia
+state machine, que solo arranca a mano o con sus calendarios (`DISABLED`). En
+PowerShell, el mismo despliegue sigue el patrón protegido de "Alertas por
+correo" añadiendo `PipelineImageUri`, `ForecastImageUri`, `ModelScheduleState`
+y `LiveForecastScheduleState`.
 
 Primera carga del modelo y pruebas (los datos `raw/` deben estar en el bucket):
 
 ```bash
+out() { aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 SM=$(out RaceModelStateMachineArn)
 aws stepfunctions start-execution --state-machine-arn "$SM" --input '{"action": "train"}'
 FN=$(out ForecastFunctionName)

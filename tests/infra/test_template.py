@@ -111,6 +111,35 @@ def test_schedule_is_disabled_by_default(template) -> None:
     assert rule["State"] == {"Ref": "AvailabilityScheduleState"}
 
 
+def test_sustained_unavailable_alarm_only_exists_for_sufficient_check_cadence(template) -> None:
+    supported = {"rate(15 minutes)", "rate(30 minutes)"}
+    condition = template["Conditions"]["AvailabilityAlarmCadence"]
+    assert condition == {
+        "Fn::Or": [
+            {"Fn::Equals": [{"Ref": "AvailabilitySchedule"}, "rate(15 minutes)"]},
+            {"Fn::Equals": [{"Ref": "AvailabilitySchedule"}, "rate(30 minutes)"]},
+        ]
+    }
+    configured_cadences = {
+        comparison["Fn::Equals"][1]
+        for comparison in condition["Fn::Or"]
+    }
+    assert configured_cadences == supported
+    assert template["Parameters"]["AvailabilitySchedule"]["Default"] in configured_cadences
+
+    alarm = template["Resources"]["OpenF1UnavailableSustainedAlarm"]
+    assert alarm["Condition"] == "AvailabilityAlarmCadence"
+    allowed = set(template["Parameters"]["AvailabilitySchedule"]["AllowedValues"])
+    assert supported <= allowed
+    assert allowed - configured_cadences == {
+        "rate(1 hour)",
+        "rate(3 hours)",
+        "rate(6 hours)",
+        "rate(12 hours)",
+        "rate(1 day)",
+    }
+
+
 @pytest.mark.parametrize("environment", DEPLOY_ENVIRONMENTS)
 def test_samconfig_keeps_the_schedule_and_the_pipeline_off(samconfig, environment) -> None:
     overrides = samconfig_overrides(samconfig, environment)
@@ -315,12 +344,15 @@ def test_only_the_data_and_model_roles_touch_s3_and_none_can_delete(template) ->
         if any(action.startswith("s3:") for action in as_list(statement["Action"]))
     }
 
-    assert s3_roles == {"DataProcessingTaskRole", "RaceModelTaskRole", "ForecastFunctionRole"}
+    assert s3_roles == {"DataProcessingTaskRole", "PipelineStateMachineRole", "RaceModelTaskRole", "ForecastFunctionRole"}
     for name in s3_roles:
-        actions = {action for _, s in policy_statements(roles[name]) for action in as_list(s["Action"])}
+        actions = {action for _, s in policy_statements(roles[name]) for action in as_list(s["Action"]) if action.startswith("s3:")}
         assert not {action for action in actions if "Delete" in action}, name
     policies = json.dumps(roles["DataProcessingTaskRole"]["Properties"]["Policies"])
     assert "models/" not in policies, "models/ belongs to the race-model role"
+    # The state machine only reads the session plan the plan task wrote.
+    states_s3 = [s for _, s in policy_statements(roles["PipelineStateMachineRole"]) if any(a.startswith("s3:") for a in as_list(s["Action"]))]
+    assert states_s3 == [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": {"Fn::Sub": "${DataBucket.Arn}/manifests/plan/*"}}]
 
 
 def test_model_roles_write_only_their_own_prefixes(template) -> None:
@@ -353,6 +385,7 @@ def test_availability_results_reach_the_state_machine_unmodified(template) -> No
     function = template["Resources"]["AvailabilityCheckerFunction"]["Properties"]
     rule = template["Resources"]["AvailabilityResultRule"]["Properties"]
 
+    assert function["Environment"]["Variables"]["F1_COMPONENT"] == "availability-checker"
     assert function["EventInvokeConfig"]["DestinationConfig"]["OnSuccess"]["Type"] == "EventBridge"
     assert function["EventInvokeConfig"]["DestinationConfig"]["OnFailure"] == {"Type": "SNS", "Destination": {"Ref": "AlertTopic"}}
     assert rule["Targets"][0]["InputPath"] == "$.detail.responsePayload"
@@ -361,25 +394,137 @@ def test_availability_results_reach_the_state_machine_unmodified(template) -> No
 
 @pytest.mark.parametrize("alarm", [
     "AvailabilityCheckerErrorsAlarm",
+    "AvailabilityCheckerThrottlesAlarm",
     "PipelineExecutionsFailedAlarm",
     "OrchestrationRulesFailedInvocationsAlarm",
+    "OpenF1UnavailableSustainedAlarm",
 ])
 def test_critical_alarms_notify_the_alert_topic(template, alarm) -> None:
     assert template["Resources"][alarm]["Properties"]["AlarmActions"] == [{"Ref": "AlertTopic"}]
 
 
-def test_no_sagemaker_and_model_compute_exists_only_once_its_image_is_tagged(template) -> None:
+def test_lambda_throttles_alarm_uses_a_real_metric_and_conservative_missing_data(template) -> None:
+    alarm = template["Resources"]["AvailabilityCheckerThrottlesAlarm"]["Properties"]
+
+    assert alarm["Namespace"] == "AWS/Lambda"
+    assert alarm["MetricName"] == "Throttles"
+    assert alarm["Dimensions"] == [{"Name": "FunctionName", "Value": {"Ref": "AvailabilityCheckerFunction"}}]
+    assert (alarm["Statistic"], alarm["Period"], alarm["EvaluationPeriods"], alarm["Threshold"]) == ("Sum", 3600, 1, 1)
+    assert alarm["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
+    assert alarm["TreatMissingData"] == "notBreaching"
+    assert alarm["OKActions"] == [{"Ref": "AlertTopic"}]
+
+
+def test_pipeline_alarm_covers_failures_timeouts_and_aborts(template) -> None:
+    alarm = template["Resources"]["PipelineExecutionsFailedAlarm"]["Properties"]
+    metric_names = {
+        metric["MetricStat"]["Metric"]["MetricName"]
+        for metric in alarm["Metrics"]
+        if "MetricStat" in metric
+    }
+
+    assert metric_names == {"ExecutionsFailed", "ExecutionsTimedOut", "ExecutionsAborted"}
+    for metric in alarm["Metrics"]:
+        if "MetricStat" in metric:
+            assert metric["MetricStat"]["Metric"]["Namespace"] == "AWS/States"
+            assert metric["MetricStat"]["Metric"]["Dimensions"] == [
+                {"Name": "StateMachineArn", "Value": {"Ref": "PipelineStateMachine"}}
+            ]
+    assert alarm["Threshold"] == 1
+    assert alarm["EvaluationPeriods"] == 1
+    assert alarm["TreatMissingData"] == "notBreaching"
+
+
+def test_dashboard_only_references_metrics_emitted_by_deployed_components(template) -> None:
+    resource = template["Resources"]["ObservabilityDashboard"]
+    assert resource["Type"] == "AWS::CloudWatch::Dashboard"
+    body_template = resource["Properties"]["DashboardBody"]["Fn::Sub"]
+    placeholders = set(re.findall(r"\$\{([^}]+)\}", body_template))
+    assert placeholders == {
+        "AWS::Region",
+        "ProjectName",
+        "Environment",
+        "PipelineStateMachine",
+        "AvailabilityCheckerFunction",
+    }
+
+    body = json.loads(re.sub(r"\$\{[^}]+\}", "test-value", body_template))
+    assert len(body["widgets"]) == 7
+    metric_names = {
+        (metric[0], metric[1])
+        for widget in body["widgets"]
+        for metric in widget["properties"]["metrics"]
+    }
+    assert metric_names == {
+        ("AWS/States", "ExecutionsStarted"),
+        ("AWS/States", "ExecutionsSucceeded"),
+        ("AWS/States", "ExecutionsFailed"),
+        ("AWS/States", "ExecutionsTimedOut"),
+        ("AWS/States", "ExecutionsAborted"),
+        ("AWS/States", "ExecutionTime"),
+        ("AWS/Lambda", "Invocations"),
+        ("AWS/Lambda", "Errors"),
+        ("AWS/Lambda", "Throttles"),
+        ("AWS/Lambda", "Duration"),
+        ("AWS/Events", "FailedInvocations"),
+        ("test-value/test-value", "OpenF1Available"),
+        ("test-value/test-value", "OpenF1LatencyMs"),
+    }
+    assert "model-serving" not in json.dumps(body).lower()
+    assert template["Outputs"]["ObservabilityDashboardName"]["Value"] == {"Ref": "ObservabilityDashboard"}
+
+
+def test_no_model_hosting_and_model_compute_exists_only_with_an_image(template) -> None:
     resources = template["Resources"]
     kinds = {body["Type"] for body in resources.values()}
 
     assert not any(kind.startswith("AWS::SageMaker::") for kind in kinds)
-    for name, body in resources.items():
-        if body["Type"] in ("AWS::ECS::TaskDefinition", "AWS::ECS::Cluster", "AWS::EC2::SecurityGroup"):
-            assert body.get("Condition") == "HasModelCompute", name
-        if body["Type"] == "AWS::Lambda::Function":
-            assert body.get("Condition") == "HasForecastFunction", name
-    assert template["Parameters"]["ModelImageTag"]["Default"] == ""
-    assert template["Parameters"]["ForecastImageTag"]["Default"] == ""
+    # Two task definitions: the M2-M6 batch tasks and the race model, both on the same image.
+    assert sorted(resources_of(template, "AWS::ECS::TaskDefinition")) == ["PipelineTaskDefinition", "RaceModelTaskDefinition"]
+    race = resources["RaceModelTaskDefinition"]
+    assert race["Condition"] == "HasPipelineImage"
+    assert race["Properties"]["ContainerDefinitions"][0]["Image"] == {"Ref": "PipelineImageUri"}
+    assert list(resources_of(template, "AWS::ECS::Cluster")) == ["PipelineCluster"]
+    for name, body in resources_of(template, "AWS::Lambda::Function").items():
+        assert body.get("Condition") == "HasForecastFunction", name
+    assert template["Parameters"]["ForecastImageUri"]["Default"] == ""
+
+
+def test_the_race_model_task_is_hardened_like_the_pipeline_task(template) -> None:
+    (container,) = template["Resources"]["RaceModelTaskDefinition"]["Properties"]["ContainerDefinitions"]
+
+    assert container["User"] == "10001:10001"
+    assert container["ReadonlyRootFilesystem"] is True
+    assert container["LinuxParameters"]["Capabilities"] == {"Drop": ["ALL"]}
+    assert "PortMappings" not in container and "MountPoints" not in container
+    environment = {item["Name"]: item["Value"] for item in container["Environment"]}
+    assert environment["F1_ENVIRONMENT"] == "aws" and environment["F1_STORAGE_BUCKET"] == {"Ref": "DataBucket"}
+    assert not [name for name in environment if re.search(r"KEY|SECRET|TOKEN|PASSWORD", name)]
+
+
+def test_the_forecast_image_is_pinned_by_digest(template) -> None:
+    parameter = template["Parameters"]["ForecastImageUri"]
+    pattern = re.compile(parameter["AllowedPattern"])
+    repository = "793264560810.dkr.ecr.us-east-1.amazonaws.com/f1-race-intelligence-dev-forecast"
+
+    assert pattern.fullmatch("") and pattern.fullmatch(f"{repository}@sha256:{'b' * 64}")
+    assert not pattern.fullmatch(f"{repository}:latest")
+    assert template["Resources"]["ForecastFunction"]["Properties"]["Code"]["ImageUri"] == {"Ref": "ForecastImageUri"}
+
+
+def test_the_race_model_state_machine_runs_only_its_task_on_the_pipeline_cluster(template) -> None:
+    statements = {s.get("Sid"): s for _, s in policy_statements(template["Resources"]["RaceModelStateMachineRole"])}
+
+    run_task = statements["RunRaceModelTaskDefinitionOnTheClusterOnly"]
+    assert run_task["Resource"]["Fn::Sub"].endswith(":task-definition/${ProjectName}-${Environment}-race-model:*")
+    assert run_task["Condition"] == {"ArnEquals": {"ecs:cluster": {"Fn::GetAtt": "PipelineCluster.Arn"}}}
+    pass_role = statements["PassOnlyTheRaceModelTaskRoles"]
+    assert pass_role["Resource"] == [{"Fn::GetAtt": "RaceModelTaskRole.Arn"}, {"Fn::GetAtt": "RaceModelExecutionRole.Arn"}]
+    assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
+    substitutions = template["Resources"]["RaceModelStateMachine"]["Properties"]["DefinitionSubstitutions"]
+    assert substitutions["ClusterArn"] == {"Fn::GetAtt": "PipelineCluster.Arn"}
+    assert (substitutions["SubnetA"], substitutions["SubnetB"]) == ({"Ref": "PipelineSubnetA"}, {"Ref": "PipelineSubnetB"})
+    assert substitutions["TaskSecurityGroupId"] == {"Ref": "PipelineTaskSecurityGroup"}
 
 
 @pytest.mark.parametrize("parameter", ["ModelScheduleState", "LiveForecastScheduleState"])
@@ -404,14 +549,12 @@ def test_model_failures_alert(template) -> None:
 
 
 def test_model_state_machine_catches_every_task(template) -> None:
-    import re
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[2] / "infra" / "statemachine" / "model.asl.json").read_text(encoding="utf-8")
     substitutions = template["Resources"]["RaceModelStateMachine"]["Properties"]["DefinitionSubstitutions"]
     placeholders = set(re.findall(r"\$\{(\w+)\}", text))
     assert placeholders <= set(substitutions), placeholders - set(substitutions)
-    text = text.replace("${SubnetIdsJson}", '["subnet-1"]')
     definition = json.loads(re.sub(r"\$\{\w+\}", "x", text))
     tasks = {name: s for name, s in definition["States"].items() if s["Type"] == "Task" and "ecs:runTask" in s["Resource"]}
     assert set(tasks) == {"TrainModel", "EvaluateAndPromote", "UpdateModel"}
@@ -420,3 +563,179 @@ def test_model_state_machine_catches_every_task(template) -> None:
         assert state["Resource"].endswith(".sync"), name
     commands = {name: s["Parameters"]["Overrides"]["ContainerOverrides"][0]["Command"] for name, s in tasks.items()}
     assert commands["EvaluateAndPromote"] == ["--stage", "m7-evaluate", "--promote"]
+
+
+# -- Phase 1B: hardened Fargate tasks, their network and the state machine's rights
+
+
+def task_definition(template):
+    return template["Resources"]["PipelineTaskDefinition"]
+
+
+def pipeline_container(template):
+    (container,) = task_definition(template)["Properties"]["ContainerDefinitions"]
+    return container
+
+
+def test_the_task_runs_hardened_and_unprivileged(template) -> None:
+    container = pipeline_container(template)
+
+    assert container["User"] == "10001:10001", "the image's unprivileged f1 user, never root"
+    assert container["ReadonlyRootFilesystem"] is True
+    assert container["LinuxParameters"]["Capabilities"] == {"Drop": ["ALL"]}
+    assert "Add" not in container["LinuxParameters"]["Capabilities"]
+    assert container.get("Privileged") is not True
+    assert "PortMappings" not in container, "the batch container serves nothing"
+    # Verified locally: every stage runs with no writable path (and tmpfs is
+    # not available on Fargate), so no volume is mounted.
+    assert "MountPoints" not in container and "Volumes" not in task_definition(template)["Properties"]
+    assert "Tmpfs" not in json.dumps(container)
+
+
+def test_the_task_definition_is_fargate_x86_with_explicit_size_and_logs(template) -> None:
+    properties = task_definition(template)["Properties"]
+    container = pipeline_container(template)
+
+    assert properties["RequiresCompatibilities"] == ["FARGATE"] and properties["NetworkMode"] == "awsvpc"
+    assert properties["RuntimePlatform"] == {"CpuArchitecture": "X86_64", "OperatingSystemFamily": "LINUX"}
+    assert (properties["Cpu"], properties["Memory"]) == ("512", "1024")
+    assert properties["ExecutionRoleArn"] == {"Fn::GetAtt": "DataProcessingExecutionRole.Arn"}
+    assert properties["TaskRoleArn"] == {"Fn::GetAtt": "DataProcessingTaskRole.Arn"}
+    assert container["LogConfiguration"]["LogDriver"] == "awslogs"
+    assert container["LogConfiguration"]["Options"]["awslogs-group"] == {"Ref": "DataProcessingLogGroup"}
+
+
+def test_the_task_environment_selects_s3_and_holds_no_secret(template) -> None:
+    environment = {item["Name"]: item["Value"] for item in pipeline_container(template)["Environment"]}
+
+    assert environment["F1_ENVIRONMENT"] == "aws"
+    assert environment["F1_COMPONENT"] == "pipeline"
+    assert environment["F1_CONFIG_PATH"] == "/app/configs/config.yaml"
+    assert environment["F1_STORAGE_BUCKET"] == {"Ref": "DataBucket"}
+    # The task role only grants the lake's root prefixes: no storage prefix.
+    assert "F1_STORAGE_PREFIX" not in environment
+    assert not [name for name in environment if re.search(r"KEY|SECRET|TOKEN|PASSWORD", name)]
+    assert "Secrets" not in pipeline_container(template)
+
+
+def test_the_image_is_pinned_by_digest_and_never_a_tag(template) -> None:
+    parameter = template["Parameters"]["PipelineImageUri"]
+    pattern = re.compile(parameter["AllowedPattern"])
+    repository = "793264560810.dkr.ecr.us-east-1.amazonaws.com/f1-race-intelligence-dev-pipeline"
+
+    assert pipeline_container(template)["Image"] == {"Ref": "PipelineImageUri"}
+    assert parameter["Default"] == ""
+    assert pattern.fullmatch("")
+    assert pattern.fullmatch(f"{repository}@sha256:{'a' * 64}")
+    for rejected in (f"{repository}:latest", f"{repository}:79798a4", f"{repository}@sha256:abc", "python:3.12", f"{repository}@sha256:{'A' * 64}"):
+        assert not pattern.fullmatch(rejected), rejected
+
+
+def test_without_an_image_no_task_definition_exists_and_the_pipeline_cannot_be_enabled(template) -> None:
+    assert template["Conditions"]["HasPipelineImage"] == {"Fn::Not": [{"Fn::Equals": [{"Ref": "PipelineImageUri"}, ""]}]}
+    assert task_definition(template)["Condition"] == "HasPipelineImage"
+
+    rule = template["Rules"]["PipelineNeedsAnImage"]
+    assert rule["RuleCondition"] == {"Fn::Equals": [{"Ref": "PipelineEnabled"}, "true"]}
+    assert rule["Assertions"][0]["Assert"] == {"Fn::Not": [{"Fn::Equals": [{"Ref": "PipelineImageUri"}, ""]}]}
+
+
+def test_the_pipeline_and_schedule_stay_off_in_the_template_and_every_environment(template, samconfig) -> None:
+    assert template["Parameters"]["PipelineEnabled"]["Default"] == "false"
+    assert template["Parameters"]["AvailabilityScheduleState"]["Default"] == "DISABLED"
+    for environment in DEPLOY_ENVIRONMENTS:
+        overrides = samconfig_overrides(samconfig, environment)
+        assert (overrides["PipelineEnabled"], overrides["AvailabilityScheduleState"]) == ("false", "DISABLED"), environment
+        # No image is committed: it is supplied, by digest, at deploy time.
+        assert "PipelineImageUri" not in overrides
+
+
+def test_the_tasks_accept_no_inbound_traffic_and_only_leave_over_https(template) -> None:
+    group = template["Resources"]["PipelineTaskSecurityGroup"]["Properties"]
+
+    assert "SecurityGroupIngress" not in group
+    assert not resources_of(template, "AWS::EC2::SecurityGroupIngress")
+    assert group["SecurityGroupEgress"] == [
+        {"Description": "HTTPS to OpenF1 and AWS service endpoints", "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0"}
+    ]
+    assert group["VpcId"] == {"Ref": "PipelineVpc"}
+
+
+def test_the_network_has_no_hourly_billed_resources(template) -> None:
+    kinds = {body["Type"] for body in template["Resources"].values()}
+
+    # Outbound access is a public IP per running task through an Internet
+    # Gateway: no NAT Gateway, interface endpoint or Elastic IP billing by the hour.
+    assert not kinds & {"AWS::EC2::NatGateway", "AWS::EC2::VPCEndpoint", "AWS::EC2::EIP", "AWS::EC2::TransitGateway"}
+    route = template["Resources"]["PipelineDefaultRoute"]["Properties"]
+    assert route["GatewayId"] == {"Ref": "PipelineInternetGateway"} and route["DestinationCidrBlock"] == "0.0.0.0/0"
+    for name in ("PipelineSubnetA", "PipelineSubnetB"):
+        assert template["Resources"][name]["Properties"]["MapPublicIpOnLaunch"] is False, name
+
+
+def test_the_cluster_does_not_enable_container_insights(template) -> None:
+    settings = template["Resources"]["PipelineCluster"]["Properties"]["ClusterSettings"]
+
+    assert settings == [{"Name": "containerInsights", "Value": "disabled"}]
+
+
+def state_machine_statements(template):
+    return {statement.get("Sid", policy): statement for policy, statement in policy_statements(template["Resources"]["PipelineStateMachineRole"])}
+
+
+def test_the_state_machine_runs_only_the_pipeline_task_on_its_cluster(template) -> None:
+    run_task = state_machine_statements(template)["RunPipelineTaskDefinitionOnTheClusterOnly"]
+
+    assert run_task["Action"] == "ecs:RunTask"
+    assert run_task["Resource"]["Fn::Sub"].endswith(":task-definition/${ProjectName}-${Environment}-pipeline:*")
+    assert run_task["Condition"] == {"ArnEquals": {"ecs:cluster": {"Fn::GetAtt": "PipelineCluster.Arn"}}}
+
+
+def test_the_state_machine_watches_only_the_cluster_tasks_and_the_managed_rule(template) -> None:
+    statements = state_machine_statements(template)
+
+    watch = statements["WatchAndStopPipelineTasks"]
+    assert sorted(watch["Action"]) == ["ecs:DescribeTasks", "ecs:StopTask"]
+    assert watch["Resource"]["Fn::Sub"].endswith(":task/${ProjectName}-${Environment}-pipeline/*")
+    events = statements["TaskCompletionEvents"]
+    assert sorted(events["Action"]) == ["events:DescribeRule", "events:PutRule", "events:PutTargets"]
+    assert events["Resource"]["Fn::Sub"].endswith(":rule/StepFunctionsGetEventsForECSTaskRule")
+
+
+def test_pass_role_is_limited_to_the_two_task_roles_and_to_ecs(template) -> None:
+    pass_role = state_machine_statements(template)["PassOnlyThePipelineTaskRoles"]
+
+    assert pass_role["Action"] == "iam:PassRole"
+    assert pass_role["Resource"] == [{"Fn::GetAtt": "DataProcessingTaskRole.Arn"}, {"Fn::GetAtt": "DataProcessingExecutionRole.Arn"}]
+    assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
+    passes = [s for _, role in resources_of(template, "AWS::IAM::Role").items() for _, s in policy_statements(role) if "iam:PassRole" in as_list(s["Action"])]
+    assert len(passes) == 2 and pass_role in passes
+    assert all(s["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}} for s in passes)
+
+
+def test_the_concurrency_check_reads_only_this_state_machine(template) -> None:
+    statement = next(s for _, s in policy_statements(template["Resources"]["PipelineStateMachineRole"]) if s["Action"] == "states:ListExecutions")
+
+    assert statement["Resource"]["Fn::Sub"].endswith(":stateMachine:${ProjectName}-${Environment}-pipeline")
+    assert template["Resources"]["PipelineStateMachine"]["Properties"]["Name"] == {"Fn::Sub": "${ProjectName}-${Environment}-pipeline"}
+
+
+def test_the_task_role_keeps_its_scoped_s3_access(template) -> None:
+    statements = {s["Sid"]: s for _, s in policy_statements(template["Resources"]["DataProcessingTaskRole"])}
+
+    # ListBucket stays bucket-wide on purpose (see the template): with an
+    # s3:prefix condition, HeadObject on a missing key answers 403 instead of
+    # 404 and the idempotency checks ("does this file exist?") break.
+    assert statements["ListProjectBucket"] == {"Sid": "ListProjectBucket", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": {"Fn::GetAtt": "DataBucket.Arn"}}
+    assert statements["ReadWritePipelineObjects"]["Action"] == ["s3:GetObject", "s3:PutObject"]
+    prefixes = {item["Fn::Sub"].split("/", 1)[1] for item in statements["ReadWritePipelineObjects"]["Resource"]}
+    assert prefixes == {"raw/*", "validated/*", "consolidated/*", "features/*", "modeling/*", "manifests/*"}
+
+
+def test_the_state_machine_is_wired_to_the_task_resources(template) -> None:
+    substitutions = template["Resources"]["PipelineStateMachine"]["Properties"]["DefinitionSubstitutions"]
+
+    assert substitutions["ClusterArn"] == {"Fn::GetAtt": "PipelineCluster.Arn"}
+    assert substitutions["TaskDefinitionArn"] == {"Fn::If": ["HasPipelineImage", {"Ref": "PipelineTaskDefinition"}, "not-configured"]}
+    assert (substitutions["SubnetA"], substitutions["SubnetB"]) == ({"Ref": "PipelineSubnetA"}, {"Ref": "PipelineSubnetB"})
+    assert substitutions["TaskSecurityGroupId"] == {"Ref": "PipelineTaskSecurityGroup"}

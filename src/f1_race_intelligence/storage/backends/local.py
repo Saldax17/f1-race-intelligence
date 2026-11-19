@@ -5,20 +5,24 @@ the configured stage paths — ``data/raw``, ``data/processed/lap_dataset`` —
 resolve exactly where they always did. An absolute key stays absolute,
 which is what lets tests point a stage at a temporary directory.
 
-JSON goes through :mod:`f1_race_intelligence.utils.files`, the module that
-already guarantees atomic replacement and never-overwriting unique names,
-so there is still a single implementation of those rules on disk.
+Every write is binary. JSON is serialised by the base class and reaches the
+disk through :meth:`LocalStorageBackend.write_bytes` (temporary file, then an
+atomic replace) or :meth:`LocalStorageBackend.write_bytes_if_absent` (atomic
+publication without replacement). A text-mode write would let the operating
+system translate line endings — ``\\n`` becomes ``\\r\\n`` on Windows — so the
+same document would be different bytes, and a different SHA-256, depending on
+where it was written.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
 import tempfile
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 
-from f1_race_intelligence.storage.backends.base import StorageBackend, join_key
-from f1_race_intelligence.utils import files
+from f1_race_intelligence.storage.backends.base import MAX_NAME_COLLISION_RETRIES, StorageBackend, join_key
 
 
 class LocalStorageBackend(StorageBackend):
@@ -72,13 +76,38 @@ class LocalStorageBackend(StorageBackend):
     def write_bytes_if_absent(self, key: str, data: bytes, *, content_type: Optional[str] = None) -> bool:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Optional[Path] = None
         try:
-            # Exclusive creation lets the filesystem arbitrate between writers.
-            with path.open("xb") as handle:
-                handle.write(data)
-        except FileExistsError:
-            return False
-        return True
+            for _ in range(MAX_NAME_COLLISION_RETRIES):
+                candidate = path.with_name(f".tmp-{secrets.token_hex(16)}{path.suffix}")
+                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+                try:
+                    descriptor = os.open(candidate, flags, 0o666)
+                except FileExistsError:
+                    continue
+                temp_path = candidate
+                try:
+                    handle = os.fdopen(descriptor, "wb")
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                break
+            else:
+                raise FileExistsError(f"Could not create a temporary file in {path.parent}")
+
+            with handle:
+                written = handle.write(data)
+                if written != len(data):
+                    raise OSError(f"Short write for temporary file {temp_path}")
+            try:
+                # A hard link publishes the complete file only if the name is free.
+                os.link(temp_path, path)
+            except FileExistsError:
+                return False
+            return True
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def list(self, prefix: str, *, recursive: bool = True) -> List[str]:
         base = self._path(prefix)
@@ -95,17 +124,10 @@ class LocalStorageBackend(StorageBackend):
     def size(self, key: str) -> int:
         return self._path(key).stat().st_size
 
-    # -- formats: keep the existing single implementation on disk ------------
-
-    def write_json(self, key: str, payload: Any) -> str:
-        path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        files.write_json_atomically(path, payload)
-        return key
-
-    def write_json_unique(self, prefix: str, stem: str, payload: Any, *, extension: str = ".json") -> str:
-        written = files.write_json_unique(self._path(prefix), stem, payload, extension=extension)
-        return join_key(prefix, written.name)
+    # -- formats ------------------------------------------------------------
+    #
+    # JSON is deliberately not overridden: the base class serialises once and
+    # hands the bytes to write_bytes / write_bytes_if_absent above.
 
     def read_parquet(self, key: str):
         import pandas as pd

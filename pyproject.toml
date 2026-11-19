@@ -30,13 +30,27 @@ dependencies = [
     "scipy>=1.11",
 ]
 
-[project.optional-dependencies]
 # S3 storage backend. Optional: local runs never import boto3. Conditional
 # writes (If-None-Match), which keep execution records from overwriting each
 # other on S3, need boto3/botocore 1.35.2 or newer.
+[project.optional-dependencies]
+# S3 storage backend.
 aws = [
     "boto3>=1.35.2",
 ]
+
+# Model training and MLflow registry (M7).
+training = [
+    "mlflow==3.18.0",
+    "SQLAlchemy==2.0.57",
+]
+
+# Local serving prototype (M8).
+serve = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.14",

@@ -18,8 +18,8 @@
         "LaunchType": "FARGATE",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ${SubnetIdsJson},
-            "SecurityGroups": ["${SecurityGroupId}"],
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
             "AssignPublicIp": "ENABLED"
           }
         },
@@ -47,8 +47,8 @@
         "LaunchType": "FARGATE",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ${SubnetIdsJson},
-            "SecurityGroups": ["${SecurityGroupId}"],
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
             "AssignPublicIp": "ENABLED"
           }
         },
@@ -75,8 +75,8 @@
         "LaunchType": "FARGATE",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ${SubnetIdsJson},
-            "SecurityGroups": ["${SecurityGroupId}"],
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
             "AssignPublicIp": "ENABLED"
           }
         },
