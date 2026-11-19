@@ -286,7 +286,7 @@ def test_lambda_role_uses_the_standard_trust_and_the_others_keep_source_account(
     for name, role in roles.items():
         statements = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
         assert len(statements) == 1 and statements[0]["Action"] == "sts:AssumeRole", name
-        if name == "AvailabilityCheckerRole":
+        if name in ("AvailabilityCheckerRole", "ForecastFunctionRole"):
             assert statements[0] == {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
         else:
             assert statements[0]["Condition"]["StringEquals"]["aws:SourceAccount"] == {"Ref": "AWS::AccountId"}, name
@@ -326,7 +326,16 @@ def test_s3_permissions_are_limited_to_the_project_bucket(template) -> None:
                 assert "DataBucket" in json.dumps(statement["Resource"]), f"{name}/{policy}"
 
 
-def test_only_the_data_processing_role_touches_s3_and_it_cannot_delete(template) -> None:
+def _s3_writes(role):
+    return {
+        json.dumps(resource)
+        for _, statement in policy_statements(role)
+        if "s3:PutObject" in as_list(statement["Action"])
+        for resource in as_list(statement["Resource"])
+    }
+
+
+def test_only_the_data_and_model_roles_touch_s3_and_none_can_delete(template) -> None:
     roles = resources_of(template, "AWS::IAM::Role")
     s3_roles = {
         name
@@ -335,14 +344,26 @@ def test_only_the_data_processing_role_touches_s3_and_it_cannot_delete(template)
         if any(action.startswith("s3:") for action in as_list(statement["Action"]))
     }
 
-    assert s3_roles == {"DataProcessingTaskRole", "PipelineStateMachineRole"}
-    actions = {action for _, s in policy_statements(roles["DataProcessingTaskRole"]) for action in as_list(s["Action"])}
-    assert not {action for action in actions if "Delete" in action}
+    assert s3_roles == {"DataProcessingTaskRole", "PipelineStateMachineRole", "RaceModelTaskRole", "ForecastFunctionRole"}
+    for name in s3_roles:
+        actions = {action for _, s in policy_statements(roles[name]) for action in as_list(s["Action"]) if action.startswith("s3:")}
+        assert not {action for action in actions if "Delete" in action}, name
     policies = json.dumps(roles["DataProcessingTaskRole"]["Properties"]["Policies"])
-    assert "models/" not in policies, "models/ belongs to the future training role"
+    assert "models/" not in policies, "models/ belongs to the race-model role"
     # The state machine only reads the session plan the plan task wrote.
     states_s3 = [s for _, s in policy_statements(roles["PipelineStateMachineRole"]) if any(a.startswith("s3:") for a in as_list(s["Action"]))]
     assert states_s3 == [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": {"Fn::Sub": "${DataBucket.Arn}/manifests/plan/*"}}]
+
+
+def test_model_roles_write_only_their_own_prefixes(template) -> None:
+    roles = resources_of(template, "AWS::IAM::Role")
+
+    model_writes = _s3_writes(roles["RaceModelTaskRole"])
+    assert model_writes and all("/models/m7/" in w or "/manifests/models/m7/" in w for w in model_writes)
+    forecast_writes = _s3_writes(roles["ForecastFunctionRole"])
+    assert forecast_writes and all("/forecasts/m7/" in w for w in forecast_writes)
+    reads = json.dumps(roles["RaceModelTaskRole"]["Properties"]["Policies"])
+    assert "/raw/*" in reads and "/features/" not in reads
 
 
 def test_log_groups_use_the_retention_parameter(template) -> None:
@@ -453,12 +474,95 @@ def test_dashboard_only_references_metrics_emitted_by_deployed_components(templa
     assert template["Outputs"]["ObservabilityDashboardName"]["Value"] == {"Ref": "ObservabilityDashboard"}
 
 
-def test_no_model_hosting_or_training_resources(template) -> None:
-    kinds = {body["Type"] for body in template["Resources"].values()}
+def test_no_model_hosting_and_model_compute_exists_only_with_an_image(template) -> None:
+    resources = template["Resources"]
+    kinds = {body["Type"] for body in resources.values()}
 
     assert not any(kind.startswith("AWS::SageMaker::") for kind in kinds)
-    # The batch tasks (Phase 1B) are data processing only: one task definition.
-    assert list(resources_of(template, "AWS::ECS::TaskDefinition")) == ["PipelineTaskDefinition"]
+    # Two task definitions: the M2-M6 batch tasks and the race model, both on the same image.
+    assert sorted(resources_of(template, "AWS::ECS::TaskDefinition")) == ["PipelineTaskDefinition", "RaceModelTaskDefinition"]
+    race = resources["RaceModelTaskDefinition"]
+    assert race["Condition"] == "HasPipelineImage"
+    assert race["Properties"]["ContainerDefinitions"][0]["Image"] == {"Ref": "PipelineImageUri"}
+    assert list(resources_of(template, "AWS::ECS::Cluster")) == ["PipelineCluster"]
+    for name, body in resources_of(template, "AWS::Lambda::Function").items():
+        assert body.get("Condition") == "HasForecastFunction", name
+    assert template["Parameters"]["ForecastImageUri"]["Default"] == ""
+
+
+def test_the_race_model_task_is_hardened_like_the_pipeline_task(template) -> None:
+    (container,) = template["Resources"]["RaceModelTaskDefinition"]["Properties"]["ContainerDefinitions"]
+
+    assert container["User"] == "10001:10001"
+    assert container["ReadonlyRootFilesystem"] is True
+    assert container["LinuxParameters"]["Capabilities"] == {"Drop": ["ALL"]}
+    assert "PortMappings" not in container and "MountPoints" not in container
+    environment = {item["Name"]: item["Value"] for item in container["Environment"]}
+    assert environment["F1_ENVIRONMENT"] == "aws" and environment["F1_STORAGE_BUCKET"] == {"Ref": "DataBucket"}
+    assert not [name for name in environment if re.search(r"KEY|SECRET|TOKEN|PASSWORD", name)]
+
+
+def test_the_forecast_image_is_pinned_by_digest(template) -> None:
+    parameter = template["Parameters"]["ForecastImageUri"]
+    pattern = re.compile(parameter["AllowedPattern"])
+    repository = "793264560810.dkr.ecr.us-east-1.amazonaws.com/f1-race-intelligence-dev-forecast"
+
+    assert pattern.fullmatch("") and pattern.fullmatch(f"{repository}@sha256:{'b' * 64}")
+    assert not pattern.fullmatch(f"{repository}:latest")
+    assert template["Resources"]["ForecastFunction"]["Properties"]["Code"]["ImageUri"] == {"Ref": "ForecastImageUri"}
+
+
+def test_the_race_model_state_machine_runs_only_its_task_on_the_pipeline_cluster(template) -> None:
+    statements = {s.get("Sid"): s for _, s in policy_statements(template["Resources"]["RaceModelStateMachineRole"])}
+
+    run_task = statements["RunRaceModelTaskDefinitionOnTheClusterOnly"]
+    assert run_task["Resource"]["Fn::Sub"].endswith(":task-definition/${ProjectName}-${Environment}-race-model:*")
+    assert run_task["Condition"] == {"ArnEquals": {"ecs:cluster": {"Fn::GetAtt": "PipelineCluster.Arn"}}}
+    pass_role = statements["PassOnlyTheRaceModelTaskRoles"]
+    assert pass_role["Resource"] == [{"Fn::GetAtt": "RaceModelTaskRole.Arn"}, {"Fn::GetAtt": "RaceModelExecutionRole.Arn"}]
+    assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
+    substitutions = template["Resources"]["RaceModelStateMachine"]["Properties"]["DefinitionSubstitutions"]
+    assert substitutions["ClusterArn"] == {"Fn::GetAtt": "PipelineCluster.Arn"}
+    assert (substitutions["SubnetA"], substitutions["SubnetB"]) == ({"Ref": "PipelineSubnetA"}, {"Ref": "PipelineSubnetB"})
+    assert substitutions["TaskSecurityGroupId"] == {"Ref": "PipelineTaskSecurityGroup"}
+
+
+@pytest.mark.parametrize("parameter", ["ModelScheduleState", "LiveForecastScheduleState"])
+def test_model_schedules_are_disabled_by_default(template, parameter) -> None:
+    assert template["Parameters"][parameter]["Default"] == "DISABLED"
+
+
+def test_model_rules_use_their_state_parameters(template) -> None:
+    resources = template["Resources"]
+    assert resources["RaceModelTrainingScheduleRule"]["Properties"]["State"] == {"Ref": "ModelScheduleState"}
+    assert resources["RaceModelUpdateScheduleRule"]["Properties"]["State"] == {"Ref": "ModelScheduleState"}
+    assert resources["LiveForecastScheduleRule"]["Properties"]["State"] == {"Ref": "LiveForecastScheduleState"}
+
+
+def test_model_failures_alert(template) -> None:
+    resources = template["Resources"]
+    for alarm in ("RaceModelExecutionsFailedAlarm", "ForecastFunctionErrorsAlarm"):
+        assert resources[alarm]["Properties"]["AlarmActions"] == [{"Ref": "AlertTopic"}]
+    assert resources["ForecastFunctionInvokeConfig"]["Properties"]["DestinationConfig"]["OnFailure"] == {
+        "Destination": {"Ref": "AlertTopic"}
+    }
+
+
+def test_model_state_machine_catches_every_task(template) -> None:
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[2] / "infra" / "statemachine" / "model.asl.json").read_text(encoding="utf-8")
+    substitutions = template["Resources"]["RaceModelStateMachine"]["Properties"]["DefinitionSubstitutions"]
+    placeholders = set(re.findall(r"\$\{(\w+)\}", text))
+    assert placeholders <= set(substitutions), placeholders - set(substitutions)
+    definition = json.loads(re.sub(r"\$\{\w+\}", "x", text))
+    tasks = {name: s for name, s in definition["States"].items() if s["Type"] == "Task" and "ecs:runTask" in s["Resource"]}
+    assert set(tasks) == {"TrainModel", "EvaluateAndPromote", "UpdateModel"}
+    for name, state in tasks.items():
+        assert state["Catch"][0]["Next"] == "NotifyFailure", name
+        assert state["Resource"].endswith(".sync"), name
+    commands = {name: s["Parameters"]["Overrides"]["ContainerOverrides"][0]["Command"] for name, s in tasks.items()}
+    assert commands["EvaluateAndPromote"] == ["--stage", "m7-evaluate", "--promote"]
 
 
 # -- Phase 1B: hardened Fargate tasks, their network and the state machine's rights
@@ -605,7 +709,8 @@ def test_pass_role_is_limited_to_the_two_task_roles_and_to_ecs(template) -> None
     assert pass_role["Resource"] == [{"Fn::GetAtt": "DataProcessingTaskRole.Arn"}, {"Fn::GetAtt": "DataProcessingExecutionRole.Arn"}]
     assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
     passes = [s for _, role in resources_of(template, "AWS::IAM::Role").items() for _, s in policy_statements(role) if "iam:PassRole" in as_list(s["Action"])]
-    assert passes == [pass_role]
+    assert len(passes) == 2 and pass_role in passes
+    assert all(s["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}} for s in passes)
 
 
 def test_the_concurrency_check_reads_only_this_state_machine(template) -> None:

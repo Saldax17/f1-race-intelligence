@@ -4,8 +4,9 @@ Description: >-
   F1 Race Intelligence - base infrastructure and availability-gated orchestration.
   Creates the data lake bucket, the OpenF1 availability checker, the pipeline state
   machine with M2-M6 as hardened Fargate tasks, their network, alerting, logs, ECR and
-  least-privilege IAM roles. Nothing runs while PipelineEnabled is false; it does not
-  train or deploy any model.
+  least-privilege IAM roles, and the race model (M7): Fargate training/update tasks on
+  the same cluster and image behind their own state machine, and a forecast Lambda.
+  Nothing runs while PipelineEnabled is false and the model schedules are DISABLED.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -20,6 +21,8 @@ Metadata:
         Parameters: [PipelineImageUri]
       - Label: { default: Observability }
         Parameters: [LogRetentionDays, AlertEmail]
+      - Label: { default: Race model (M7) }
+        Parameters: [ModelTrainingSchedule, ModelUpdateSchedule, ModelScheduleState, ForecastImageUri, LiveForecastScheduleState]
 
 Parameters:
   ProjectName:
@@ -117,10 +120,48 @@ Parameters:
       then alarms and Lambda failures publish to a topic nobody receives. A real address
       gets a confirmation e-mail; alerts are delivered only after it is confirmed.
 
+  # --- Race model (M7). Its Fargate tasks run the same batch image as M2-M6
+  # (PipelineImageUri) on the same cluster and network; nothing is created
+  # until that image is supplied. ---
+  ModelTrainingSchedule:
+    Type: String
+    Default: cron(0 6 1 * ? *)
+    Description: When the model is retrained (train, then evaluate and promote). Default monthly.
+
+  ModelUpdateSchedule:
+    Type: String
+    Default: cron(0 8 ? * MON *)
+    Description: When the season state is refreshed with the last race (Monday after a race weekend).
+
+  ModelScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Both model schedules. DISABLED by default; runs can always be started by hand.
+
+  ForecastImageUri:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
+    ConstraintDescription: Empty, or an ECR image pinned by digest (repository@sha256:<64 hex>). Tags are not accepted.
+    Description: >-
+      The forecast Lambda image (ForecastImageRepository, Dockerfile.forecast), pinned by
+      digest like PipelineImageUri. Empty creates no forecast Lambda.
+
+  LiveForecastScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >-
+      Invoke the forecast Lambda every minute in live mode. It does nothing outside a race,
+      but OpenF1 serves live data only to authenticated users during sessions: keep it
+      DISABLED until that access is configured.
+
 Conditions:
   UseGeneratedBucketName: !Equals [!Ref S3BucketName, ""]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
   HasPipelineImage: !Not [!Equals [!Ref PipelineImageUri, ""]]
+  HasForecastFunction: !Not [!Equals [!Ref ForecastImageUri, ""]]
   AvailabilityAlarmCadence: !Or
     - !Equals [!Ref AvailabilitySchedule, "rate(15 minutes)"]
     - !Equals [!Ref AvailabilitySchedule, "rate(30 minutes)"]
@@ -247,6 +288,52 @@ Resources:
         ScanOnPush: true
       EncryptionConfiguration:
         EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7},
+                "action": {"type": "expire"}
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the 30 most recent images",
+                "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+                "action": {"type": "expire"}
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  ForecastImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-${Environment}-forecast"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Lambda pulls container images with the service principal; only functions
+      # of this project and environment, in this account, may do so.
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaPullFromThisProject
+            Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+            Condition:
+              StringLike:
+                aws:sourceArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-*"
       LifecyclePolicy:
         LifecyclePolicyText: |
           {
@@ -892,6 +979,465 @@ Resources:
         ManagedBy: sam
 
   # ---------------------------------------------------------------------------
+  # Race model (M7): training/update on Fargate, forecasts on Lambda
+  # ---------------------------------------------------------------------------
+  RaceModelLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-race-model"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ForecastFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-race-forecast"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RaceModelStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ProjectName}-${Environment}-race-model"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RaceModelTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-race-model"
+      Description: >-
+        Task role of the race-model jobs (m7-train, m7-evaluate, m7-update): read raw/,
+        read/write models/ and its reports. No delete, no other prefix.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: race-model-prefixes
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListProjectBucket  # see DataProcessingTaskRole: HeadObject needs it to return 404
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: ReadRaw
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DataBucket.Arn}/raw/*"
+              - Sid: ReadWriteModels
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - !Sub "${DataBucket.Arn}/models/m7/*"
+                  - !Sub "${DataBucket.Arn}/manifests/models/m7/*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RaceModelExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-race-model-exec"
+      Description: ECS task execution role of the race-model jobs - pull the batch image, write their logs.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: pull-pipeline-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"  # this action has no resource-level permissions
+              - Sid: PullImage
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: !GetAtt PipelineImageRepository.Arn
+        - PolicyName: write-container-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${RaceModelLogGroup.Arn}"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # The race-model tasks share the M2-M6 image, cluster, subnets and security
+  # group (PipelineCluster, PipelineSubnetA/B, PipelineTaskSecurityGroup), with
+  # the same container hardening, and their own roles and log group.
+  RaceModelTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasPipelineImage
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-race-model"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # Training replays 69 races and runs about 1,500 forecasts of 4,000 draws;
+      # measured locally at about 6 minutes and well under 2 GB.
+      Cpu: "2048"
+      Memory: "8192"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt RaceModelExecutionRole.Arn
+      TaskRoleArn: !GetAtt RaceModelTaskRole.Arn
+      # No volumes: the race-model stages read and write only through S3.
+      ContainerDefinitions:
+        - Name: race-model
+          Image: !Ref PipelineImageUri
+          Essential: true
+          User: "10001:10001"
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+            InitProcessEnabled: true
+          Command: ["--stage", "m7-train"]
+          Environment:
+            - { Name: F1_ENVIRONMENT, Value: aws }
+            - { Name: F1_COMPONENT, Value: race-model }
+            - { Name: F1_CONFIG_PATH, Value: /app/configs/config.yaml }
+            - { Name: F1_STORAGE_BUCKET, Value: !Ref DataBucket }
+            - { Name: F1_STORAGE_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RaceModelLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: race-model
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
+
+  RaceModelStateMachineRole:
+    Type: AWS::IAM::Role
+    Condition: HasPipelineImage
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-race-model-states"
+      Description: Runs the race-model Fargate tasks on the pipeline cluster, waits for them (.sync) and publishes failures.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: run-race-model-tasks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunRaceModelTaskDefinitionOnTheClusterOnly
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-${Environment}-race-model:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt PipelineCluster.Arn
+              - Sid: WatchAndStopClusterTasks
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}-${Environment}-pipeline/*"
+              - Sid: TaskCompletionEvents
+                Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+              - Sid: PassOnlyTheRaceModelTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt RaceModelTaskRole.Arn
+                  - !GetAtt RaceModelExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+        - PolicyName: publish-critical-alerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+        - PolicyName: deliver-execution-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RaceModelStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Condition: HasPipelineImage
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-race-model"
+      Type: STANDARD
+      DefinitionUri: statemachine/model.asl.json
+      DefinitionSubstitutions:
+        Environment: !Ref Environment
+        ClusterArn: !GetAtt PipelineCluster.Arn
+        TaskDefinitionArn: !Ref RaceModelTaskDefinition
+        SubnetA: !Ref PipelineSubnetA
+        SubnetB: !Ref PipelineSubnetB
+        TaskSecurityGroupId: !Ref PipelineTaskSecurityGroup
+        AlertTopicArn: !Ref AlertTopic
+      Role: !GetAtt RaceModelStateMachineRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt RaceModelStateMachineLogGroup.Arn
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: sam
+
+  RaceModelScheduleRole:
+    Type: AWS::IAM::Role
+    Condition: HasPipelineImage
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-race-model-schedule"
+      Description: Lets EventBridge start the race-model state machine on its schedules.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: start-race-model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref RaceModelStateMachine
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RaceModelTrainingScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: HasPipelineImage
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-race-model-train"
+      Description: Retrains the race model; the new version is promoted only if it beats the baseline.
+      ScheduleExpression: !Ref ModelTrainingSchedule
+      State: !Ref ModelScheduleState
+      Targets:
+        - Id: race-model-train
+          Arn: !Ref RaceModelStateMachine
+          RoleArn: !GetAtt RaceModelScheduleRole.Arn
+          Input: '{"action": "train"}'
+
+  RaceModelUpdateScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: HasPipelineImage
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-race-model-update"
+      Description: Feeds the last race into the season state (frozen hyperparameters).
+      ScheduleExpression: !Ref ModelUpdateSchedule
+      State: !Ref ModelScheduleState
+      Targets:
+        - Id: race-model-update
+          Arn: !Ref RaceModelStateMachine
+          RoleArn: !GetAtt RaceModelScheduleRole.Arn
+          Input: '{"action": "update"}'
+
+  ForecastFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-race-forecast"
+      Description: >-
+        Execution role of the forecast Lambda: read raw/ and models/, write forecasts/.
+        Nothing else.
+      # Standard Lambda trust, for the same reason as AvailabilityCheckerRole.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ForecastFunctionLogGroup.Arn}"
+        - PolicyName: forecast-prefixes
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListProjectBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: ReadInputs
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${DataBucket.Arn}/raw/*"
+                  - !Sub "${DataBucket.Arn}/models/m7/*"
+                  - !Sub "${DataBucket.Arn}/forecasts/m7/*"
+              - Sid: WriteForecasts
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${DataBucket.Arn}/forecasts/m7/*"
+        - PolicyName: report-failures
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # A plain Lambda resource (not AWS::Serverless::Function) so the zip-runtime
+  # Globals above do not apply to this container-image function.
+  ForecastFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasForecastFunction
+    DependsOn: ForecastFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-race-forecast"
+      Description: In-race finishing-position forecast (M7) for one race and lap, or the race running now.
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ForecastImageUri
+      Architectures: [x86_64]
+      MemorySize: 3008
+      Timeout: 120
+      Role: !GetAtt ForecastFunctionRole.Arn
+      Environment:
+        Variables:
+          F1_ENVIRONMENT: aws
+          F1_STORAGE_BUCKET: !Ref DataBucket
+      LoggingConfig:
+        LogGroup: !Ref ForecastFunctionLogGroup
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ForecastFunctionInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Condition: HasForecastFunction
+    Properties:
+      FunctionName: !Ref ForecastFunction
+      Qualifier: $LATEST
+      # A forecast for lap k is stale a minute later; the next tick makes a fresh one.
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 120
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref AlertTopic
+
+  LiveForecastScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: HasForecastFunction
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-race-forecast-live"
+      Description: During a Grand Prix, forecasts from each newly completed lap; idle otherwise.
+      ScheduleExpression: rate(1 minute)
+      State: !Ref LiveForecastScheduleState
+      Targets:
+        - Id: race-forecast-live
+          Arn: !GetAtt ForecastFunction.Arn
+          Input: '{"mode": "live"}'
+
+  LiveForecastInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasForecastFunction
+    Properties:
+      FunctionName: !Ref ForecastFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LiveForecastScheduleRule.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  ForecastFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasForecastFunction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-race-forecast-errors"
+      AlarmDescription: The forecast Lambda failed (bad input, missing model, OpenF1 or S3 errors).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref ForecastFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  RaceModelExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPipelineImage
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-race-model-executions-failed"
+      AlarmDescription: A race-model run failed (training, evaluation/promotion or update).
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - { Name: StateMachineArn, Value: !Ref RaceModelStateMachine }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ---------------------------------------------------------------------------
   # Alarms on critical infrastructure failures
   # ---------------------------------------------------------------------------
   AvailabilityCheckerErrorsAlarm:
@@ -1195,6 +1741,17 @@ Outputs:
   DataProcessingExecutionRoleArn:
     Description: ECS task execution role of the batch tasks (image pull, container logs).
     Value: !GetAtt DataProcessingExecutionRole.Arn
+  ForecastImageRepositoryUri:
+    Description: ECR repository for the forecast Lambda image (Dockerfile.forecast).
+    Value: !GetAtt ForecastImageRepository.RepositoryUri
+  RaceModelStateMachineArn:
+    Condition: HasPipelineImage
+    Description: Race-model lifecycle (input {"action":"train"} or {"action":"update"}).
+    Value: !Ref RaceModelStateMachine
+  ForecastFunctionName:
+    Condition: HasForecastFunction
+    Description: Forecast Lambda (event {"session_key":..,"lap":..} or {"mode":"live"}).
+    Value: !Ref ForecastFunction
   PipelineClusterName:
     Description: ECS cluster the batch tasks run on.
     Value: !Ref PipelineCluster

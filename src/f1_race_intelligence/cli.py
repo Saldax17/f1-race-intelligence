@@ -13,8 +13,14 @@
 Stages: ``plan`` (list the session work units of a season), ``m2`` extraction,
 ``m3`` validation, ``m4`` consolidation, ``m5`` features, ``m6`` modelling
 datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), ``m7``
-training and evaluation from a verified M6 report, and ``copy-raw`` (copy
-already-extracted raw data between stores).
+training and evaluation from a verified M6 report, ``copy-raw`` (copy
+already-extracted raw data between stores), and the in-race position model:
+``m7-train``, ``m7-evaluate`` (``--split``, ``--promote``), ``m7-update`` and
+``m7-forecast`` (``--session-key``, ``--lap``, ``--source``)::
+
+    python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote
+    python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
+
 Several stages run in order when given as a comma-separated list; the first
 failure stops the chain.
 
@@ -53,7 +59,10 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-STAGES = ("plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "copy-raw")
+STAGES = (
+    "plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "copy-raw",
+    "m7-train", "m7-evaluate", "m7-update", "m7-forecast",
+)
 
 
 @dataclass
@@ -108,6 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
     config.add_argument("--m6-report", help="Verified local M6 report to use as M7 training input")
+
+    model = parser.add_argument_group("race model (m7-*)")
+    model.add_argument("--lap", type=int, help="m7-forecast: forecast from the end of this lap (default: latest)")
+    model.add_argument("--total-laps", type=int, help="m7-forecast: race distance, when the circuit is new")
+    model.add_argument("--source", choices=["raw", "live"], default="raw", help="m7-forecast: raw tree or live OpenF1")
+    model.add_argument("--model-version", help="m7-evaluate/m7-forecast: a version instead of the newest/promoted one")
+    model.add_argument("--split", choices=["validation", "test"], default="validation", help="m7-evaluate: races to score")
+    model.add_argument("--promote", action="store_true", help="m7-evaluate: make the version 'latest' if it beats the baseline")
+    model.add_argument("--scenarios", type=int, help="m7-evaluate: Monte Carlo draws per forecast")
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -361,7 +379,59 @@ def run_copy_raw(ctx: RunContext) -> StageOutcome:
     )
 
 
+def _race_model(ctx: RunContext) -> Any:
+    from f1_race_intelligence.race_model.runner import RaceModelRunner
+
+    return RaceModelRunner(
+        ctx.settings,
+        ctx.input_store,
+        ctx.output_store,
+        client_factory=lambda: ctx.client_factory(ctx.settings),
+    )
+
+
+def _outcome(result: Any) -> StageOutcome:
+    return StageOutcome(ok=result.ok, summary=result.summary, reason=result.reason)
+
+
+def run_m7_train(ctx: RunContext) -> StageOutcome:
+    return _outcome(_race_model(ctx).train())
+
+
+def run_m7_evaluate(ctx: RunContext) -> StageOutcome:
+    args = ctx.args
+    return _outcome(
+        _race_model(ctx).evaluate(
+            version=args.model_version, split=args.split, promote=args.promote, scenarios=args.scenarios
+        )
+    )
+
+
+def run_m7_update(ctx: RunContext) -> StageOutcome:
+    return _outcome(_race_model(ctx).update())
+
+
+def run_m7_forecast(ctx: RunContext) -> StageOutcome:
+    args = ctx.args
+    if ctx.scope.session_key is None:
+        return StageOutcome(ok=False, reason="m7-forecast needs --session-key")
+    return _outcome(
+        _race_model(ctx).forecast(
+            ctx.scope.session_key,
+            lap=args.lap,
+            source=args.source,
+            version=args.model_version,
+            total_laps=args.total_laps,
+            year=ctx.scope.year,
+        )
+    )
+
+
 STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
+    "m7-train": run_m7_train,
+    "m7-evaluate": run_m7_evaluate,
+    "m7-update": run_m7_update,
+    "m7-forecast": run_m7_forecast,
     "plan": run_plan,
     "m2": run_m2,
     "m3": run_m3,

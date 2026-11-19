@@ -329,7 +329,15 @@ else
     --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
     --build-arg F1_GIT_DIRTY=false \
     -t "$REPO:$TAG" . &&
-  docker push "$REPO:$TAG"
+  docker push "$REPO:$TAG" &&
+  # Imagen de la Lambda de pronóstico (M7): mismo código y commit.
+  FORECAST_REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
+    --query "Stacks[0].Outputs[?OutputKey=='ForecastImageRepositoryUri'].OutputValue" --output text) &&
+  docker build --platform linux/amd64 \
+    --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg F1_GIT_DIRTY=false \
+    -f Dockerfile.forecast -t "$FORECAST_REPO:$TAG" . &&
+  docker push "$FORECAST_REPO:$TAG"
 fi
 ```
 
@@ -439,6 +447,106 @@ aws sns list-subscriptions-by-topic --topic-arn $topic --query "Subscriptions[].
 Activar el calendario (`AvailabilityScheduleState=ENABLED`) no forma parte de
 ningún ejemplo de este documento: es una decisión explícita y revisada, que se
 toma sustituyendo `DISABLED` en el despliegue correspondiente.
+
+## Modelo de carrera (M7): desplegar y mantener
+
+El modelo (`src/f1_race_intelligence/race_model/`, matemática en
+`f1-model-math.md`) se despliega en dos piezas, cada una creada **solo cuando su
+imagen ya está en ECR** (parámetros vacíos ⇒ el stack no crea nada de M7 salvo el
+repositorio ECR del pronóstico, los roles y los log groups):
+
+| Pieza | Recurso | Se crea si | Qué hace |
+|---|---|---|---|
+| Entrenamiento / actualización | ECS Fargate (`RaceModelTaskDefinition`, imagen batch, `PipelineCluster`) + Step Functions `…-race-model` | `PipelineImageUri` no vacío | `{"action":"train"}`: `m7-train` → `m7-evaluate --promote`. `{"action":"update"}`: `m7-update` |
+| Pronóstico | Lambda imagen `…-race-forecast` (`Dockerfile.forecast`) | `ForecastImageUri` no vacío | `{"session_key":…, "lap":…}` o `{"mode":"live"}` → `forecasts/m7/…` |
+
+Datos en el lake (contrato, ver `storage/layout.py`):
+
+```
+models/m7/version=<v>/model.json        versión inmutable (JSON: parámetros + estado del filtro)
+models/m7/latest.json                   puntero a la versión promovida (lo único que leen los pronósticos)
+manifests/models/m7/*.json              reportes de train / evaluate / update
+forecasts/m7/year=<y>/session=<s>/lap=<k>.json   y latest.json por carrera
+```
+
+IAM: `…-race-model` lee `raw/` y escribe solo `models/m7/` y
+`manifests/models/m7/`; `…-race-forecast` lee `raw/` y `models/m7/` y escribe
+solo `forecasts/m7/`. Ninguno puede borrar.
+
+### Ciclo de vida
+
+1. **Datos.** M2 ahora también extrae `session_result` (etiqueta) y
+   `starting_grid` (prior de clasificación, pedido por `meeting_key`).
+2. **Entrenar** (mensual o a mano): ajusta nivel 1 en todas las carreras, el filtro
+   de temporada, eventos y baselines en las de entrenamiento, y escribe una versión
+   nueva. `m7-evaluate --promote` la puntúa en validación y **solo** mueve
+   `latest.json` si mejora el RPS medio del baseline `persist`; si no, la tarea sale
+   con código 1, la ejecución falla y llega una alerta, y `latest` no cambia.
+3. **Actualizar** (lunes tras cada GP): `m7-update` vuelve a correr el filtro con
+   los hiperparámetros congelados para que la próxima carrera use el último
+   resultado; promueve automáticamente (la versión padre ya estaba aprobada).
+4. **Pronosticar**: invocación bajo demanda o la regla `…-race-forecast-live`
+   (cada minuto; fuera de carrera responde `idle`).
+5. **Revertir**: escribir la versión anterior en `models/m7/latest.json`
+   (`aws s3 cp` de un `latest.json` con `{"version": "<v>"}`); las versiones nunca
+   se sobrescriben.
+
+### Publicar imágenes y desplegar
+
+Las dos imágenes (batch y pronóstico) se construyen y publican con el bloque
+protegido de "Para publicar la imagen batch en ECR": solo desde un árbol limpio
+y con el SHA completo del commit. Las tareas del modelo usan **la misma imagen
+batch** (`PipelineImageUri`), el mismo cluster, las mismas subredes y el mismo
+security group que M2-M6; la Lambda usa `ForecastImageUri`. Ambas van **por
+digest** (el que devuelve `docker push`), nunca por tag.
+
+```bash
+: "${ALERT_EMAIL:?Define ALERT_EMAIL con la dirección real del destinatario}"
+: "${PIPELINE_IMAGE:?Define PIPELINE_IMAGE=<repositorio>@sha256:<digest> de la imagen batch}"
+: "${FORECAST_IMAGE:?Define FORECAST_IMAGE=<repositorio>@sha256:<digest> de la imagen de pronóstico}"
+cd infra && sam build
+sam deploy --config-env dev --parameter-overrides   ParameterKey=ProjectName,ParameterValue=f1-race-intelligence   ParameterKey=Environment,ParameterValue=dev   'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"'   ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED   ParameterKey=PipelineEnabled,ParameterValue=false   ParameterKey=LogRetentionDays,ParameterValue=30   "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}"   "ParameterKey=PipelineImageUri,ParameterValue=${PIPELINE_IMAGE}"   "ParameterKey=ForecastImageUri,ParameterValue=${FORECAST_IMAGE}"   ParameterKey=ModelScheduleState,ParameterValue=DISABLED   ParameterKey=LiveForecastScheduleState,ParameterValue=DISABLED
+```
+
+`PipelineEnabled=false` sigue apagando M2-M6: el modelo corre con su propia
+state machine, que solo arranca a mano o con sus calendarios (`DISABLED`). En
+PowerShell, el mismo despliegue sigue el patrón protegido de "Alertas por
+correo" añadiendo `PipelineImageUri`, `ForecastImageUri`, `ModelScheduleState`
+y `LiveForecastScheduleState`.
+
+Primera carga del modelo y pruebas (los datos `raw/` deben estar en el bucket):
+
+```bash
+out() { aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+SM=$(out RaceModelStateMachineArn)
+aws stepfunctions start-execution --state-machine-arn "$SM" --input '{"action": "train"}'
+FN=$(out ForecastFunctionName)
+aws lambda invoke --function-name "$FN" --cli-binary-format raw-in-base64-out \
+  --payload '{"session_key": 9998, "lap": 30}' forecast.json && cat forecast.json
+```
+
+Local, sin AWS (mismos comandos que ejecutan las tareas):
+
+```bash
+python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote
+python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
+python -m f1_race_intelligence --stage m7-evaluate --split test   # solo para el informe final
+```
+
+### Riesgos del modelo en producción
+
+- **Datos en vivo.** Durante una sesión OpenF1 sirve datos en vivo solo a usuarios
+  autenticados; sin esa credencial el modo `live` falla o ve datos atrasados. Por
+  eso `LiveForecastScheduleState` es `DISABLED` y el cliente aún no envía token.
+- **Puerta de promoción.** Promueve contra `persist`. En la validación de
+  2025 el modelo supera claramente a `persist` y queda por delante de la
+  matriz de transición (`transition`) sin diferencia significativa (IC 95%
+  del ΔRPS que incluye 0); si se quiere exigir ambos, cambiar
+  `race_model.promote_requires_beating`.
+- **Test.** `--split test` no promueve nunca y no debe usarse para decidir nada.
+- El reinicio reglamentario de 2026 deja el filtro sin historia útil: tras
+  `m7-update`, revisar `prior_check` en el reporte antes de confiar en las
+  primeras carreras.
 
 ## Eliminar
 

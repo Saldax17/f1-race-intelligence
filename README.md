@@ -1129,7 +1129,38 @@ CloudWatch Logs + alarmas                            IAM role por tarea (mínimo
 Glue Data Catalog / Athena (opcional, partition projection)
 ```
 
-## 15. Ejecutar tests
+## 15. Modelo de carrera (M7): pronóstico en carrera desde la vuelta *k*
+
+Dado todo lo observado hasta el final de la vuelta *k*, el modelo entrega la
+matriz N×N `P[i, j] = Pr(piloto i termina j-ésimo)` más `Pr(DNF)` por piloto. Los
+coches retirados ocupan las últimas posiciones, así que la matriz es doblemente
+estocástica por construcción. La matemática y cada decisión están en
+`f1-model-math.md`; el alcance, en `f1-model-scope.md`.
+
+| Módulo (`race_model/`) | Qué hace |
+|---|---|
+| `racedata` | Lee una carrera del raw (local o S3) o en vivo de OpenF1; `truncate_at_lap` es la guarda anti-leakage: corta todo después de que el líder completa la vuelta *k* y elimina el resultado oficial |
+| `regime` | Vuelta a vuelta: verde / SC / VSC / bandera roja desde `race_control` |
+| `pace` | Nivel 1: vueltas limpias, ritmo θ̂ por carrera (ridge, SE por covarianza, AR(1)), degradación por compuesto |
+| `season` | Nivel 2: forma de coche y piloto entre carreras (Kalman, ρ ≡ 1) + clasificación como medición |
+| `events` | Riesgos de SC/VSC/roja y de abandono por vuelta (pooling por circuito), pérdida en boxes, momento de parada |
+| `forecast` | Posterior del ritmo con las vueltas 1..*k* y Monte Carlo vectorizado → matriz |
+| `scoring`, `baselines` | RPS, log-loss por pares, calibración; baselines "orden persiste + parada" y matriz de transición |
+| `artifact`, `runner` | Versiones inmutables en `models/m7/`, puntero `latest.json`, etapas `m7-*` |
+| `lambda_handler` | Entrada de la Lambda de pronóstico (bajo demanda o en vivo) |
+
+```bash
+python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote     # entrenar y promover si supera al baseline
+python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
+python -m f1_race_intelligence --stage m7-update                          # tras cada GP: estado de temporada al día
+```
+
+Split: 2023–24 entrenamiento; 2025 en orden de calendario, primera mitad
+validación y segunda mitad test (solo con `m7-evaluate --split test`, nunca para
+promover). Despliegue y mantenimiento en AWS: `infra/README.md`, sección
+"Modelo de carrera (M7)".
+
+## 16. Ejecutar tests
 
 ```bash
 # Unit tests (sin red, con mocks) — se ejecutan por defecto
@@ -1153,7 +1184,7 @@ layouts `legacy`/`lake`; configuración local/AWS; M2–M6 sobre S3 comparados
 contra su ejecución local; idempotencia; jobs por sesión; CLI y códigos de
 salida; contexto de logging.
 
-## 16. Limitaciones actuales
+## 17. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
   devuelven como `list`/`dict` crudos).
@@ -1171,7 +1202,7 @@ salida; contexto de logging.
   y compara los hashes de M6 entre ambos. No ejecuta `cfn-lint` ni
   `sam validate`, no construye la imagen y no despliega (sin CD).
 
-## 17. Licencia y uso de datos
+## 18. Licencia y uso de datos
 
 Este proyecto consume la API pública [OpenF1](https://openf1.org/), cuyos
 términos de uso la destinan a fines educativos, proyectos personales de
@@ -1180,7 +1211,7 @@ Maestría en Ciencia de Datos y Analítica. No se distribuyen ni republican
 los datos crudos obtenidos de OpenF1 fuera de este repositorio; los archivos
 bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
-## 18. Próximos pasos (fuera del alcance de esta etapa)
+## 19. Próximos pasos (fuera del alcance de esta etapa)
 
 - Feature engineering sobre la unidad Piloto × Carrera × Vuelta.
 - Modelado y entrenamiento (baseline → modelos más complejos) para predecir
