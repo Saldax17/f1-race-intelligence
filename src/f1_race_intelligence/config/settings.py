@@ -327,6 +327,67 @@ class ModelingSettings(BaseModel):
     """Refuse to write anything when a blocking guard fails."""
 
 
+class RaceModelSettings(BaseModel):
+    """The in-race position forecaster (M7): what it trains on and how it is scored.
+
+    The model is described in ``f1-model-math.md`` (pace prior §3.3, sampler
+    §4.3, events §5–7). Every number here is a modelling choice that the
+    training report records, so a retrain with different settings is
+    traceable.
+    """
+
+    raw_path: str = "data/raw"
+    """Legacy-layout root of the raw tree (the lake layout ignores it)."""
+
+    output_path: str = "data/models/m7"
+    """Legacy-layout root for model versions, reports and forecasts."""
+
+    years: List[int] = Field(default_factory=lambda: [2023, 2024, 2025])
+    train_years: List[int] = Field(default_factory=lambda: [2023, 2024])
+    validation_share_of_remainder: float = 0.5
+    """Of the races after ``train_years``, the earlier share is validation and the rest test."""
+
+    exclude_races: List[str] = Field(default_factory=lambda: ["2025 Miami Gardens"])
+    """``"<year> <location>"`` of races left out entirely (2025 Miami: laps 2–25 missing at source)."""
+
+    burn_in_races: int = 6
+    """First races the season filter runs through without adding likelihood."""
+
+    # level 1 (laps)
+    free_air_seconds: float = 1.5
+    slow_lap_factor: float = 1.04
+    min_clean_laps: int = 5
+    ridge_sigma: float = 0.4
+    compound_offset_prior_sd: float = 1.0
+    compound_slope_prior_sd: float = 0.1
+
+    # level 2 (races)
+    fit_rho: bool = False
+    """Fit ρ_in/ρ_season. False keeps the random walk chosen in math note §3.3 (xi)."""
+    initial_team_variance: float = 0.25
+    initial_driver_variance: float = 0.05
+    quali_max_abs_pct: float = 4.0
+
+    # events and forecast
+    k_fractions: List[float] = Field(default_factory=lambda: [0.1, 0.25, 0.5, 0.75, 0.9])
+    """Forecast moments as fractions of race distance; the evaluation reports each bucket."""
+    scenarios: int = 4000
+    """Monte Carlo draws per forecast. Cell SE ≤ 0.5/√S."""
+    restart_gap_seconds: float = 0.8
+    """Gap per position in the queue at a safety-car restart."""
+    pit_under_sc_probability: float = 0.7
+    pit_under_vsc_probability: float = 0.4
+    noise_scales: List[float] = Field(default_factory=lambda: [1.0, 1.5, 2.0, 3.0])
+    """Candidates for the lap-noise multiplier, chosen on training races by RPS."""
+    calibration_races: int = 16
+    """Training races (the latest ones) used to pick the noise multiplier."""
+    random_seed: int = 42
+
+    # promotion
+    promote_requires_beating: str = "persist"
+    """Baseline the candidate must beat on validation mean RPS before it becomes ``latest``."""
+
+
 class AppSettings(BaseModel):
     """Top-level application settings."""
 
@@ -343,6 +404,7 @@ class AppSettings(BaseModel):
     consolidation: ConsolidationSettings = Field(default_factory=ConsolidationSettings)
     features: FeatureSettings = Field(default_factory=FeatureSettings)
     modeling: ModelingSettings = Field(default_factory=ModelingSettings)
+    race_model: RaceModelSettings = Field(default_factory=RaceModelSettings)
 
     @model_validator(mode="after")
     def _aws_runs_on_object_storage(self) -> "AppSettings":

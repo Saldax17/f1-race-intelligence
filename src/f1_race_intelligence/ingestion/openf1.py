@@ -182,3 +182,30 @@ class F1Client(BaseAPIClient):
         """GET /race_control"""
         params = build_params(session_key=session_key, meeting_key=meeting_key, **filters)
         return self._get("/race_control", params)
+
+    def get_session_result(
+        self,
+        *,
+        session_key: Optional[int] = None,
+        driver_number: Optional[int] = None,
+        **filters: Any,
+    ) -> Any:
+        """GET /session_result — official classification (position, laps, dnf/dns/dsq)."""
+        params = build_params(session_key=session_key, driver_number=driver_number, **filters)
+        return self._get("/session_result", params)
+
+    def get_starting_grid(
+        self,
+        *,
+        session_key: Optional[int] = None,
+        meeting_key: Optional[int] = None,
+        **filters: Any,
+    ) -> Any:
+        """GET /starting_grid — grid position and qualifying lap per driver.
+
+        OpenF1 answers 404 for a *race* ``session_key``: query the qualifying
+        session or the whole meeting (which on sprint weekends also returns the
+        sprint grid; readers keep the rows of the ``Qualifying`` session).
+        """
+        params = build_params(session_key=session_key, meeting_key=meeting_key, **filters)
+        return self._get("/starting_grid", params)

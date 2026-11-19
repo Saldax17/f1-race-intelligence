@@ -257,7 +257,7 @@ def test_lambda_role_uses_the_standard_trust_and_the_others_keep_source_account(
     for name, role in roles.items():
         statements = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
         assert len(statements) == 1 and statements[0]["Action"] == "sts:AssumeRole", name
-        if name == "AvailabilityCheckerRole":
+        if name in ("AvailabilityCheckerRole", "ForecastFunctionRole"):
             assert statements[0] == {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
         else:
             assert statements[0]["Condition"]["StringEquals"]["aws:SourceAccount"] == {"Ref": "AWS::AccountId"}, name
@@ -297,7 +297,16 @@ def test_s3_permissions_are_limited_to_the_project_bucket(template) -> None:
                 assert "DataBucket" in json.dumps(statement["Resource"]), f"{name}/{policy}"
 
 
-def test_only_the_data_processing_role_touches_s3_and_it_cannot_delete(template) -> None:
+def _s3_writes(role):
+    return {
+        json.dumps(resource)
+        for _, statement in policy_statements(role)
+        if "s3:PutObject" in as_list(statement["Action"])
+        for resource in as_list(statement["Resource"])
+    }
+
+
+def test_only_the_data_and_model_roles_touch_s3_and_none_can_delete(template) -> None:
     roles = resources_of(template, "AWS::IAM::Role")
     s3_roles = {
         name
@@ -306,11 +315,23 @@ def test_only_the_data_processing_role_touches_s3_and_it_cannot_delete(template)
         if any(action.startswith("s3:") for action in as_list(statement["Action"]))
     }
 
-    assert s3_roles == {"DataProcessingTaskRole"}
-    actions = {action for _, s in policy_statements(roles["DataProcessingTaskRole"]) for action in as_list(s["Action"])}
-    assert not {action for action in actions if "Delete" in action}
+    assert s3_roles == {"DataProcessingTaskRole", "RaceModelTaskRole", "ForecastFunctionRole"}
+    for name in s3_roles:
+        actions = {action for _, s in policy_statements(roles[name]) for action in as_list(s["Action"])}
+        assert not {action for action in actions if "Delete" in action}, name
     policies = json.dumps(roles["DataProcessingTaskRole"]["Properties"]["Policies"])
-    assert "models/" not in policies, "models/ belongs to the future training role"
+    assert "models/" not in policies, "models/ belongs to the race-model role"
+
+
+def test_model_roles_write_only_their_own_prefixes(template) -> None:
+    roles = resources_of(template, "AWS::IAM::Role")
+
+    model_writes = _s3_writes(roles["RaceModelTaskRole"])
+    assert model_writes and all("/models/m7/" in w or "/manifests/models/m7/" in w for w in model_writes)
+    forecast_writes = _s3_writes(roles["ForecastFunctionRole"])
+    assert forecast_writes and all("/forecasts/m7/" in w for w in forecast_writes)
+    reads = json.dumps(roles["RaceModelTaskRole"]["Properties"]["Policies"])
+    assert "/raw/*" in reads and "/features/" not in reads
 
 
 def test_log_groups_use_the_retention_parameter(template) -> None:
@@ -347,8 +368,55 @@ def test_critical_alarms_notify_the_alert_topic(template, alarm) -> None:
     assert template["Resources"][alarm]["Properties"]["AlarmActions"] == [{"Ref": "AlertTopic"}]
 
 
-def test_no_model_hosting_or_training_resources(template) -> None:
-    kinds = {body["Type"] for body in template["Resources"].values()}
+def test_no_sagemaker_and_model_compute_exists_only_once_its_image_is_tagged(template) -> None:
+    resources = template["Resources"]
+    kinds = {body["Type"] for body in resources.values()}
 
     assert not any(kind.startswith("AWS::SageMaker::") for kind in kinds)
-    assert "AWS::ECS::TaskDefinition" not in kinds, "batch jobs are deployed in a later step"
+    for name, body in resources.items():
+        if body["Type"] in ("AWS::ECS::TaskDefinition", "AWS::ECS::Cluster", "AWS::EC2::SecurityGroup"):
+            assert body.get("Condition") == "HasModelCompute", name
+        if body["Type"] == "AWS::Lambda::Function":
+            assert body.get("Condition") == "HasForecastFunction", name
+    assert template["Parameters"]["ModelImageTag"]["Default"] == ""
+    assert template["Parameters"]["ForecastImageTag"]["Default"] == ""
+
+
+@pytest.mark.parametrize("parameter", ["ModelScheduleState", "LiveForecastScheduleState"])
+def test_model_schedules_are_disabled_by_default(template, parameter) -> None:
+    assert template["Parameters"][parameter]["Default"] == "DISABLED"
+
+
+def test_model_rules_use_their_state_parameters(template) -> None:
+    resources = template["Resources"]
+    assert resources["RaceModelTrainingScheduleRule"]["Properties"]["State"] == {"Ref": "ModelScheduleState"}
+    assert resources["RaceModelUpdateScheduleRule"]["Properties"]["State"] == {"Ref": "ModelScheduleState"}
+    assert resources["LiveForecastScheduleRule"]["Properties"]["State"] == {"Ref": "LiveForecastScheduleState"}
+
+
+def test_model_failures_alert(template) -> None:
+    resources = template["Resources"]
+    for alarm in ("RaceModelExecutionsFailedAlarm", "ForecastFunctionErrorsAlarm"):
+        assert resources[alarm]["Properties"]["AlarmActions"] == [{"Ref": "AlertTopic"}]
+    assert resources["ForecastFunctionInvokeConfig"]["Properties"]["DestinationConfig"]["OnFailure"] == {
+        "Destination": {"Ref": "AlertTopic"}
+    }
+
+
+def test_model_state_machine_catches_every_task(template) -> None:
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[2] / "infra" / "statemachine" / "model.asl.json").read_text(encoding="utf-8")
+    substitutions = template["Resources"]["RaceModelStateMachine"]["Properties"]["DefinitionSubstitutions"]
+    placeholders = set(re.findall(r"\$\{(\w+)\}", text))
+    assert placeholders <= set(substitutions), placeholders - set(substitutions)
+    text = text.replace("${SubnetIdsJson}", '["subnet-1"]')
+    definition = json.loads(re.sub(r"\$\{\w+\}", "x", text))
+    tasks = {name: s for name, s in definition["States"].items() if s["Type"] == "Task" and "ecs:runTask" in s["Resource"]}
+    assert set(tasks) == {"TrainModel", "EvaluateAndPromote", "UpdateModel"}
+    for name, state in tasks.items():
+        assert state["Catch"][0]["Next"] == "NotifyFailure", name
+        assert state["Resource"].endswith(".sync"), name
+    commands = {name: s["Parameters"]["Overrides"]["ContainerOverrides"][0]["Command"] for name, s in tasks.items()}
+    assert commands["EvaluateAndPromote"] == ["--stage", "m7-evaluate", "--promote"]
