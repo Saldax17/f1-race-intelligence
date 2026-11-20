@@ -306,10 +306,19 @@ def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch
 
     assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_OK
 
+    # M6 reuses a previous VALID result for the same inputs (possible on a clean checkout),
+    # which would skip the guard below. An M6 output location of its own has no previous
+    # report, so the forced guard is evaluated by a fresh run.
+    settings = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    settings["modeling"]["output_path"] = str(tmp_path / "modeling_guarded")
+    settings["modeling"]["report_path"] = str(tmp_path / "modeling_guarded_reports")
+    guarded_config = tmp_path / "config_guarded.yaml"
+    guarded_config.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
     monkeypatch.setattr(
         checks, "check_chronological_split", lambda assignments: checks.CheckResult("chronological_split", False, "forced")
     )
-    assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
+    assert cli.main(["--stage", "m6", "--config", str(guarded_config)]) == cli.EXIT_FAILED
 
 
 def test_cli_skips_m6_only_for_matching_valid_inputs(config_file, tmp_path, monkeypatch, capsys) -> None:
