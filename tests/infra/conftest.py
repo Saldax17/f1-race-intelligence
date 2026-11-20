@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INFRA = REPO_ROOT / "infra"
 
 sys.path.insert(0, str(INFRA / "functions" / "availability_checker"))
+sys.path.insert(0, str(INFRA / "functions" / "pipeline_admission"))
 
 
 class _CloudFormationLoader(yaml.SafeLoader):

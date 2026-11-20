@@ -42,6 +42,7 @@ parameter_overrides = [
   "Environment=dev",
   'AvailabilitySchedule="rate(15 minutes)"',
   "AvailabilityScheduleState=DISABLED",
+  "PipelineIntervalHours=24",
   "PipelineEnabled=false",
   "LogRetentionDays=30",
 ]
@@ -60,6 +61,7 @@ parameter_overrides = [
   "Environment=prod",
   'AvailabilitySchedule="rate(15 minutes)"',
   "AvailabilityScheduleState=DISABLED",
+  "PipelineIntervalHours=24",
   "PipelineEnabled=false",
   "LogRetentionDays=90",
 ]

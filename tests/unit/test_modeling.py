@@ -675,6 +675,76 @@ def test_the_feature_dataset_is_not_modified(three_races, modeling_settings, tmp
     assert {path: path.read_bytes() for path in source} == before
 
 
+def test_m6_reuses_only_a_verified_valid_report_with_the_same_fingerprint(
+    three_races, modeling_settings, tmp_path, monkeypatch
+) -> None:
+    import f1_race_intelligence.modeling.runner as modeling_module
+
+    three_races()
+    settings = modeling_settings()
+    monkeypatch.setattr(modeling_module, "source_revision", lambda: ("a" * 40, False))
+    monkeypatch.setattr(modeling_module, "dependency_lock_sha256", lambda: "b" * 64)
+
+    first = ModelingRunner(settings).run()
+    assert first.verdict is RunVerdict.VALID
+    reusable = ModelingRunner(settings).reusable_report()
+    assert reusable is not None
+    assert reusable["run_id"] == first.run_id
+
+    feature_path = tmp_path / "lap_features" / "2023" / "session_1.parquet"
+    original_bytes = feature_path.read_bytes()
+    changed = pd.read_parquet(feature_path)
+    changed.loc[0, "speed_mean"] += 1
+    changed.to_parquet(feature_path, engine="pyarrow", index=False)
+    assert ModelingRunner(settings).reusable_report() is None
+
+    feature_path.write_bytes(original_bytes)
+    (report_path,) = (tmp_path / "modeling" / "reports").glob("modeling_report_*.json")
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    artifact = Path(payload["artifact_files"][0]["path"])
+    artifact.write_bytes(artifact.read_bytes() + b"corruption")
+    assert ModelingRunner(settings).reusable_report() is None
+
+
+def test_m6_does_not_reuse_valid_with_warnings_or_invalid_results(
+    three_races, modeling_settings, tmp_path, monkeypatch
+) -> None:
+    import f1_race_intelligence.modeling.runner as modeling_module
+
+    three_races()
+    settings = modeling_settings()
+    monkeypatch.setattr(modeling_module, "source_revision", lambda: ("a" * 40, False))
+    monkeypatch.setattr(modeling_module, "dependency_lock_sha256", lambda: "b" * 64)
+    ModelingRunner(settings).run()
+
+    (report_path,) = (tmp_path / "modeling" / "reports").glob("modeling_report_*.json")
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["verdict"] = RunVerdict.VALID_WITH_WARNINGS.value
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert ModelingRunner(settings).reusable_report() is None
+
+    payload["verdict"] = RunVerdict.INVALID.value
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert ModelingRunner(settings).reusable_report() is None
+
+
+def test_m6_does_not_reuse_a_report_when_an_artifact_is_missing(
+    three_races, modeling_settings, tmp_path, monkeypatch
+) -> None:
+    import f1_race_intelligence.modeling.runner as modeling_module
+
+    three_races()
+    settings = modeling_settings()
+    monkeypatch.setattr(modeling_module, "source_revision", lambda: ("a" * 40, False))
+    monkeypatch.setattr(modeling_module, "dependency_lock_sha256", lambda: "b" * 64)
+    ModelingRunner(settings).run()
+
+    (report_path,) = (tmp_path / "modeling" / "reports").glob("modeling_report_*.json")
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    Path(payload["artifact_files"][0]["path"]).unlink()
+    assert ModelingRunner(settings).reusable_report() is None
+
+
 def test_features_come_from_the_m5_catalogue(three_races, modeling_settings) -> None:
     """M6 does not invent features; it consumes what M5 approved."""
     three_races()

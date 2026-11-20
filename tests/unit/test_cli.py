@@ -250,8 +250,25 @@ def test_plan_lists_work_units(config_file, tmp_path, capsys) -> None:
     )
 
     assert code == cli.EXIT_OK
-    units = json.loads(output.read_text(encoding="utf-8"))
-    assert units == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
+    plan = json.loads(output.read_text(encoding="utf-8"))
+    assert len(plan["sessions"]) == 1
+    assert plan["sessions"][0] == {
+        "year": 2023,
+        "meeting_key": 1219,
+        "session_key": 9158,
+        "session_name": "Race",
+        "process_reason": "no verified completion provenance",
+    }
+    assert plan["decisions"] == [
+        {
+            "year": 2023,
+            "meeting_key": 1219,
+            "session_key": 9158,
+            "session_name": "Race",
+            "decision": "include",
+            "reason": "no verified completion provenance",
+        }
+    ]
 
 
 def test_plan_can_be_written_to_s3_for_the_orchestrator(config_file, monkeypatch) -> None:
@@ -269,7 +286,8 @@ def test_plan_can_be_written_to_s3_for_the_orchestrator(config_file, monkeypatch
 
     assert code == cli.EXIT_OK
     stored = json.loads(s3.get_object(Bucket="plans-bucket", Key="manifests/plan/exec-1.json")["Body"].read())
-    assert stored == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
+    assert stored["sessions"][0]["session_key"] == 9158
+    assert stored["decisions"][0]["decision"] == "include"
 
 
 @pytest.mark.parametrize("destination", ["s3://plans-bucket", "s3://plans-bucket/manifests/plan/", "gs://bucket/plan.json"])
@@ -292,6 +310,39 @@ def test_m6_blocked_by_a_guard_exits_non_zero(config_file, tmp_path, monkeypatch
         checks, "check_chronological_split", lambda assignments: checks.CheckResult("chronological_split", False, "forced")
     )
     assert cli.main(["--stage", "m6", "--config", str(config_file)]) == cli.EXIT_FAILED
+
+
+def test_cli_skips_m6_only_for_matching_valid_inputs(config_file, tmp_path, monkeypatch, capsys) -> None:
+    import f1_race_intelligence.modeling.runner as modeling_module
+
+    for session_key, year, offset in ((1, 2023, 0), (2, 2024, 365), (3, 2025, 730)):
+        frame = pd.DataFrame(feature_rows(session_key, year, offset))
+        path = tmp_path / "features" / str(year) / f"session_{session_key}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=False)
+    monkeypatch.setattr(modeling_module, "source_revision", lambda: ("a" * 40, False))
+    monkeypatch.setattr(modeling_module, "dependency_lock_sha256", lambda: "b" * 64)
+    original_run = modeling_module.ModelingRunner.run
+    calls = []
+
+    def count_runs(self):
+        calls.append(True)
+        return original_run(self)
+
+    monkeypatch.setattr(modeling_module.ModelingRunner, "run", count_runs)
+    args = ["--stage", "m6", "--config", str(config_file)]
+
+    assert cli.main(args) == cli.EXIT_OK
+    assert cli.main(args) == cli.EXIT_OK
+    assert len(calls) == 1
+    assert "reused_from_run_id" in capsys.readouterr().err
+
+    path = tmp_path / "features" / "2023" / "session_1.parquet"
+    changed = pd.read_parquet(path)
+    changed.loc[0, "speed_mean"] += 1
+    changed.to_parquet(path, index=False)
+    assert cli.main(args) == cli.EXIT_OK
+    assert len(calls) == 2
 
 
 def test_m6_blocking_guard_still_fails_pipeline_when_leakage_stop_is_disabled(

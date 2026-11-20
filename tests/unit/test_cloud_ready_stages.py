@@ -114,7 +114,15 @@ def test_m2_plan_then_one_session_job_needs_no_discovery_calls(lake, s3) -> None
     units = pipeline.plan([2023])
     manifest = pipeline.run_session(2023, 9158)
 
-    assert units == [{"year": 2023, "meeting_key": 1219, "session_key": 9158, "session_name": "Race"}]
+    assert units == [
+        {
+            "year": 2023,
+            "meeting_key": 1219,
+            "session_key": 9158,
+            "session_name": "Race",
+            "process_reason": "no verified completion provenance",
+        }
+    ]
     assert client.get_sessions.call_count == 1, "the session's meeting came from the stored catalogue"
     assert manifest.sessions_processed == [9158]
     assert manifest.config["scope"] == {"mode": "session", "year": 2023, "meeting_key": 1219, "session_key": 9158}
