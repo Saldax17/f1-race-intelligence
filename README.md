@@ -7,8 +7,130 @@ pilotos de Fórmula 1 a partir de datos históricos de la API pública
 
 La unidad de análisis objetivo es **Piloto × Carrera × Vuelta**, con la meta
 de predecir `next_lap_time` (tiempo de la siguiente vuelta). M7 incorpora un
-pipeline reproducible de regresión lineal y evaluación sobre los splits M6;
-el entrenamiento con datos reales sigue pendiente de autorización.
+pipeline reproducible de regresión lineal y evaluación sobre los splits M6; el
+entrenamiento con datos reales sigue pendiente de autorización. La cadena
+completa M1–M8 está demostrada **localmente con datos sintéticos**
+([DEMO_LOCAL.md](DEMO_LOCAL.md)); ver la
+[visión general MLOps](#visión-general-mlops-m1m8) y su índice de documentación.
+
+## Visión general MLOps (M1–M8)
+
+**Propósito.** Construir de forma reproducible y trazable el camino completo
+desde los datos públicos de OpenF1 hasta un modelo servido, para predecir
+`next_lap_time` por Piloto × Carrera × Vuelta. El énfasis académico está en la
+ingeniería: cada etapa deja evidencia verificable (manifiestos, informes con
+SHA-256, `input_fingerprint`), las guardas anti-leakage no se relajan y cada
+paso puede repetirse sin duplicar ni corromper resultados.
+
+**Estado, con exactitud.**
+
+- Implementado y probado **localmente** con datos sintéticos y un cliente
+  OpenF1 simulado: M1–M8, la planificación incremental, el backfill por
+  temporadas, la protección de M6, la publicación del modelo y el serving.
+  La última validación integral: **979 pruebas pasadas y 2 excluidas** (las
+  dos de `tests/integration`, que llaman a OpenF1 real) y la demostración
+  [DEMO_LOCAL.md](DEMO_LOCAL.md).
+- **No** se ha entrenado con datos reales de OpenF1. Las métricas de la
+  demostración salen de seis carreras artificiales y no son resultados
+  académicos de rendimiento.
+- La infraestructura AWS (SAM/Step Functions/ECS/Lambda/alarmas) está definida
+  en código y validada estáticamente (`sam validate --lint`) y por simulación;
+  **no está desplegada ni se ha validado en AWS real**
+  ([infra/aws_status.json](infra/aws_status.json)). M7 y M8 no existen en AWS:
+  MLflow usa SQLite local y el serving es un prototipo local.
+- Auditorías independientes (Antigravity): la planificación incremental y la
+  admisión (R1, R1.1 y R1.2) obtuvieron *APPROVED WITH MINOR FINDINGS* (su único
+  hallazgo menor, `pythonpath = ["src"]` en `pyproject.toml`, está corregido);
+  el backfill por temporadas y la protección de M6 (R2) y la robustez ante el
+  resultado de ECS (R3) obtuvieron *APPROVED*. La validación en AWS real sigue
+  pendiente.
+
+### Componentes y responsabilidades
+
+| Etapa | Responsabilidad | Entrada → salida | Detalle |
+|---|---|---|---|
+| M1 | Cliente `F1Client`, configuración y almacenamiento | OpenF1 → respuestas raw | §2, §6–§8 |
+| M2 | Extracción histórica idempotente por sesión | OpenF1 → `raw/` + manifiesto | §9 |
+| M3 | Validación de calidad (no modifica el raw) | `raw/` + manifiesto → informe PASS/WARNING/FAIL | §10 |
+| M4 | Consolidación a Piloto × Carrera × Vuelta | `raw/` + informe M3 → dataset por sesión | §11 |
+| M5 | Features y target `next_lap_time`, con guardas anti-leakage | dataset M4 → features por sesión | §12 |
+| M6 | Dataset de modelado: split cronológico por carrera y preprocesado ajustado solo con train | features de **todo** el histórico → splits, preprocesador y esquema con hashes | §13 |
+| M7 | Entrenamiento (regresión lineal y referencia), métricas, MLflow y registro | informe M6 verificado → modelo registrado | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| Publicación | Paquete inmutable y verificable de una versión registrada | modelo + artefactos M6 → `published-models/…` con manifiesto y `PUBLISHED` | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
+| M8 | Serving FastAPI (`/live`, `/health`, `/model-info`, `/predict`) | paquete publicado (o URIs de MLflow) → predicciones | §19 |
+
+```
+OpenF1 ──F1Client──▶ M2 raw ──▶ M3 validación ──▶ M4 consolidado ──▶ M5 features ─┐
+                       (por sesión, idempotente, con evidencia por etapa)           │
+                                                                                    ▼
+        M8 serving ◀── paquete publicado ◀── MLflow (registro) ◀── M7 ◀── M6 (historia completa)
+```
+
+La cadena de trazabilidad conserva el mismo `run_id` de M6, el mismo
+`input_fingerprint` y el mismo `run_id` de M7 en el informe de M7, MLflow, el
+manifiesto del paquete y la respuesta de `/model-info`. M8 usa el preprocesador
+publicado; no reajusta nada.
+
+### Incrementalidad, idempotencia y admisión
+
+- **Plan incremental.** Cada sesión se omite solo si su estado
+  `manifests/incremental/…` demuestra, con hashes, que M2–M5 terminaron y que
+  el raw, los informes, las salidas y la configuración siguen intactos. Una
+  evidencia ausente o alterada vuelve a incluirla. Un 404 legítimo de un
+  endpoint solo cuenta si el manifiesto de M2 lo registra (código 404, no
+  reintentable).
+- **M6 idempotente.** Se reutiliza únicamente un resultado previo con veredicto
+  `VALID` cuyo `input_fingerprint`, configuración, código y dependencias
+  coinciden y cuyos artefactos verifican.
+- **Admisión.** Una Lambda reserva en S3, con escritura condicional
+  (compare-and-set), el intervalo mínimo (24 h como mínimo) entre inicios
+  automáticos del pipeline. Es una espera mínima entre reservas, no una ventana
+  de calendario; los inicios manuales no pasan por ella.
+
+### Backfill por temporadas y protección de M6
+
+El histórico se procesa **una temporada por ejecución** (`extraction_years` en
+el input o `F1_EXTRACTION_YEARS` en la tarea de planificación); cada fase es
+reanudable porque se apoya en el plan incremental. M6 necesita todo el
+histórico para construir sus splits, así que la tarea M6 se ejecuta siempre con
+`--require-complete-history`: solo corre si la evidencia almacenada prueba
+completas todas las temporadas de modelado. Si no, sale con **código 3**, no
+escribe artefactos y la state machine termina en
+`ModelingDeferredHistoryIncomplete` (sin alerta y sin declarar completo el
+backfill). Ver [infra/README.md](infra/README.md#backfill-histórico-por-fases-r2).
+
+### Observabilidad y tratamiento de errores
+
+Logs JSON con `component` y `pipeline_execution_id` (propagado desde Step
+Functions a todas las tareas Fargate), métricas EMF de disponibilidad de
+OpenF1, seis alarmas CloudWatch, un dashboard y SNS para avisos. Los resultados
+de ECS se validan antes de usarse: un `ExitCode` numérico 0 es el único éxito;
+otro número, la ausencia de `Containers`/`ExitCode` o un tipo incorrecto
+terminan en `NotifyPipelineFailure`. Ver
+[infra/README.md](infra/README.md#observabilidad-operativa).
+
+### Índice de documentación
+
+| Tema | Documento |
+|---|---|
+| Arquitectura del código y del pipeline | §2 y §3 de este README |
+| M1: cliente, configuración, rate limiting | §5–§8 de este README |
+| M2: extracción histórica | §9 |
+| M3: validación | §10 |
+| M4: consolidación | §11 |
+| M5: features y target | §12 |
+| M6: dataset de modelado y guardas anti-leakage | §13 |
+| M7: entrenamiento y MLflow | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| Publicación de modelos | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
+| M8: serving | §19 de este README |
+| Preparación para la nube y Docker | §14 |
+| Infraestructura AWS (SAM, IAM, parámetros) | [infra/README.md](infra/README.md) |
+| Planificación incremental y admisión | [infra/README.md](infra/README.md#planificación-incremental-e-idempotencia-m6-r1) |
+| Backfill y protección de M6 | [infra/README.md](infra/README.md#backfill-histórico-por-fases-r2) |
+| Observabilidad, alarmas y SNS | [infra/README.md](infra/README.md#observabilidad-operativa) |
+| Despliegue, eliminación y riesgos | [infra/README.md](infra/README.md#desplegar-más-adelante) y [Riesgos conocidos](infra/README.md#riesgos-conocidos) |
+| Demostración local reproducible | [DEMO_LOCAL.md](DEMO_LOCAL.md) |
+| Estado de verificación AWS | [infra/aws_status.json](infra/aws_status.json) |
 
 ## 1. Objetivo de esta primera etapa
 
@@ -1153,6 +1275,11 @@ layouts `legacy`/`lake`; configuración local/AWS; M2–M6 sobre S3 comparados
 contra su ejecución local; idempotencia; jobs por sesión; CLI y códigos de
 salida; contexto de logging.
 
+La cadena M1–M8 se puede recorrer de extremo a extremo, sin red y con datos
+sintéticos, con la demostración descrita en [DEMO_LOCAL.md](DEMO_LOCAL.md)
+(`python -m pytest scripts/demo_local_mlops.py -s`). Esa demostración no forma
+parte de la suite por defecto.
+
 ## 16. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
@@ -1182,23 +1309,37 @@ bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
 ## 18. Próximos pasos (fuera del alcance de esta etapa)
 
-- Feature engineering sobre la unidad Piloto × Carrera × Vuelta.
-- Modelado y entrenamiento (baseline → modelos más complejos) para predecir
-  `next_lap_time`.
-- Tracking de experimentos con MLflow y model registry.
-- Servir el modelo vía FastAPI: existe un prototipo local (sección 19); falta
-  el modelo registrado por M7 y cualquier despliegue.
-- Despliegue en AWS (CloudFormation/SAM) de la arquitectura propuesta en la
-  sección 14.9 (la base ya está definida en `infra/`); construir y publicar
-  la imagen Docker en ECR.
-- CI/CD.
-- Dashboard y monitoreo de drift.
+Ya implementado y demostrado **localmente** (con datos sintéticos): features
+(M5), dataset de modelado (M6), entrenamiento con MLflow (M7), publicación del
+modelo, serving FastAPI (M8), planificación incremental, backfill por
+temporadas y protección de M6. Queda pendiente:
+
+- Entrenamiento con datos reales de OpenF1 (requiere autorización) y
+  evaluación académica de los resultados; modelos más complejos que la
+  regresión lineal.
+- Validación de la infraestructura AWS en una cuenta real (despliegue
+  controlado, IAM y S3 reales, Step Functions, alarmas y SNS); hoy solo está
+  validada estáticamente y por simulación.
+- Construir y publicar la imagen Docker en ECR y registrar su digest.
+- Una arquitectura AWS para M7 (MLflow remoto en lugar de SQLite local) y para
+  servir M8 desplegado.
+- Integración de R1–R3 en `master`, ya con auditoría independiente aprobada
+  (ver la visión general); la validación en AWS real sigue pendiente.
+- Medir la duración real de una temporada y del plan sobre el histórico
+  completo, y definir una política de refresco de datos de OpenF1.
+- CI/CD y despliegue automatizado.
+- Dashboard de negocio y monitoreo de drift del modelo.
+
+---
 
 ## 19. Prototipo de serving (M8)
 
-> Prototipo **local**. No entrena modelos ni despliega en AWS/SageMaker.
-> Mientras M7 no registre un modelo no hay predicciones reales: los valores
-> de los ejemplos de esta sección son **ilustrativos**.
+> Prototipo **local**. No entrena modelos ni despliega en AWS/SageMaker. M7
+> ya registra modelos localmente y la publicación los empaqueta (ver
+> [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md)); la cadena completa se
+> demuestra con datos sintéticos en [DEMO_LOCAL.md](DEMO_LOCAL.md). Los valores
+> de los ejemplos de esta sección son **ilustrativos**: no hay un modelo
+> entrenado con datos reales.
 
 ### Arquitectura
 

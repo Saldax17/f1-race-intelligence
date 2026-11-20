@@ -19,6 +19,7 @@ from f1_race_intelligence.config.settings import DEFAULT_CONFIG_PATH, load_setti
 SUBSTITUTIONS = {
     "Environment": "dev",
     "DataBucketName": "f1-race-intelligence-dev-123456789012-us-east-1",
+    "DefaultExtractionYears": "",
     "AlertTopicArn": "arn:aws:sns:us-east-1:123456789012:f1-race-intelligence-dev-critical-alerts",
     "ClusterArn": "arn:aws:ecs:us-east-1:123456789012:cluster/f1-race-intelligence-dev-pipeline",
     "TaskDefinitionArn": "arn:aws:ecs:us-east-1:123456789012:task-definition/f1-race-intelligence-dev-pipeline:1",
@@ -145,7 +146,17 @@ def set_path(data: Dict[str, Any], path: Optional[str], value: Any) -> Dict[str,
 
 
 def matches(rule: Dict[str, Any], data: Any) -> bool:
+    if "And" in rule:
+        return all(matches(item, data) for item in rule["And"])
     value = get_path(data, rule["Variable"])
+    if "IsPresent" in rule:
+        return (value is not _MISSING) is rule["IsPresent"]
+    if "IsString" in rule:
+        return isinstance(value, str) is rule["IsString"]
+    if "IsNumeric" in rule:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)) is rule["IsNumeric"]
+    if value is _MISSING:  # every other comparison on an absent path is false
+        return False
     if "IsBoolean" in rule:
         return isinstance(value, bool) is rule["IsBoolean"]
     if "BooleanEquals" in rule:
@@ -174,7 +185,8 @@ class World:
     """Records the tasks the definition starts and answers the service calls."""
 
     def __init__(self, sessions=None, running: int = 1, exit_codes: Optional[Dict[str, int]] = None,
-                 failures: Optional[Dict[str, str]] = None) -> None:
+                 failures: Optional[Dict[str, str]] = None, results: Optional[Dict[str, Any]] = None) -> None:
+        self.results = results or {}  # raw ECS results to return instead of a well-formed one
         self.sessions = SESSIONS if sessions is None else sessions
         self.running = running
         self.exit_codes = exit_codes or {}
@@ -191,7 +203,11 @@ class World:
                 raise TaskFailed(self.failures[name])
             command = parameters["Overrides"]["ContainerOverrides"][0]["Command"]
             if command[:2] == ["--stage", "plan"]:  # the plan task writes the work units
-                self.objects[command[command.index("--plan-output") + 1]] = json.dumps(self.sessions)
+                self.objects[command[command.index("--plan-output") + 1]] = json.dumps(
+                    {"sessions": self.sessions, "decisions": []}
+                )
+            if name in self.results:
+                return self.results[name]
             return {"TaskArn": f"arn:aws:ecs:task/{len(self.tasks)}", "Containers": [{"ExitCode": self.exit_codes.get(name, 0)}]}
         if resource == "arn:aws:states:::aws-sdk:s3:getObject":
             return {"Body": self.objects[f"s3://{parameters['Bucket']}/{parameters['Key']}"]}
@@ -217,7 +233,8 @@ def run(states: Dict[str, Any], start: str, data: Any, world: World, context: Di
             return visited, kind, {"Error": state.get("Error"), "Cause": state.get("Cause")}
         if kind == "Pass":
             if "Parameters" in state:
-                data = render(state["Parameters"], data, context)
+                rendered = render(state["Parameters"], data, context)
+                data = set_path(data, state["ResultPath"], rendered) if "ResultPath" in state else rendered
             elif "Result" in state:
                 data = set_path(data, state.get("ResultPath", "$"), state["Result"])
             name = state["Next"]
@@ -342,10 +359,16 @@ def test_every_task_retries_launch_failures_and_checks_its_exit_code(asl_text) -
         # States.TaskFailed matches every error and would swallow them.
         assert "AmazonECS.Unknown" in launch["ErrorEquals"], name
         assert run_failure["ErrorEquals"] == ["States.TaskFailed"], name
-        assert state["ResultSelector"]["exit_code.$"] == "$.Containers[0].ExitCode"
+        assert "ResultSelector" not in state, f"{name}: the ECS result must be stored whole, not dereferenced"
         check = states[state["Next"]]
         assert check["Type"] == "Choice", f"{name}: whether a non-zero exit fails runTask.sync is not relied on"
-        assert check["Choices"][0] == {"Variable": f"{state['ResultPath']}.exit_code", "NumericEquals": 0, "Next": check["Choices"][0]["Next"]}
+        variable = f"{state['ResultPath']}.Containers[0].ExitCode"
+        assert check["Choices"][0]["And"] == [
+            {"Variable": variable, "IsPresent": True},
+            {"Variable": variable, "IsNumeric": True},
+            {"Variable": variable, "NumericEquals": 0},
+        ], name
+        assert check["Default"].endswith("ResultMalformed"), name
 
 
 def test_only_m2_retries_a_failed_run_more_than_once(asl_text) -> None:
@@ -399,10 +422,10 @@ def test_stages_run_in_order_with_the_scope_of_each_session(asl_text) -> None:
         expected += [
             ("M2_Extraction", ["--stage", "m2", "--year", year, "--meeting-key", meeting, "--session-key", key]),
             ("M3_Validation", ["--stage", "m3", "--year", year, "--session-key", key]),
-            ("M4_Consolidation", ["--stage", "m4", "--year", year, "--session-key", key]),
-            ("M5_Features", ["--stage", "m5", "--year", year, "--session-key", key]),
+            ("M4_Consolidation", ["--stage", "m4", "--year", year, "--session-key", key, "--overwrite-derived"]),
+            ("M5_Features", ["--stage", "m5", "--year", year, "--session-key", key, "--overwrite-derived"]),
         ]
-    expected.append(("M6_ModelingDataset", ["--stage", "m6"]))
+    expected.append(("M6_ModelingDataset", ["--stage", "m6", "--require-complete-history"]))
     assert commands == expected
 
 
@@ -415,10 +438,11 @@ def test_the_plan_is_read_back_from_where_the_plan_task_wrote_it(asl_text, templ
     bucket, key = cli.parse_plan_destination(location)
     assert (bucket, key) == (SUBSTITUTIONS["DataBucketName"], f"manifests/plan/{EXECUTION_NAME}.json")
     assert states["LoadPlan"]["Parameters"]["Bucket"] == bucket
-    # The task role may write it (manifests/*) and the state machine may read it.
+    # The task role may write the plan prefix; the state machine may read it.
     task_policy = json.dumps(template["Resources"]["DataProcessingTaskRole"]["Properties"]["Policies"])
     states_policy = json.dumps(template["Resources"]["PipelineStateMachineRole"]["Properties"]["Policies"])
-    assert "/manifests/*" in task_policy and "/manifests/plan/*" in states_policy
+    assert "/manifests/plan/*" in task_policy and "/manifests/plan/*" in states_policy
+    assert "/manifests/control/" not in task_policy
 
 
 # -- branching ------------------------------------------------------------------------
@@ -450,6 +474,14 @@ def test_available_and_enabled_runs_every_stage_of_every_session(asl_text) -> No
     assert world.alerts == []
 
 
+def all_task_states(asl: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    states = dict(asl["States"])
+    for state in asl["States"].values():
+        if state.get("Type") == "Map":
+            states.update(state["ItemProcessor"]["States"])
+    return {name: state for name, state in states.items() if state.get("Resource") == ECS_RUN_TASK_SYNC}
+
+
 def test_every_fargate_task_receives_the_pipeline_execution_id(asl_text) -> None:
     asl = json.loads(asl_text)
     tasks = [
@@ -459,11 +491,12 @@ def test_every_fargate_task_receives_the_pipeline_execution_id(asl_text) -> None
     ]
 
     assert len(tasks) == 6
-    for task in tasks:
+    for name, task in ((n, s) for n, s in all_task_states(asl).items()):
         environment = task["Parameters"]["Overrides"]["ContainerOverrides"][0]["Environment"]
-        assert environment == [
-            {"Name": "F1_PIPELINE_EXECUTION_ID", "Value.$": "$$.Execution.Id"}
-        ]
+        expected = [{"Name": "F1_PIPELINE_EXECUTION_ID", "Value.$": "$$.Execution.Id"}]
+        if name == "PlanSessions":  # only planning is scoped by season
+            expected.append({"Name": "F1_EXTRACTION_YEARS", "Value.$": "$.scope.value"})
+        assert environment == expected, name
 
 
 def test_a_concurrent_run_stops_before_starting_any_task(asl_text) -> None:
@@ -533,3 +566,183 @@ def test_retry_and_catch_only_appear_where_step_functions_allows_them(asl_text) 
         if state["Type"] not in ERROR_HANDLING_STATE_TYPES:
             assert "Catch" not in state, f"{name} ({state['Type']}) cannot have Catch"
             assert "Retry" not in state, f"{name} ({state['Type']}) cannot have Retry"
+
+
+# -- R2: backfill by season ------------------------------------------------------
+
+
+def plan_environment(world: World) -> Dict[str, str]:
+    _, params = next((n, p) for n, p in world.tasks if n == "PlanSessions")
+    return {item["Name"]: item["Value"] for item in params["Overrides"]["ContainerOverrides"][0]["Environment"]}
+
+
+def test_default_execution_passes_the_stack_default_seasons_to_the_plan_task(asl_text) -> None:
+    visited, terminal, _, world = execute(asl_text, availability(True))
+
+    assert terminal == "Succeed"
+    assert "UseConfiguredYears" in visited and "UseRequestedYears" not in visited
+    assert plan_environment(world)["F1_EXTRACTION_YEARS"] == ""  # empty keeps the configured seasons
+
+
+def test_the_stack_parameter_is_the_default_scope(asl_text) -> None:
+    substituted = asl_text.replace("${DefaultExtractionYears}", "2023,2024")
+    _, _, _, world = execute(substituted.replace("${DefaultExtractionYears}", ""), availability(True))
+    document = definition(substituted.replace("${Environment}", "dev"))  # still valid JSON
+    assert document["States"]["UseConfiguredYears"]["Result"] == {"value": "2023,2024"}
+    assert plan_environment(world)["F1_EXTRACTION_YEARS"] == "2023,2024"
+
+
+@pytest.mark.parametrize("years", ["2023", "2023,2024"])
+def test_requested_seasons_reach_the_plan_task_environment(asl_text, years) -> None:
+    visited, terminal, _, world = execute(asl_text, {**availability(True), "extraction_years": years})
+
+    assert terminal == "Succeed"
+    assert "UseRequestedYears" in visited and "UseConfiguredYears" not in visited
+    assert plan_environment(world) == {"F1_PIPELINE_EXECUTION_ID": f"arn:aws:states:execution:{EXECUTION_NAME}", "F1_EXTRACTION_YEARS": years}
+
+
+@pytest.mark.parametrize("bad", [2023, ["2023"], None, True])
+def test_a_non_string_scope_is_rejected_before_any_task(asl_text, bad) -> None:
+    visited, terminal, data, world = execute(asl_text, {**availability(True), "extraction_years": bad})
+
+    assert terminal == "Fail" and data["Error"] == "InvalidExtractionScope"
+    assert world.tasks == []
+
+
+def test_m6_exit_3_defers_modelling_without_reporting_a_complete_pipeline(asl_text) -> None:
+    visited, terminal, _, world = execute(asl_text, availability(True), world=World(exit_codes={"M6_ModelingDataset": 3}))
+
+    assert terminal == "Succeed"
+    assert visited[-1] == "ModelingDeferredHistoryIncomplete" and "PipelineSucceeded" not in visited
+    assert world.alerts == []  # a deferral is not a failure
+
+
+def test_m6_exit_0_is_still_the_only_path_to_pipeline_succeeded(asl_text) -> None:
+    visited, _, _, _ = execute(asl_text, availability(True))
+    assert visited[-1] == "PipelineSucceeded"
+    visited, terminal, _, world = execute(asl_text, availability(True), world=World(exit_codes={"M6_ModelingDataset": 1}))
+    assert terminal == "Fail" and len(world.alerts) == 1
+
+
+def test_the_m6_task_always_asks_for_the_history_check(asl_text) -> None:
+    _, _, _, world = execute(asl_text, availability(True))
+    command = dict(task_commands(world))["M6_ModelingDataset"]
+    assert command == ["--stage", "m6", "--require-complete-history"]
+
+
+# -- R3: a bad ECS result is a controlled failure, never States.Runtime ---------------------
+
+MALFORMED_RESULTS = {
+    "no Containers": {"TaskArn": "t"},
+    "empty Containers": {"TaskArn": "t", "Containers": []},
+    "container without ExitCode": {"TaskArn": "t", "Containers": [{"Name": "pipeline"}]},
+    "null ExitCode": {"TaskArn": "t", "Containers": [{"ExitCode": None}]},
+    "string ExitCode": {"TaskArn": "t", "Containers": [{"ExitCode": "0"}]},
+    "boolean ExitCode": {"TaskArn": "t", "Containers": [{"ExitCode": False}]},
+    "list ExitCode": {"TaskArn": "t", "Containers": [{"ExitCode": [0]}]},
+    "Containers not a list": {"TaskArn": "t", "Containers": {"ExitCode": 0}},
+    "empty result": {},
+}
+TASK_STATES = ["PlanSessions", "M2_Extraction", "M3_Validation", "M4_Consolidation", "M5_Features", "M6_ModelingDataset"]
+
+
+@pytest.mark.parametrize("label", sorted(MALFORMED_RESULTS))
+@pytest.mark.parametrize("stage", TASK_STATES)
+def test_a_malformed_ecs_result_alerts_and_fails_instead_of_raising_runtime(asl_text, stage, label) -> None:
+    world = World(results={stage: MALFORMED_RESULTS[label]})
+    visited, terminal, data, world = execute(asl_text, availability(True), world=world)
+
+    assert terminal == "Fail", (stage, label)
+    assert "NotifyPipelineFailure" in visited and "PipelineSucceeded" not in visited
+    assert len(world.alerts) == 1
+    assert json.loads(world.alerts[0]["Message"])["error"]["Error"] == "StageResultMalformed", (stage, label)
+
+
+@pytest.mark.parametrize("stage", TASK_STATES)
+@pytest.mark.parametrize("code", [1, 2, 137, 255, -1])
+def test_any_other_numeric_exit_code_is_a_failed_stage_with_one_alert(asl_text, stage, code) -> None:
+    visited, terminal, data, world = execute(asl_text, availability(True), world=World(exit_codes={stage: code}))
+
+    assert terminal == "Fail" and len(world.alerts) == 1
+    assert json.loads(world.alerts[0]["Message"])["error"]["Error"] == "StageExitedNonZero"
+    assert "PipelineSucceeded" not in visited
+
+
+def test_a_numeric_zero_is_the_only_path_to_success(asl_text) -> None:
+    visited, terminal, _, world = execute(asl_text, availability(True))
+    assert terminal == "Succeed" and visited[-1] == "PipelineSucceeded" and world.alerts == []
+
+    zero_float = {"TaskArn": "t", "Containers": [{"ExitCode": 0.0}]}
+    world = World(results={name: zero_float for name in TASK_STATES if name != "PlanSessions"})
+    visited, _, _, _ = execute(asl_text, availability(True), world=world)
+    assert visited[-1] == "PipelineSucceeded"
+
+
+def test_ecs_errors_raised_by_the_task_state_still_use_the_existing_catch(asl_text) -> None:
+    for stage in ("PlanSessions", "M6_ModelingDataset"):
+        visited, terminal, data, world = execute(asl_text, availability(True), world=World(failures={stage: "States.TaskFailed"}))
+        assert terminal == "Fail" and len(world.alerts) == 1, stage
+        assert json.loads(world.alerts[0]["Message"])["error"]["Error"] == "States.TaskFailed"
+    # inside the Map the failure propagates to the Map's Catch
+    visited, terminal, _, world = execute(asl_text, availability(True), world=World(failures={"M3_Validation": "States.TaskFailed"}))
+    assert terminal == "Fail" and len(world.alerts) == 1
+
+
+def test_m6_exit_3_stays_a_controlled_deferral_and_is_not_a_malformed_result(asl_text) -> None:
+    visited, terminal, _, world = execute(asl_text, availability(True), world=World(exit_codes={"M6_ModelingDataset": 3}))
+    assert terminal == "Succeed" and visited[-1] == "ModelingDeferredHistoryIncomplete"
+    assert world.alerts == [] and "PipelineSucceeded" not in visited and "M6ExitedNonZero" not in visited
+    # 3 only means "deferred" for M6: any other stage exiting 3 is a plain failure
+    for stage in ("PlanSessions", "M2_Extraction", "M5_Features"):
+        visited, terminal, _, world = execute(asl_text, availability(True), world=World(exit_codes={stage: 3}))
+        assert terminal == "Fail" and len(world.alerts) == 1, stage
+    # a deferral needs a numeric 3: "3" as a string or no container is malformed, not deferred
+    for bad in ({"TaskArn": "t", "Containers": [{"ExitCode": "3"}]}, {"TaskArn": "t", "Containers": []}):
+        visited, terminal, _, world = execute(asl_text, availability(True), world=World(results={"M6_ModelingDataset": bad}))
+        assert terminal == "Fail" and "ModelingDeferredHistoryIncomplete" not in visited
+
+
+def _strings(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key != "Comment":
+                yield from _strings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _strings(item)
+    elif isinstance(node, str):
+        yield node
+
+
+def test_no_state_dereferences_the_ecs_exit_code_outside_a_choice(asl_text) -> None:
+    for name, state in all_states(definition(asl_text)).items():
+        if state["Type"] in ("Choice", "Map"):
+            continue
+        for text in _strings(state):
+            if text.startswith("$") or "$." in text:  # a path or an intrinsic function over a path
+                assert "Containers" not in text and "ExitCode" not in text, f"{name}: {text}"
+        if state.get("Resource") == ECS_RUN_TASK_SYNC:
+            assert "ResultSelector" not in state, name
+
+
+def test_the_state_machine_is_structurally_sound_after_r3(asl_text) -> None:
+    document = definition(asl_text)
+    inner = document["States"]["PerSessionPipeline"]["ItemProcessor"]
+    for states, start in ((document["States"], document["StartAt"]), (inner["States"], inner["StartAt"])):
+        reachable, pending = set(), [start]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            assert name in states, f"dangling transition to {name}"
+            reachable.add(name)
+            state = states[name]
+            pending.extend(state[k] for k in ("Next", "Default") if k in state)
+            pending.extend(rule["Next"] for rule in state.get("Choices", []))
+            pending.extend(catch["Next"] for catch in state.get("Catch", []))
+        assert reachable == set(states), f"unreachable states: {sorted(set(states) - reachable)}"
+        for name, state in states.items():
+            if state["Type"] in ("Succeed", "Fail"):
+                assert not {"Next", "End"} & set(state), name
+            elif state["Type"] != "Choice":
+                assert ("Next" in state) != bool(state.get("End")), name

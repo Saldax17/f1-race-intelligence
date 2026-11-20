@@ -1,0 +1,166 @@
+# Demostración local M1–M8 (datos sintéticos, sin red)
+
+Esta guía reproduce, de extremo a extremo y **sin llamar a OpenF1 ni a AWS**,
+la cadena MLOps del proyecto: extracción por temporadas (M2), validación (M3),
+consolidación (M4), features (M5), dataset de modelado (M6), entrenamiento y
+registro (M7), publicación del modelo y serving (M8).
+
+La demostración es un único módulo pytest,
+[scripts/demo_local_mlops.py](scripts/demo_local_mlops.py). Usa el **código real
+del proyecto** (la CLI `python -m f1_race_intelligence`, MLflow, la
+publicación y la API FastAPI) y sustituye solo la fuente de datos: un cliente
+OpenF1 simulado (`SeasonClient`, en `tests/unit/test_backfill.py`) que sirve
+tres temporadas sintéticas (2023, 2024 y 2025) de dos carreras cada una. Ningún
+informe se fabrica: cada etapa escribe los suyos.
+
+## Qué demuestra y qué no
+
+| Demuestra (localmente) | No demuestra |
+|---|---|
+| Backfill por temporadas con `F1_EXTRACTION_YEARS`; M2–M5 por sesión | Datos, volúmenes ni duraciones reales de OpenF1 |
+| M6 **diferido** (código de salida 3) con el histórico incompleto y **ejecutado** con el completo | Rendimiento predictivo: las métricas salen de 6 carreras artificiales y **no son resultados académicos** |
+| M7 por CLI, registro en MLflow y recuperación de la ejecución | MLflow remoto: aquí es una base **SQLite local** |
+| Publicación inmutable del paquete y verificación de su manifiesto y hashes | Controles de S3 real (IAM, versionado, Object Lock) |
+| M8 cargando el paquete publicado, sin reajustar el preprocesador | Despliegue de M7/M8 en AWS (no existe) |
+| La cadena de trazabilidad M6 → M7 → MLflow → paquete → M8 | La orquestación AWS (Step Functions, admisión, alarmas): solo validada estáticamente y por simulación |
+
+Los datos sintéticos hacen que M3 emita advertencias (`PARTIAL`) en las
+sesiones: es esperado y no una fuga ni un error.
+
+## Requisitos
+
+- Python 3.11 o superior (la imagen usa 3.12), `git` y este repositorio.
+- Dependencias fijadas del proyecto (sin añadir ninguna):
+
+```bash
+python -m pip install -r requirements/runtime-lock.txt
+python -m pip install -r requirements/training-lock.txt
+python -m pip install -r requirements/dev-lock.txt
+python -m pip install -e ".[dev,training,serve]" --no-deps
+```
+
+No hacen falta credenciales ni variables de entorno: la demo aísla el entorno
+(`F1_*`) y trabaja en directorios temporales.
+
+## Ejecución
+
+Desde la **raíz del repositorio**:
+
+```bash
+python -m pytest scripts/demo_local_mlops.py -s -p no:cacheprovider -p no:warnings
+```
+
+`-s` muestra las líneas `[DEMO]` que se citan abajo. Tarda unos 15–20 segundos.
+Para conservar y poder abrir los artefactos (MLflow, paquete publicado), fija un
+directorio de trabajo fuera del repositorio:
+
+```bash
+python -m pytest scripts/demo_local_mlops.py -s -p no:cacheprovider -p no:warnings --basetemp "<carpeta>/f1-demo"
+```
+
+Con `--basetemp`, pytest vacía y recrea esa carpeta. Los artefactos quedan en
+`<carpeta>/f1-demo/test_integral_flow0/` (`mlflow/tracking.db`,
+`model-store/published-models/…`, `modeling/`, `features/`, `raw/`…). Se puede
+inspeccionar MLflow con
+`mlflow ui --backend-store-uri sqlite:///<ruta>/mlflow/tracking.db` (no
+ejecutado en esta validación).
+
+La ejecución termina con `1 passed`. Si algo no concuerda, el módulo falla con
+la aserción correspondiente.
+
+## Secuencia y criterios de éxito
+
+Cada fase lanza el **plan** con `F1_EXTRACTION_YEARS=<año>` (así se acota una
+fase, como hace la state machine), ejecuta M2→M3→M4→M5 por cada sesión
+planificada con la CLI real y llama a
+`python -m f1_race_intelligence --stage m6 --require-complete-history`.
+
+| Paso | Comando real que invoca | Criterio de éxito |
+|---|---|---|
+| Fase 2023 | `--stage plan`, luego `--stage m2/m3/m4/m5 --year … --meeting-key … --session-key …` | 2 sesiones planificadas; M2–M5 con código `0, 0, 0, 0` |
+| M6 con histórico incompleto | `--stage m6 --require-complete-history` | **código 3**; 0 informes de M6; `[DEMO] phase 2023: … m6 exit=3 … m6 reports so far=0` |
+| Fase 2024 | igual | M2–M5 en `0`; M6 de nuevo con **código 3** y sin informes |
+| Fase 2025 | igual | M2–M5 en `0`; M6 con **código 0**; 1 informe |
+| Histórico | `history_completeness` | `{'2023': ('complete', 2), '2024': ('complete', 2), '2025': ('complete', 2)}` |
+| M6 | `verify_report` | veredicto `VALID`, `sessions=6`, 8 artefactos, `verify_report ok=True` |
+| M7 | `--stage m7 --m6-report <informe>` | código `0`; modelo `models:/integral-demo-model/1` |
+| MLflow | `MlflowClient` | versión 1 en estado `READY`, run `FINISHED`; artefactos `m6`, `model`, `metrics.json`, `training_report.json`, `data_provenance.json`, `training_config.json` |
+| Publicación | `publish_model(...)` y `read_model_package(...)` | paquete con 14 archivos, marcador `PUBLISHED`; republicar es idempotente |
+| M8 | `PredictionService.load_published_package` + `TestClient` | `/live`, `/health`, `/model-info` y `/predict` con **200**; `/predict` devuelve 3 valores de `next_lap_time` |
+
+### Cómo ver el diferimiento de M6
+
+En las líneas de las fases 2023 y 2024 aparece `m6 exit=3` y
+`m6 reports so far=0`: M6 no escribió ningún artefacto de modelado porque la
+evidencia almacenada no demuestra las tres temporadas completas. Es una salida
+controlada (no un fallo). En la fase 2025 la misma orden devuelve `0` y crea el
+informe. La evidencia que se evalúa (catálogo, manifiesto M2, hashes de raw,
+informes y salidas de M3–M5 por sesión) está descrita en
+[infra/README.md](infra/README.md#backfill-histórico-por-fases-r2).
+
+### Cómo ver la trazabilidad
+
+Las líneas `[DEMO] chain:` muestran los mismos identificadores en cada eslabón
+y el módulo lo comprueba con aserciones:
+
+- el `run_id` de M6 aparece en el informe de M7, en el manifiesto del paquete y
+  en la procedencia que expone `/model-info`;
+- el `input_fingerprint` (`sha256:c2a462e7…7600140` en esta ejecución) es el
+  mismo en M6, M7, el manifiesto y M8;
+- el `run_id` de M7 coincide con el de la versión de MLflow, el del manifiesto y
+  el del modelo que sirve M8;
+- la URI del modelo es `models:/integral-demo-model/1` en el paquete y en M8;
+- M8 carga el `preprocessor.joblib` **del paquete** (su hash en el manifiesto es
+  el del run de MLflow) y `ColumnTransformer.fit` está bloqueado durante M8:
+  no se reajusta nada.
+
+## Resultados esperados
+
+Valores observados en la validación (los identificadores `run_id` cambian en
+cada ejecución; el `input_fingerprint` y las predicciones dependen solo de los
+datos sintéticos y de las versiones de las dependencias):
+
+```
+[DEMO] phase 2023: … m6 exit=3; m6 reports so far=0
+[DEMO] phase 2024: … m6 exit=3; m6 reports so far=0
+[DEMO] phase 2025: … m6 exit=0; m6 reports so far=1
+[DEMO] M6: … verdict=VALID sessions=6 … verify_report ok=True artifacts=8
+[DEMO] M7 exit: 0
+[DEMO] MLflow registry: [('integral-demo-model', 1, 'READY', '<run_id de M7>')]
+[DEMO] GET /live: (200, {'status': 'ok'})   /health y /model-info también 200
+[DEMO] POST /predict: (200, [108.212, 109.912, 113.802], 'next_lap_time')
+```
+
+## Verificaciones relacionadas
+
+La demostración no sustituye a las pruebas; las complementa:
+
+```bash
+python -m pytest -m "not integration"      # suite completa no integrada
+python -m pytest tests/unit/test_backfill.py tests/unit/test_incremental_e2e.py
+python -m pytest tests/unit/test_m7_m8_integration.py
+python -m pytest tests/infra               # plantilla, ASL y Lambda de admisión
+```
+
+En la validación integral, la suite no integrada dio **979 passed y 2
+deselected** (las dos pruebas de `tests/integration` llaman a OpenF1 real y
+están excluidas por defecto). `scripts/` no se recoge en `pytest` sin una ruta
+explícita, por lo que la demostración no cuenta en esa cifra.
+
+## Limitaciones de la demostración
+
+- Es **offline y sintética**: los números del modelo (R² negativo en test sobre
+  8 filas) solo prueban que la cadena funciona, no su capacidad predictiva.
+- MLflow usa **SQLite local**; el entrenamiento rechaza explícitamente S3.
+- La publicación se ejecuta sobre el backend local; el backend S3 está probado
+  únicamente con un S3 simulado.
+- El servicio M8 se ejercita con el cliente de pruebas de FastAPI (en proceso),
+  no como servidor `uvicorn` desplegado.
+- La orquestación AWS (Step Functions, Lambda de admisión, EventBridge, alarmas,
+  dashboard) **no forma parte de la demo**: está validada estáticamente
+  (`sam validate --lint`, pruebas de plantilla y ASL) y por simulación, no en
+  AWS real.
+- Estado de las auditorías independientes (Antigravity): R1, R1.1 y R1.2
+  *APPROVED WITH MINOR FINDINGS* (hallazgo menor corregido); R2 (backfill y
+  protección de M6) y R3 (robustez ante el resultado de ECS) *APPROVED*. Eso no
+  sustituye la validación en AWS real, que sigue pendiente.

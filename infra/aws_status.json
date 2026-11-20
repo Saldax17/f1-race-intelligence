@@ -13,13 +13,19 @@
       "evidence": [
         "infra/template.yaml",
         "infra/functions/availability_checker/app.py",
+        "infra/functions/pipeline_admission/handler.py",
         "infra/statemachine/pipeline.asl.json"
       ]
     },
     "local_validation": {
       "status": "VALIDADO LOCALMENTE",
       "evidence": [
-        "tests/infra"
+        "tests/infra",
+        "tests/infra/test_pipeline_admission.py",
+        "tests/infra/test_template.py",
+        "tests/infra/test_state_machine.py",
+        "tests/unit/test_incremental_planning.py",
+        "tests/unit/test_modeling.py"
       ]
     },
     "deployment": {
