@@ -204,4 +204,22 @@ training:
   artifact_path: "data/mlflow/artifacts"
   output_path: "data/modeling/training/reports"
   experiment_name: "f1-race-intelligence"
+  # linear_regression | mlp
+  model_type: "linear_regression"
   registered_model_name: "f1-next-lap-linear-regression"
+  # PyTorch CPU-only tabular MLP settings (used when model_type is "mlp").
+  mlp:
+    # null uses "f1-next-lap-mlp" unless registered_model_name was overridden.
+    registered_model_name: null
+    hidden_dims: [64, 32]
+    dropout: 0.1
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    batch_size: 64
+    max_epochs: 100
+    early_stopping_patience: 10
+    min_delta: 0.0001
+    # huber | mse
+    loss: "huber"
+    # Standardize training target using finite train targets only; inverted inside the model.
+    scale_target: true

@@ -1,0 +1,23 @@
+# Exact closure of the project's "dl" extra (PyTorch CPU-only) for CPython 3.12.
+# Install after runtime-lock.txt, training-lock.txt and dev-lock.txt; shared
+# pins (jinja2, markupsafe, setuptools, typing-extensions) match those locks.
+# Linux and Windows install the CPU-only wheel from the PyTorch index (no CUDA
+# packages); macOS (Darwin) uses the PyPI CPU/MPS wheel, which for torch==2.12.1
+# exists only for Apple Silicon on macOS >= 14 (macosx_14_0_arm64); Intel Macs
+# and older macOS have no wheel. `torch==2.12.1` in pyproject.toml is satisfied
+# by `2.12.1+cpu` (PEP 440 local version).
+# With uv, install via `uv pip install --index-strategy unsafe-best-match -r
+# requirements/dl-lock.txt`: uv's default first-index strategy does not mix the
+# PyTorch index with PyPI for the other pins.
+--extra-index-url https://download.pytorch.org/whl/cpu
+filelock==4.2.12
+fsspec==2026.9.0
+jinja2==3.1.6
+markupsafe==3.0.4
+mpmath==1.3.0
+networkx==3.7
+setuptools==75.6.0
+sympy==1.14.0
+torch==2.12.1+cpu ; platform_system == "Linux" or platform_system == "Windows"
+torch==2.12.1 ; platform_system == "Darwin"
+typing-extensions==4.16.0
