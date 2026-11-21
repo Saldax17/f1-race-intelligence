@@ -18,5 +18,6 @@ Modules, in the order data flows through them:
 ``runner``     train / evaluate / update / forecast, as pipeline stages
 ``lambda_handler``  the AWS Lambda entry point for live and on-demand forecasts
 
-The math and every decision behind it are in ``f1-model-math.md``.
+The math and every decision behind it are in ``docs/f1-model-math.md``; the
+implemented specification is ``docs/m7-model-spec.md``.
 """

@@ -339,7 +339,7 @@ class TrainingSettings(BaseModel):
 class RaceModelSettings(BaseModel):
     """The in-race position forecaster (M7): what it trains on and how it is scored.
 
-    The model is described in ``f1-model-math.md`` (pace prior §3.3, sampler
+    The model is described in ``docs/f1-model-math.md`` (pace prior §3.3, sampler
     §4.3, events §5–7). Every number here is a modelling choice that the
     training report records, so a retrain with different settings is
     traceable.
@@ -353,8 +353,22 @@ class RaceModelSettings(BaseModel):
 
     years: List[int] = Field(default_factory=lambda: [2023, 2024, 2025])
     train_years: List[int] = Field(default_factory=lambda: [2023, 2024])
-    validation_share_of_remainder: float = 0.5
-    """Of the races after ``train_years``, the earlier share is validation and the rest test."""
+    validation_until: str = "2025-08-01"
+    """Races after ``train_years`` and before this date are validation."""
+    test_until: str = "2026-01-01"
+    """Races from ``validation_until`` up to (not including) this date are the test set.
+
+    Fixed dates, not a share of the remaining races, so adding later seasons
+    never moves a test race into validation. Races after it are ``future``:
+    usable by ``m7-update`` and live forecasts, never by any evaluation.
+    """
+
+    test_sealed: bool = True
+    """While True, nothing reads a test race: training, validation, update and
+    forecasts skip them before their raw files are opened. The only way in is
+    ``m7-evaluate --split test --unseal-test``, which is recorded in a ledger
+    and refused a second time. Set False only after the final test report,
+    to let production updates use every race."""
 
     exclude_races: List[str] = Field(default_factory=lambda: ["2025 Miami Gardens"])
     """``"<year> <location>"`` of races left out entirely (2025 Miami: laps 2–25 missing at source)."""
@@ -388,6 +402,8 @@ class RaceModelSettings(BaseModel):
     pit_under_vsc_probability: float = 0.4
     noise_scales: List[float] = Field(default_factory=lambda: [1.0, 1.5, 2.0, 3.0])
     """Candidates for the lap-noise multiplier, chosen on training races by RPS."""
+    noise_scale_per_phase: bool = False
+    """Choose one multiplier per k-bucket instead of one for the whole race."""
     calibration_races: int = 16
     """Training races (the latest ones) used to pick the noise multiplier."""
     random_seed: int = 42

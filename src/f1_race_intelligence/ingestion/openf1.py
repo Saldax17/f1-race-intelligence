@@ -117,6 +117,26 @@ class F1Client(BaseAPIClient):
         params = build_params(session_key=session_key, driver_number=driver_number, **filters)
         return self._get("/car_data", params)
 
+    def get_location(
+        self,
+        *,
+        session_key: Optional[int] = None,
+        driver_number: Optional[int] = None,
+        **filters: Any,
+    ) -> Any:
+        """GET /location — car position on track (x, y, z), ~3.7 Hz per car.
+
+        Same volume as ``car_data``, so the same guard: ``driver_number`` and/or a
+        date-range filter is required.
+        """
+        if driver_number is None and not any(key.startswith("date") for key in filters):
+            raise ValueError(
+                "get_location requires 'driver_number' and/or a date range filter "
+                "(e.g. date>=...) — an unfiltered call can return millions of rows"
+            )
+        params = build_params(session_key=session_key, driver_number=driver_number, **filters)
+        return self._get("/location", params)
+
     def get_positions(
         self,
         *,

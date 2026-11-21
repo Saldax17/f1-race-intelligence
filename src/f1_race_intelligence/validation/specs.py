@@ -401,6 +401,24 @@ RACE_CONTROL = EndpointSpec(
 )
 
 
+LOCATION = EndpointSpec(
+    name="location",
+    natural_key=("session_key", "driver_number", "date"),
+    natural_key_note="Position samples (~3.7 Hz), one file per driver like car_data.",
+    timestamp_fields=("date",),
+    order_field="date",
+    fields={
+        "session_key": _SESSION_KEY,
+        "meeting_key": _MEETING_KEY,
+        "driver_number": _DRIVER_NUMBER,
+        "date": _timestamp(),
+        # Circuit coordinates in OpenF1's own units (about decimetres); circuits span ~±20 000.
+        "x": FieldSpec(types=(int, float), minimum=-100000, maximum=100000),
+        "y": FieldSpec(types=(int, float), minimum=-100000, maximum=100000),
+        "z": FieldSpec(types=(int, float), minimum=-100000, maximum=100000),
+    },
+)
+
 SESSION_RESULT = EndpointSpec(
     name="session_result",
     natural_key=("session_key", "driver_number"),
@@ -450,6 +468,7 @@ ENDPOINT_SPECS: Dict[str, EndpointSpec] = {
         PIT,
         WEATHER,
         RACE_CONTROL,
+        LOCATION,
         SESSION_RESULT,
         STARTING_GRID,
     )

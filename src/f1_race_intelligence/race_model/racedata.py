@@ -372,33 +372,52 @@ class FinalOrder:
 
     ``position`` maps driver → 1-based place: classified cars by position,
     then unclassified retirements by laps completed (most first). DSQ and
-    DNS cars are listed in ``excluded`` and carry no position.
+    DNS cars are listed in ``excluded`` and carry no position. ``retired`` is
+    exactly the cars for which :func:`is_retirement` holds; ``classified_dnf``
+    (classified despite ``dnf=True``) is informational only.
     """
 
     position: Dict[int, int]
     retired: frozenset
     excluded: frozenset
+    classified_dnf: frozenset = frozenset()
+
+
+def is_excluded(row: Mapping[str, Any]) -> bool:
+    """DSQ (a stewards' decision the model cannot forecast) or DNS: never scored."""
+    return bool(row.get("dsq") or row.get("dns"))
+
+
+def is_retirement(row: Mapping[str, Any]) -> bool:
+    """The model's retirement event, convention (a): the car was **not classified**.
+
+    The single definition shared by the hazard fit (``events.fit_events``),
+    the simulator (a retired car is ranked after every finisher) and the
+    evaluation (``FinalOrder.retired``). A car with ``dnf=True`` and a
+    position covered at least 90% of the distance and was classified: for the
+    position matrix it finished in that place, so it is *not* a retirement
+    here (it is kept in ``FinalOrder.classified_dnf`` for information).
+    """
+    return row.get("position") is None and not is_excluded(row)
 
 
 def final_order(result: Sequence[Mapping[str, Any]]) -> FinalOrder:
     rows = [r for r in result if r.get("driver_number") is not None]
-    excluded = {int(r["driver_number"]) for r in rows if r.get("dsq") or r.get("dns")}
+    excluded = {int(r["driver_number"]) for r in rows if is_excluded(r)}
     classified = sorted(
-        (r for r in rows if r.get("position") is not None and int(r["driver_number"]) not in excluded),
+        (r for r in rows if r.get("position") is not None and not is_excluded(r)),
         key=lambda r: r["position"],
     )
     unclassified = sorted(
-        (r for r in rows if r.get("position") is None and int(r["driver_number"]) not in excluded),
+        (r for r in rows if is_retirement(r)),
         key=lambda r: -(r.get("number_of_laps") or 0),
     )
     order = [int(r["driver_number"]) for r in classified + unclassified]
-    retired = {int(r["driver_number"]) for r in unclassified} | {
-        int(r["driver_number"]) for r in classified if r.get("dnf")
-    }
     return FinalOrder(
         position={d: i + 1 for i, d in enumerate(order)},
-        retired=frozenset(retired),
+        retired=frozenset(int(r["driver_number"]) for r in unclassified),
         excluded=frozenset(excluded),
+        classified_dnf=frozenset(int(r["driver_number"]) for r in classified if r.get("dnf")),
     )
 
 

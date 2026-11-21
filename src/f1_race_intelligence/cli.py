@@ -146,6 +146,10 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--split", choices=["validation", "test"], default="validation", help="m7-evaluate: races to score")
     model.add_argument("--promote", action="store_true", help="m7-evaluate: make the version 'latest' if it beats the baseline")
     model.add_argument("--scenarios", type=int, help="m7-evaluate: Monte Carlo draws per forecast")
+    model.add_argument("--unseal-test", action="store_true",
+                       help="m7-evaluate --split test: the final, recorded look at the sealed test races")
+    model.add_argument("--allow-repeat-test", action="store_true",
+                       help="m7-evaluate --split test: allow a second look (the ledger counts it)")
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -517,7 +521,8 @@ def run_m7_evaluate(ctx: RunContext) -> StageOutcome:
     args = ctx.args
     return _outcome(
         _race_model(ctx).evaluate(
-            version=args.model_version, split=args.split, promote=args.promote, scenarios=args.scenarios
+            version=args.model_version, split=args.split, promote=args.promote, scenarios=args.scenarios,
+            unseal_test=args.unseal_test, allow_repeat_test=args.allow_repeat_test,
         )
     )
 

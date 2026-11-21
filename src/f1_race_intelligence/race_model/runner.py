@@ -64,14 +64,28 @@ logger = get_logger(__name__)
 # -- splits -----------------------------------------------------------------------
 
 
-def assign_splits(refs: Sequence[RaceRef], train_years: Sequence[int], validation_share: float) -> Dict[int, str]:
-    """Whole seasons to train; of the rest (in date order) the earlier share is validation."""
-    out = {r.session_key: "train" for r in refs if r.year in set(train_years)}
-    rest = [r for r in sorted(refs, key=lambda r: r.date_start) if r.session_key not in out]
-    n_val = int(np.ceil(len(rest) * validation_share))
-    for i, r in enumerate(rest):
-        out[r.session_key] = "validation" if i < n_val else "test"
-    return out
+TRAIN, VALIDATION, TEST, FUTURE = "train", "validation", "test", "future"
+
+
+def split_of(ref: RaceRef, train_years: Sequence[int], validation_until: str, test_until: str) -> str:
+    """The split of one race, from fixed dates: it never depends on which other races exist."""
+    if ref.year in set(train_years):
+        return TRAIN
+    day = (ref.date_start or "")[:10]
+    if day < validation_until:
+        return VALIDATION
+    if day < test_until:
+        return TEST
+    return FUTURE
+
+
+def assign_splits(refs: Sequence[RaceRef], train_years: Sequence[int], validation_until: str,
+                  test_until: str) -> Dict[int, str]:
+    return {r.session_key: split_of(r, train_years, validation_until, test_until) for r in refs}
+
+
+class SealedTestError(PermissionError):
+    """A code path tried to read a test race while the test set is sealed."""
 
 
 def reference_lap(race: RaceData) -> float:
@@ -280,12 +294,25 @@ class RaceModelRunner:
 
     # -- data -------------------------------------------------------------------
 
-    def load_races(self) -> Tuple[List[RaceRef], List[RaceData]]:
-        refs = self.catalog.races(self.cfg.years, exclude=self.cfg.exclude_races)
+    def splits_of(self, refs: Sequence[RaceRef]) -> Dict[int, str]:
+        return assign_splits(refs, self.cfg.train_years, self.cfg.validation_until, self.cfg.test_until)
+
+    def _load(self, ref: RaceRef, split: str, unsealed: bool = False) -> RaceData:
+        """The only place a race's raw files are opened: test races need an explicit unseal."""
+        if split == TEST and self.cfg.test_sealed and not unsealed:
+            raise SealedTestError(f"{ref.tag} is a test race and the test set is sealed")
+        return self.catalog.load(ref)
+
+    def load_races(self, include_test: bool = False) -> Tuple[List[RaceRef], List[RaceData]]:
+        """Races in calendar order. Test races are dropped *before* their raw files are read,
+        unless ``include_test`` (the final, ledgered test evaluation)."""
+        all_refs = self.catalog.races(self.cfg.years, exclude=self.cfg.exclude_races)
+        splits = self.splits_of(all_refs)
+        refs = [r for r in all_refs if include_test or splits[r.session_key] != TEST]
         races = []
         for ref in refs:
             try:
-                race = self.catalog.load(ref)
+                race = self._load(ref, splits[ref.session_key], unsealed=include_test)
             except LookupError as exc:
                 logger.warning("race_skipped", extra={"race": ref.tag, "reason": str(exc)})
                 continue
@@ -302,13 +329,19 @@ class RaceModelRunner:
 
     def _fit_all(self, races: Sequence[RaceData], splits: Mapping[int, str], params: Optional[SeasonParams] = None,
                  events: Optional[EventModel] = None, forecast_cfg: Optional[Dict[str, Any]] = None,
-                 transition: Optional[TransitionBaseline] = None) -> Tuple[ModelArtifact, Dict[str, Any]]:
+                 transition: Optional[TransitionBaseline] = None,
+                 frozen_level1: Optional[Mapping[str, Any]] = None) -> Tuple[ModelArtifact, Dict[str, Any]]:
         cfg = self.cfg
         level1 = Level1Config.from_settings(cfg)
-        train_keys = {k for k, s in splits.items() if s == "train"}
+        train_keys = {k for k, s in splits.items() if s == TRAIN}
         train_races = [r for r in races if r.ref.session_key in train_keys]
         started = time.monotonic()
-        l1 = fit_level1(races, level1, tyre_races=train_keys)
+        # Every pooled level-1 quantity comes from training races (or is frozen).
+        l1 = fit_level1(
+            races, level1, tyre_races=train_keys, noise_races=train_keys,
+            phi=frozen_level1["phi"] if frozen_level1 else None,
+            sigma_eps=frozen_level1["sigma_eps"] if frozen_level1 else None,
+        )
         obs = observations(l1.obs)
         logger.info("m7_level1_fitted", extra={"races": len(races), "phi": l1.phi, "sigma_eps": l1.sigma_eps})
 
@@ -320,7 +353,7 @@ class RaceModelRunner:
             logger.info("m7_season_fitted", extra={"params": params.to_dict(), "loglik": fitted_ll})
         state, priors, _ = replay(obs, params, cfg.quali_max_abs_pct)
         if events is None:
-            events = fit_events(train_races, l1.tyres, all_races=races)
+            events = fit_events(train_races, l1.tyres)
 
         settings_dump = cfg.model_dump() if hasattr(cfg, "model_dump") else dict(cfg)
         artifact = ModelArtifact(
@@ -382,8 +415,8 @@ class RaceModelRunner:
                     continue
                 rows.append((splits.get(int(key)), r["theta_hat"] - prior.mean[i], prior.cov[i, i], r["se"]))
         out = {}
-        # Test races are scored only by an explicit `m7-evaluate --split test`.
-        for split in ("train", "validation"):
+        # Test races are scored only by an explicit, ledgered `m7-evaluate --split test`.
+        for split in (TRAIN, VALIDATION):
             sel = [x for x in rows if x[0] == split]
             if not sel:
                 continue
@@ -415,26 +448,38 @@ class RaceModelRunner:
                          [order.position.get(c.driver_number) for c in cars])
         return base
 
-    def _choose_noise(self, model: LoadedModel, races: Sequence[RaceData]) -> Tuple[float, Dict[str, float]]:
+    def _choose_noise(self, model: LoadedModel, races: Sequence[RaceData]) -> Tuple[float, Dict[str, Any]]:
+        """Pick the lap-noise multiplier by RPS on the latest training races.
+
+        With ``noise_scale_per_phase`` one multiplier is chosen per k-bucket
+        (stored as ``noise_scale_by_fraction``); otherwise one for all.
+        """
         cfg = self.cfg
         if len(cfg.noise_scales) <= 1:
             return (cfg.noise_scales[0] if cfg.noise_scales else 1.0), {}
         sample = [r for r in races if not r.wet][-cfg.calibration_races:]
-        scores: Dict[str, float] = {}
+        fractions = {f"{int(round(f * 100))}%": f for f in cfg.k_fractions}
+        by_bucket: Dict[str, Dict[str, List[float]]] = {}
+        model.config.noise_scale_by_fraction = None
+        model.config.scenarios = min(cfg.scenarios, 1000)
         for scale in cfg.noise_scales:
             model.config.noise_scale = scale
-            model.config.scenarios = min(cfg.scenarios, 1000)
-            rps = []
             for race in sample:
                 for bucket, k in k_laps(model.total_laps(race), cfg.k_fractions):
                     try:
                         result = model.run(truncate_at_lap(race, k), model.prior_for(race), model.total_laps(race), seed=cfg.random_seed)
                     except ValueError:
                         continue
-                    rps.append(score_forecast(result, race, model, bucket)["model"]["rps"])
-            scores[str(scale)] = float(np.nanmean(rps)) if rps else float("inf")
-        best = min(scores, key=scores.get)
-        return float(best), scores
+                    rps = score_forecast(result, race, model, bucket)["model"]["rps"]
+                    by_bucket.setdefault(bucket, {}).setdefault(str(scale), []).append(rps)
+        overall = {str(s): float(np.nanmean([x for b in by_bucket.values() for x in b.get(str(s), [])])) for s in cfg.noise_scales}
+        best = float(min(overall, key=overall.get))
+        detail: Dict[str, Any] = {"overall": overall, "by_bucket": {
+            b: {s: float(np.nanmean(v)) for s, v in scores.items()} for b, scores in by_bucket.items()}}
+        if cfg.noise_scale_per_phase:
+            detail["chosen_by_fraction"] = {
+                str(fractions[b]): float(min(scores, key=scores.get)) for b, scores in detail["by_bucket"].items()}
+        return best, detail
 
     # -- stages -------------------------------------------------------------------
 
@@ -442,8 +487,9 @@ class RaceModelRunner:
         refs, races = self.load_races()
         if not races:
             return StageResult(False, reason="no races with raw data were found")
-        splits = assign_splits(refs, self.cfg.train_years, self.cfg.validation_share_of_remainder)
-        train_races = [r for r in races if splits[r.ref.session_key] == "train" and r.result]
+        splits = self.splits_of(refs)
+        assert TEST not in splits.values(), "a test race reached training"
+        train_races = [r for r in races if splits[r.ref.session_key] == TRAIN and r.result]
         if len(train_races) <= self.cfg.burn_in_races:
             return StageResult(False, reason=f"only {len(train_races)} training races; need more than the burn-in")
         transition = self._transition_counts(train_races)
@@ -451,6 +497,7 @@ class RaceModelRunner:
         model = LoadedModel.from_artifact(artifact)
         scale, scores = self._choose_noise(model, train_races)
         artifact.forecast["noise_scale"] = scale
+        artifact.forecast["noise_scale_by_fraction"] = scores.get("chosen_by_fraction")
         artifact.metrics["noise_scale_rps"] = scores
         uri = self.registry.save(artifact)
         report = {"stage": "m7-train", "version": artifact.version, "model_uri": uri, **artifact.metrics}
@@ -458,17 +505,79 @@ class RaceModelRunner:
         return StageResult(True, {"version": artifact.version, "model_uri": uri, "noise_scale": scale,
                                   "prior_check": metrics["prior_check"]})
 
+    # -- the sealed test set ----------------------------------------------------------
+
+    @property
+    def _ledger_key(self) -> str:
+        return join_key(reports_prefix(self.output_store, self.cfg.output_path), "test_ledger.json")
+
+    def test_ledger(self) -> List[Dict[str, Any]]:
+        backend = self.output_store.backend
+        if not backend.exists(self._ledger_key):
+            return []
+        import json
+
+        return list(json.loads(backend.read_bytes(self._ledger_key)).get("entries", []))
+
+    def _open_test(self, artifact: ModelArtifact, allow_repeat: bool) -> Tuple[LoadedModel, List[RaceData]]:
+        """Unseal once: record it, then replay the season filter online through the test races.
+
+        The entry is written *before* any test race is read, so even a crashed
+        run counts as a look. Development artifacts never contain test races,
+        so their pre-race priors are rebuilt here the way a live forecaster
+        would have had them: every hyperparameter (level 1, season filter,
+        events) frozen from the artifact, and each test race's prior using
+        only races that finished before it.
+        """
+        entries = self.test_ledger()
+        if entries and not allow_repeat:
+            raise SealedTestError(
+                f"the test set was already evaluated ({len(entries)} time(s), last {entries[-1]['at']} on version "
+                f"{entries[-1]['version']}); a second look turns it into validation. Pass --allow-repeat-test to "
+                "override; the ledger keeps the count."
+            )
+        entry = {"version": artifact.version, "at": datetime.now(timezone.utc).isoformat(), "look": len(entries) + 1}
+        self.output_store.backend.write_json(self._ledger_key, {"entries": entries + [entry]})
+        logger.warning("test_set_unsealed", extra=entry)
+
+        refs, races = self.load_races(include_test=True)
+        splits = self.splits_of(refs)
+        params = SeasonParams.from_dict(artifact.season["state"]["params"])
+        replayed, _ = self._fit_all(
+            races, splits, params=params, events=EventModel.from_dict(artifact.events),
+            forecast_cfg=artifact.forecast, transition=TransitionBaseline.from_dict(artifact.transition),
+            frozen_level1=artifact.level1,
+        )
+        model = LoadedModel.from_artifact(artifact)
+        model.priors = {int(k): Prior.from_dict(v) for k, v in replayed.season["priors"].items()}
+        return model, [r for r in races if splits[r.ref.session_key] == TEST]
+
     def evaluate(self, version: Optional[str] = None, split: str = "validation", promote: bool = False,
-                 scenarios: Optional[int] = None) -> StageResult:
+                 scenarios: Optional[int] = None, unseal_test: bool = False,
+                 allow_repeat_test: bool = False) -> StageResult:
         artifact = self.registry.load(version) if version else self._newest()
-        model = LoadedModel.from_artifact(artifact, scenarios)
-        keys = {r["session_key"] for r in artifact.races if r.get("split") == split}
-        if not keys:
-            return StageResult(False, reason=f"version {artifact.version} has no {split} races")
-        refs = [RaceRef.from_dict(r) for r in artifact.races if r["session_key"] in keys]
+        if split == TEST:
+            if promote:
+                return StageResult(False, reason="promotion is decided on validation, never on test")
+            if self.cfg.test_sealed and not unseal_test:
+                return StageResult(False, reason="the test set is sealed: pass --unseal-test for the final, "
+                                                 "recorded evaluation (it is refused a second time)")
+            try:
+                model, races = self._open_test(artifact, allow_repeat_test)
+            except SealedTestError as exc:
+                return StageResult(False, reason=str(exc))
+            if scenarios:
+                model.config.scenarios = scenarios
+        elif split == VALIDATION:
+            model = LoadedModel.from_artifact(artifact, scenarios)
+            refs = [RaceRef.from_dict(r) for r in artifact.races if r.get("split") == VALIDATION]
+            races = [self._load(ref, self.splits_of([ref])[ref.session_key]) for ref in refs]
+        else:
+            return StageResult(False, reason=f"unknown split {split!r}")
+        if not races:
+            return StageResult(False, reason=f"no {split} races to evaluate for version {artifact.version}")
         rows = []
-        for ref in refs:
-            race = self.catalog.load(ref)
+        for race in races:
             if not race.result:
                 continue
             total = model.total_laps(race)
@@ -485,8 +594,6 @@ class RaceModelRunner:
         report_uri = self._report(f"evaluate_{split}", report)
         promoted = False
         if promote:
-            if split != "validation":
-                return StageResult(False, reason="promotion is decided on validation, never on test")
             if summary.get(f"beats_{self.cfg.promote_requires_beating}"):
                 self.registry.promote(artifact.version, {"reason": "evaluation", "report": report_uri,
                                                          "delta_rps": summary["by_bucket"]["all"]})
@@ -502,15 +609,16 @@ class RaceModelRunner:
     def update(self) -> StageResult:
         """Refresh level 1 and the filter state with frozen hyperparameters."""
         parent = self.registry.load()
+        # While the test set is sealed the update skips test races too; the
+        # filter then carries form across that gap with its random-walk variance.
         refs, races = self.load_races()
-        splits = {r["session_key"]: r["split"] for r in parent.races}
-        new_refs = [r for r in refs if r.session_key not in splits]
-        for r in new_refs:
-            splits[r.session_key] = "live"  # never used for training or evaluation
+        known = {r["session_key"] for r in parent.races}
+        new_refs = [r for r in refs if r.session_key not in known]
+        splits = self.splits_of(refs)
         params = SeasonParams.from_dict(parent.season["state"]["params"])
         artifact, _ = self._fit_all(
             races, splits, params=params, events=EventModel.from_dict(parent.events), forecast_cfg=parent.forecast,
-            transition=TransitionBaseline.from_dict(parent.transition),
+            transition=TransitionBaseline.from_dict(parent.transition), frozen_level1=parent.level1,
         )
         # level-1 tyre/noise terms stay those of the trained parent
         artifact.level1 = {**artifact.level1, "phi": parent.level1["phi"], "sigma_eps": parent.level1["sigma_eps"],
@@ -532,11 +640,16 @@ class RaceModelRunner:
             if self.client_factory is None:
                 return StageResult(False, reason="live forecasts need an OpenF1 client")
             race = load_live_race(self.client_factory(), session_key)
+            if self.cfg.test_sealed and self.splits_of([race.ref])[race.ref.session_key] == TEST:
+                return StageResult(False, reason=f"{race.tag} is a test race and the test set is sealed")
         else:
             ref = next((r for r in self.catalog.races([year] if year else self.cfg.years) if r.session_key == session_key), None)
             if ref is None:
                 return StageResult(False, reason=f"session {session_key} is not a Grand Prix in the raw tree")
-            race = self.catalog.load(ref)  # the result is only a label; truncate_at_lap drops it
+            try:  # the result is only a label; truncate_at_lap drops it
+                race = self._load(ref, self.splits_of([ref])[ref.session_key])
+            except SealedTestError as exc:
+                return StageResult(False, reason=str(exc))
         k = int(lap or race.leader_laps())
         if k < 1:
             return StageResult(False, reason="the race has not completed a lap yet")

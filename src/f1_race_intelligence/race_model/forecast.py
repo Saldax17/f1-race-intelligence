@@ -51,6 +51,16 @@ class ForecastConfig:
     pit_under_sc_probability: float = 0.7
     pit_under_vsc_probability: float = 0.4
     noise_scale: float = 1.5
+    noise_scale_by_fraction: Optional[Dict[str, float]] = None
+    """Per race phase: ``{"0.1": s, "0.5": s, ...}`` keyed by the k/L fraction it was
+    chosen at; a forecast uses the nearest one. ``None`` uses ``noise_scale``."""
+
+    def noise_for(self, k: int, total_laps: int) -> float:
+        if not self.noise_scale_by_fraction:
+            return self.noise_scale
+        here = k / max(total_laps, 1)
+        nearest = min(self.noise_scale_by_fraction, key=lambda f: abs(float(f) - here))
+        return float(self.noise_scale_by_fraction[nearest])
     events: bool = True
     """False switches off SC/VSC/red, DNFs, extra stops and stop-loss noise (the Gaussian core)."""
     pooled_sigma_laps: float = 40.0
@@ -375,7 +385,7 @@ def forecast(
     planned = np.where(take_vsc, own_vsc, planned)
     stop_cost = np.where(take_vsc, stop_cost * events.vsc_pit_factor, stop_cost)
 
-    sigma_lap = config.noise_scale * sec * sigma_eps * np.sqrt((1 + phi) / (1 - phi))
+    sigma_lap = config.noise_for(k, L) * sec * sigma_eps * np.sqrt((1 + phi) / (1 - phi))
 
     def tyre_upto(lap: np.ndarray, stop_lap: np.ndarray) -> np.ndarray:
         """Tyre cost (seconds) from the car's lap at k to its own lap ``lap``, changing at ``stop_lap``."""
@@ -385,30 +395,38 @@ def forecast(
         return sec * (_tyre_cost(o1, d1, age1, before) + _tyre_cost(o2, d2, np.zeros_like(age1), after))
 
     finish = np.full((S, M), float(L))
-    # --- scenarios that stay green to the flag
-    Z = (
-        banked
-        + remaining * pace
-        + tyre_upto(finish, planned)
-        + stop_cost
-        + extra_cost
-        + sigma_lap * np.sqrt(remaining) * rng.standard_normal((S, M))
-    )
     neutral = np.isfinite(first)
-    if neutral.any():
+    # Random draws, drawn once so the totals below share them.
+    eps_green = rng.standard_normal((S, M))
+    eps_pre = rng.standard_normal((S, M))
+    eps_post = rng.standard_normal((S, M))
+    u_take = rng.random((S, M))
+
+    def assemble(pace_arr: np.ndarray, noise: float) -> np.ndarray:
+        """Total time to the flag per scenario and car (green, or around one neutralisation)."""
+        Z = (
+            banked
+            + remaining * pace_arr
+            + tyre_upto(finish, planned)
+            + stop_cost
+            + extra_cost
+            + noise * sigma_lap * np.sqrt(remaining) * eps_green
+        )
+        if not neutral.any():
+            return Z
         # each car's own lap when the neutralisation starts (lapped cars are behind)
         e_own = np.where(neutral[:, None], np.maximum(first[:, None], laps_done), laps_done)
         n1 = e_own - laps_done
         pre = (
             banked
-            + n1 * pace
+            + n1 * pace_arr
             + tyre_upto(e_own, planned)
             + np.where(stop <= e_own, stop_cost, 0.0)
             + np.where(has_extra & (extra_lap <= e_own), extra_cost, 0.0)
-            + sigma_lap * np.sqrt(n1) * rng.standard_normal((S, M))
+            + noise * sigma_lap * np.sqrt(n1) * eps_pre
         )
         pending = np.isfinite(stop) & (stop > e_own)
-        take = pending & (is_red[:, None] | (rng.random((S, M)) < config.pit_under_sc_probability))
+        take = pending & (is_red[:, None] | (u_take < config.pit_under_sc_probability))
         queue_cost = np.where(take, np.where(is_red[:, None], 0.0, stop_cost * events.sc_pit_factor), 0.0)
         alive = ~(retire_lap <= first[:, None])
         queue = np.where(alive, pre + queue_cost, np.inf)
@@ -421,14 +439,15 @@ def forecast(
         stop_now = np.where(take, e_own, planned)
         post = (
             config.restart_gap_seconds * rank
-            + n2 * pace
+            + n2 * pace_arr
             + tyre_upto(finish, stop_now) - tyre_upto(restart_own, stop_now)
             + np.where(pending & ~take, stop_cost, 0.0)
             + np.where(has_extra & (extra_lap > e_own), extra_cost, 0.0)
-            + sigma_lap * np.sqrt(n2) * rng.standard_normal((S, M))
+            + noise * sigma_lap * np.sqrt(n2) * eps_post
         )
-        Z = np.where(neutral[:, None], post, Z)
+        return np.where(neutral[:, None], post, Z)
 
+    Z = assemble(pace, 1.0)
     # --- classification
     finished = ~np.isfinite(retire_lap)
     laps_completed = np.where(finished, L, retire_lap - 1 - down)

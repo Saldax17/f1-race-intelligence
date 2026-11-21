@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import numpy as np
 
 from f1_race_intelligence.race_model.pace import TyreModel, tyre_state
-from f1_race_intelligence.race_model.racedata import DRY_COMPOUNDS, RaceData, final_order
+from f1_race_intelligence.race_model.racedata import DRY_COMPOUNDS, RaceData, final_order, is_excluded, is_retirement
 from f1_race_intelligence.race_model.regime import RED, SC, VSC, neutralised_laps, regime_by_lap, regime_events
 
 HAZARD_POOLING_LAPS = 60.0
@@ -101,12 +101,9 @@ def _shrunk(events: Mapping[str, float], exposure: Mapping[str, float], pooled: 
     }
 
 
-def fit_events(races: Sequence[RaceData], tyres: TyreModel, all_races: Sequence[RaceData] = ()) -> EventModel:
-    """Fit every event component on ``races`` (training only).
-
-    ``all_races`` supplies only race distances per circuit (``circuit_laps``),
-    which are public before any race.
-    """
+def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
+    """Fit every event component, race distances per circuit included, on ``races``
+    (the training races only)."""
     model = EventModel()
     ev = {SC: defaultdict(float), VSC: defaultdict(float), RED: defaultdict(float)}
     green_laps: Dict[str, float] = defaultdict(float)
@@ -133,13 +130,13 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel, all_races: Sequence[
             if e.laps:
                 (sc_len if e.kind == SC else vsc_len if e.kind == VSC else []).append(e.laps)
 
-        # retirements: unclassified, not DSQ/DNS, after lap 1
+        # retirements (racedata.is_retirement: not classified, not DSQ/DNS), after lap 1
         for r in race.result:
             d = r.get("driver_number")
-            if d is None or int(d) in order.excluded:
+            if d is None or is_excluded(r):
                 continue
             laps = int(r.get("number_of_laps") or 0)
-            retired = r.get("position") is None
+            retired = is_retirement(r)
             exposure = max(0, min(laps, total) - 1) + (1 if retired else 0)
             dnf_exposure[loc] += exposure
             hit = 1.0 if (retired and laps >= 1) else 0.0
@@ -184,7 +181,7 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel, all_races: Sequence[
         if not race.wet:
             ts = tyre_state(race)
             for d, stops in ts.stops.items():
-                if order.position.get(d) is None or d in order.retired:
+                if order.position.get(d) is None or d in order.retired or d in order.classified_dnf:
                     continue
                 extra[loc][0] += 1
                 extra[loc][1] += 1 if stops >= 2 else 0
@@ -237,7 +234,7 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel, all_races: Sequence[
         model.extra_stop_by_location = {
             loc: float((v[1] + 20 * model.extra_stop_rate) / (v[0] + 20)) for loc, v in extra.items() if v[0]
         }
-    for race in list(races) + list(all_races):
+    for race in races:
         winner = [r.get("number_of_laps") for r in race.result if r.get("position") == 1]
         if winner and winner[0]:
             model.circuit_laps[race.ref.location] = max(int(winner[0]), model.circuit_laps.get(race.ref.location, 0))

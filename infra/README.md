@@ -711,7 +711,7 @@ toma sustituyendo `DISABLED` en el despliegue correspondiente.
 ## Modelo de carrera (M7): desplegar y mantener
 
 El modelo (`src/f1_race_intelligence/race_model/`, matemática en
-`f1-model-math.md`) se despliega en dos piezas, cada una creada **solo cuando su
+`docs/f1-model-math.md`) se despliega en dos piezas, cada una creada **solo cuando su
 imagen ya está en ECR** (parámetros vacíos ⇒ el stack no crea nada de M7 salvo el
 repositorio ECR del pronóstico, los roles y los log groups):
 
@@ -802,7 +802,7 @@ Local, sin AWS (mismos comandos que ejecutan las tareas):
 ```bash
 python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote
 python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
-python -m f1_race_intelligence --stage m7-evaluate --split test   # solo para el informe final
+python -m f1_race_intelligence --stage m7-evaluate --split test --unseal-test   # una sola vez, informe final
 ```
 
 ### Riesgos del modelo en producción
@@ -815,7 +815,11 @@ python -m f1_race_intelligence --stage m7-evaluate --split test   # solo para el
   matriz de transición (`transition`) sin diferencia significativa (IC 95%
   del ΔRPS que incluye 0); si se quiere exigir ambos, cambiar
   `race_model.promote_requires_beating`.
-- **Test.** `--split test` no promueve nunca y no debe usarse para decidir nada.
+- **Test sellado.** Mientras `race_model.test_sealed` sea `true`, ni el entrenamiento, ni
+  `m7-update`, ni los pronósticos leen carreras de test. `--split test --unseal-test` es
+  la única entrada: no promueve, queda en `manifests/models/m7/test_ledger.json` y se
+  rechaza la segunda vez. Con el test sellado, `m7-update` salta esas carreras; pasar
+  `test_sealed: false` solo tras el informe final.
 - El reinicio reglamentario de 2026 deja el filtro sin historia útil: tras
   `m7-update`, revisar `prior_check` en el reporte antes de confiar en las
   primeras carreras.

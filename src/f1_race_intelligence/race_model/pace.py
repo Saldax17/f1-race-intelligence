@@ -359,11 +359,20 @@ def tyre_prior_means(tyres: TyreModel) -> Dict[str, float]:
     return means
 
 
-def fit_level1(races: Sequence[RaceData], config: Level1Config, tyre_races: Optional[Set[int]] = None) -> Level1Result:
+def fit_level1(
+    races: Sequence[RaceData],
+    config: Level1Config,
+    tyre_races: Optional[Set[int]] = None,
+    noise_races: Optional[Set[int]] = None,
+    phi: Optional[float] = None,
+    sigma_eps: Optional[float] = None,
+) -> Level1Result:
     """Full-race θ̂ and SE for every driver-race (flat prior: laps only, no double counting).
 
-    ``tyre_races`` restricts the pooled tyre model to those session keys
-    (the training races), so validation degradation never leaks into it.
+    Every pooled quantity is learned only from the session keys it is given:
+    ``tyre_races`` for the tyre model and ``noise_races`` for φ and σ_ε (the
+    training races). ``phi`` / ``sigma_eps`` freeze them instead, as an update
+    or the final test replay must. Per-race θ̂ are computed for every race.
     """
     from f1_race_intelligence.race_model.racedata import final_order
 
@@ -374,10 +383,11 @@ def fit_level1(races: Sequence[RaceData], config: Level1Config, tyre_races: Opti
         fit = None
         if not race.wet and clean.frame["driver_number"].nunique() >= config.min_drivers:
             fit = fit_race_pace(clean.frame, config, phi=0.0)
-        if fit is not None:
+        if fit is not None and (noise_races is None or race.ref.session_key in noise_races):
             pairs.append(fit.phi_pairs)
         fits.append((race, clean, fit))
-    phi = estimate_phi(pairs)
+    if phi is None:
+        phi = estimate_phi(pairs)
     inflation = (1 + phi) / (1 - phi)
 
     rows, stats, tyre_terms, refs = [], [], [], {}
@@ -432,11 +442,13 @@ def fit_level1(races: Sequence[RaceData], config: Level1Config, tyre_races: Opti
         )
     obs = pd.DataFrame(rows)
     tyres, by_location = pool_tyres(tyre_terms)
-    sigma = finite(s["resid_sd"] for s in stats)
+    if sigma_eps is None:
+        sigma = finite(s["resid_sd"] for s in stats if noise_races is None or s["session_key"] in noise_races)
+        sigma_eps = float(np.median(sigma)) if len(sigma) else 0.4
     return Level1Result(
         obs=obs,
         phi=phi,
-        sigma_eps=float(np.median(sigma)) if len(sigma) else 0.4,
+        sigma_eps=sigma_eps,
         tyres=tyres,
         tyres_by_location=by_location,
         reference_seconds=refs,

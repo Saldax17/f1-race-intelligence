@@ -210,14 +210,18 @@ training:
   experiment_name: "f1-race-intelligence"
   registered_model_name: "f1-next-lap-linear-regression"
 # The in-race position forecaster (M7): from lap k, the N x N matrix of
-# finishing positions. The math is in f1-model-math.md; every value here is
+# finishing positions. The math is in docs/f1-model-math.md; every value here is
 # recorded in the training report.
 race_model:
   raw_path: "data/raw"
   output_path: "data/models/m7"
   years: [2023, 2024, 2025]
   train_years: [2023, 2024]
-  validation_share_of_remainder: 0.5
+  # Fixed windows: 2025 up to Spa is validation, Budapest to Abu Dhabi is test.
+  validation_until: "2025-08-01"
+  test_until: "2026-01-01"
+  # Test races are never read while sealed; see m7-evaluate --unseal-test.
+  test_sealed: true
   # Laps 2-25 are missing at source.
   exclude_races: ["2025 Miami Gardens"]
   burn_in_races: 6
@@ -243,6 +247,8 @@ race_model:
   pit_under_sc_probability: 0.7
   pit_under_vsc_probability: 0.4
   noise_scales: [1.0, 1.5, 2.0, 3.0]
+  # One multiplier per k-bucket (experiment 1 in docs/m7-experiments.md).
+  noise_scale_per_phase: true
   calibration_races: 16
   random_seed: 42
 

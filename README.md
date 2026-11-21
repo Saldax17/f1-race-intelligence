@@ -1257,7 +1257,9 @@ Dado todo lo observado hasta el final de la vuelta *k*, el modelo entrega la
 matriz N×N `P[i, j] = Pr(piloto i termina j-ésimo)` más `Pr(DNF)` por piloto. Los
 coches retirados ocupan las últimas posiciones, así que la matriz es doblemente
 estocástica por construcción. La matemática y cada decisión están en
-`f1-model-math.md`; el alcance, en `f1-model-scope.md`.
+`docs/f1-model-math.md`; el alcance, en `docs/f1-model-scope.md`; la
+especificación implementada (formulación, supuestos, censura y DNF, priors,
+alcance y protocolo anti-leakage), en `docs/m7-model-spec.md`.
 
 | Módulo (`race_model/`) | Qué hace |
 |---|---|
@@ -1277,9 +1279,11 @@ python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 999
 python -m f1_race_intelligence --stage m7-update                          # tras cada GP: estado de temporada al día
 ```
 
-Split: 2023–24 entrenamiento; 2025 en orden de calendario, primera mitad
-validación y segunda mitad test (solo con `m7-evaluate --split test`, nunca para
-promover). Despliegue y mantenimiento en AWS: `infra/README.md`, sección
+Split por fechas fijas: 2023–24 entrenamiento; 2025 hasta Spa validación; de
+Budapest a Abu Dabi test. **El test está sellado** (`race_model.test_sealed`):
+ninguna etapa lee sus carreras, salvo `m7-evaluate --split test --unseal-test`,
+que queda registrado en `test_ledger.json` y se rechaza una segunda vez. Las
+iteraciones del modelo se registran en `docs/m7-experiments.md`. Despliegue y mantenimiento en AWS: `infra/README.md`, sección
 "Modelo de carrera (M7)".
 
 ## 16. Ejecutar tests
