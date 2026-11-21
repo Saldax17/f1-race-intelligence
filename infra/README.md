@@ -420,13 +420,31 @@ desde el repositorio.
 `sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df`
 (Python 3.12.16, misma distribución Bookworm) actualiza `apt` a 2.6.2 y
 `openssl`/`libssl3` a `3.0.22-1~deb12u2`, y es el único cambio. No se usa
-`apt-get upgrade` (no sería reproducible) ni se migra a Trixie. El efecto sobre
-el escaneo es **esperado, no medido**: la imagen nueva aún no se ha publicado ni
-escaneado en ECR.
+`apt-get upgrade` (no sería reproducible) ni se migra a Trixie.
 
-*Resumen de los 17 HIGH:* **2 con parche disponible** y **15 sin parche
-disponible en Bookworm** (3 mitigados por configuración verificada y 12 que
-requieren aceptación de riesgo).
+*Resultado medido.* La imagen resultante (commit
+`3d3b4e685f3456f33c1bf9ed169f826dcef93083`, etiqueta `3d3b4e6`, digest
+`sha256:b4c0f5012acd02062d0bb236e99b4cd55ecc4545fe4054a35618ca0a80cd5fdf`) se
+publicó en ECR y su escaneo terminó `COMPLETE` el 2026-11-21. Comparado con el de
+`88514b4` (verificado en ECR, no estimado):
+
+| Severidad | `88514b4` | `3d3b4e6` |
+|---|---|---|
+| HIGH | 17 | **15** |
+| MEDIUM | 28 | **25** |
+| LOW | 8 | **6** |
+| Total | 53 | **46** |
+
+Desaparecieron **exactamente siete hallazgos** y **no apareció ninguno nuevo**:
+HIGH `apt` CVE-2026-109518 y `openssl` CVE-2026-84782; MEDIUM `openssl`
+CVE-2026-35189, CVE-2026-75805 y CVE-2026-75806; LOW `openssl` CVE-2026-54872 y
+CVE-2026-77696. Coincide con lo previsto a partir del Debian Security Tracker.
+
+*Resumen de los 17 HIGH de `88514b4`:* **2 con parche disponible** (ya aplicado
+en `3d3b4e6`) y **15 sin parche disponible en Bookworm**, que son los 15 HIGH que
+siguen abiertos en `3d3b4e6`: 3 mitigados por configuración verificada y 12 que
+requieren aceptación de riesgo. **Ninguno de los doce está aceptado todavía**:
+la aceptación formal debe registrarla el responsable humano.
 
 | CVE | Paquete (versión) | Estado en Debian | Tratamiento |
 |---|---|---|---|
@@ -465,8 +483,9 @@ completa.
 *Limitaciones.* La lista de bibliotecas cargadas sale de importar los módulos del
 proyecto, no de una traza exhaustiva de todas las rutas de ejecución. Los
 resultados de las etapas M3–M5 en la imagen se probaron con datos sintéticos; M2
-no se ha probado dentro de la imagen (requiere OpenF1). Hasta que ECR escanee la
-imagen nueva, las cifras posteriores a la remediación no están verificadas.
+no se ha probado dentro de la imagen (requiere OpenF1). El escaneo de ECR es el
+escáner básico del servicio: informa de presencia y versión de paquetes, no del
+alcance de cada CVE.
 
 **Red y costes**
 
