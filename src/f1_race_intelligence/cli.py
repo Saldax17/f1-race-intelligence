@@ -58,6 +58,9 @@ logger = get_logger("f1_race_intelligence.cli")
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
+# The stage ran correctly but deliberately did nothing (M6 with an incomplete history).
+# Distinct from 0 so an orchestrator cannot report the history as complete.
+EXIT_DEFERRED = 3
 
 STAGES = (
     "plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "copy-raw",
@@ -72,6 +75,7 @@ class StageOutcome:
     ok: bool
     summary: Dict[str, Any] = field(default_factory=dict)
     reason: Optional[str] = None
+    deferred: bool = False
 
 
 @dataclass
@@ -109,11 +113,27 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--config", help="Config file (default: F1_CONFIG_PATH or configs/config.yaml)")
     config.add_argument("--environment", choices=["local", "aws"])
     config.add_argument("--overwrite", action="store_true", help="Rebuild outputs that already exist (m2, m4, m5, copy-raw)")
+    config.add_argument(
+        "--overwrite-derived",
+        action="store_true",
+        help="Rebuild M4/M5 outputs without forcing M2 to redownload valid raw files",
+    )
     config.add_argument("--strict", action="store_true", help="Exit non-zero when validation (m3) comes back FAIL")
     config.add_argument(
         "--plan-output",
         help="Also write the plan's work units as JSON to this local file or s3://bucket/key "
         "(where an orchestrator such as Step Functions can read them)",
+    )
+    config.add_argument(
+        "--refresh-catalogs",
+        action="store_true",
+        help="Refresh OpenF1 meetings/sessions metadata while planning; session data is not downloaded",
+    )
+    config.add_argument(
+        "--require-complete-history",
+        action="store_true",
+        help="m6 only: run only when stored, hash-verified M2-M5 evidence proves every modelling season is "
+        "complete; otherwise exit 3 without modelling",
     )
     config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
     config.add_argument("--m6-report", help="Verified local M6 report to use as M7 training input")
@@ -184,6 +204,9 @@ def settings_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     if args.overwrite:
         for section in ("historical_extraction", "consolidation", "features"):
             overrides[section] = {"overwrite": True}
+    elif args.overwrite_derived:
+        overrides["consolidation"] = {"overwrite": True}
+        overrides["features"] = {"overwrite": True}
     return overrides
 
 
@@ -213,13 +236,15 @@ def run_plan(ctx: RunContext) -> StageOutcome:
     years = [ctx.scope.year] if ctx.scope.year is not None else None
     client = ctx.client_factory(ctx.settings)
     with HistoricalExtractionPipeline(ctx.settings, client=client, store=ctx.output_store) as pipeline:
-        units = pipeline.plan(years)
+        units = pipeline.plan(years, refresh_catalogs=ctx.args.refresh_catalogs)
+        plan = {"sessions": units, "decisions": pipeline.plan_decisions}
 
     if ctx.args.plan_output:
-        location = write_plan(ctx.args.plan_output, units, ctx.settings.storage)
+        location = write_plan(ctx.args.plan_output, plan, ctx.settings.storage)
         logger.info("plan_written", extra={"location": location, "work_units": len(units)})
-    print(json.dumps(units))
-    return StageOutcome(ok=True, summary={"work_units": len(units)})
+    print(json.dumps(plan))
+    omitted = sum(decision["decision"] == "omit" for decision in pipeline.plan_decisions)
+    return StageOutcome(ok=True, summary={"work_units": len(units), "omitted": omitted})
 
 
 def parse_plan_destination(destination: str) -> Optional[tuple]:
@@ -238,7 +263,7 @@ def parse_plan_destination(destination: str) -> Optional[tuple]:
     return None
 
 
-def write_plan(destination: str, units: List[Dict[str, Any]], storage: StorageSettings, *, client: Any = None) -> str:
+def write_plan(destination: str, plan: Dict[str, Any], storage: StorageSettings, *, client: Any = None) -> str:
     """Store the plan's work units at a local path or ``s3://bucket/key``.
 
     A container's stdout cannot be read by an orchestrator, so on AWS the
@@ -249,11 +274,11 @@ def write_plan(destination: str, units: List[Dict[str, Any]], storage: StorageSe
     if s3_object:
         bucket, key = s3_object
         backend = S3StorageBackend(bucket, client=client, region_name=storage.region, endpoint_url=storage.endpoint_url)
-        backend.write_json(key, units)
+        backend.write_json(key, plan)
         return backend.uri(key)
     path = Path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(units, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
     return str(path)
 
 
@@ -284,10 +309,29 @@ def run_m2(ctx: RunContext) -> StageOutcome:
 
 def run_m3(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.validation.runner import ValidationRunner
+    from f1_race_intelligence.pipelines.incremental import capture_stage_inputs, record_stage_provenance
 
+    stage_inputs, capture_reason = (
+        capture_stage_inputs(ctx.output_store, ctx.settings, ctx.scope, "m3")
+        if ctx.scope.is_session
+        else (None, "not a session-scoped run")
+    )
     report = ValidationRunner(ctx.settings, store=ctx.input_store, scope=ctx.scope).run()
     status = report.global_status.value
     failed = ctx.args.strict and status == "FAIL"
+    if ctx.scope.is_session and status in {"PASS", "WARNING"}:
+        recorded, detail = (
+            record_stage_provenance(
+                ctx.output_store, ctx.settings, ctx.scope, "m3", expected_inputs=stage_inputs
+            )
+            if stage_inputs is not None
+            else (False, capture_reason)
+        )
+        if not recorded:
+            logger.warning(
+                "incremental_stage_provenance_not_recorded",
+                extra={"stage": "m3", "session_key": ctx.scope.session_key, "reason": detail},
+            )
     return StageOutcome(
         ok=not failed,
         summary={"global_status": status, **report.summary(), "files": report.scope.get("files_evaluated", 0)},
@@ -297,7 +341,13 @@ def run_m3(ctx: RunContext) -> StageOutcome:
 
 def run_m4(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.consolidation.runner import ConsolidationRunner
+    from f1_race_intelligence.pipelines.incremental import capture_stage_inputs, record_stage_provenance
 
+    stage_inputs, capture_reason = (
+        capture_stage_inputs(ctx.output_store, ctx.settings, ctx.scope, "m4")
+        if ctx.scope.is_session
+        else (None, "not a session-scoped run")
+    )
     report = ConsolidationRunner(
         ctx.settings, store=ctx.input_store, output_store=ctx.output_store, scope=ctx.scope
     ).run()
@@ -309,12 +359,31 @@ def run_m4(ctx: RunContext) -> StageOutcome:
         reason = f"{summary['sessions_failed']} session(s) failed to consolidate"
     elif ctx.scope.is_session and not (summary["sessions_processed"] or summary["sessions_skipped"]):
         reason = f"no raw laps found for session {ctx.scope.session_key}"
+    if reason is None and ctx.scope.is_session:
+        recorded, detail = (
+            record_stage_provenance(
+                ctx.output_store, ctx.settings, ctx.scope, "m4", expected_inputs=stage_inputs
+            )
+            if stage_inputs is not None
+            else (False, capture_reason)
+        )
+        if not recorded:
+            logger.warning(
+                "incremental_stage_provenance_not_recorded",
+                extra={"stage": "m4", "session_key": ctx.scope.session_key, "reason": detail},
+            )
     return StageOutcome(ok=reason is None, summary=summary, reason=reason)
 
 
 def run_m5(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.features.runner import FeatureRunner
+    from f1_race_intelligence.pipelines.incremental import capture_stage_inputs, record_session_completion, record_stage_provenance
 
+    stage_inputs, capture_reason = (
+        capture_stage_inputs(ctx.output_store, ctx.settings, ctx.scope, "m5")
+        if ctx.scope.is_session
+        else (None, "not a session-scoped run")
+    )
     report = FeatureRunner(ctx.settings, store=ctx.input_store, output_store=ctx.output_store, scope=ctx.scope).run()
     summary = report.summary()
     reason = None
@@ -324,6 +393,30 @@ def run_m5(ctx: RunContext) -> StageOutcome:
         reason = f"anti-leakage checks failed for sessions {summary['sessions_with_blocking_failures']}"
     elif ctx.scope.is_session and not (summary["sessions_processed"] or summary["sessions_skipped"]):
         reason = f"no consolidated dataset found for session {ctx.scope.session_key}"
+    if reason is None and ctx.scope.is_session:
+        stage_recorded, stage_detail = (
+            record_stage_provenance(
+                ctx.output_store, ctx.settings, ctx.scope, "m5", expected_inputs=stage_inputs
+            )
+            if stage_inputs is not None
+            else (False, capture_reason)
+        )
+        if not stage_recorded:
+            logger.warning(
+                "incremental_stage_provenance_not_recorded",
+                extra={"stage": "m5", "session_key": ctx.scope.session_key, "reason": stage_detail},
+            )
+            return StageOutcome(
+                ok=True,
+                summary=summary,
+                reason=None,
+            )
+        recorded, detail = record_session_completion(ctx.output_store, ctx.settings, ctx.scope)
+        if not recorded:
+            logger.warning(
+                "incremental_completion_not_recorded",
+                extra={"session_key": ctx.scope.session_key, "reason": detail},
+            )
     return StageOutcome(ok=reason is None, summary=summary, reason=reason)
 
 
@@ -333,7 +426,29 @@ def run_m6(ctx: RunContext) -> StageOutcome:
 
     if not ctx.scope.is_empty:
         logger.warning("m6_ignores_scope", extra={"reason": "the split needs the whole history; use modeling.years"})
-    report = ModelingRunner(ctx.settings, store=ctx.input_store, output_store=ctx.output_store).run()
+    if ctx.args.require_complete_history:
+        from f1_race_intelligence.pipelines.incremental import history_completeness
+
+        required = list(ctx.settings.modeling.years) or list(ctx.settings.historical_extraction.years)
+        history = history_completeness(ctx.output_store, ctx.settings, required)
+        logger.info("backfill_history_status", extra={"history": history})
+        if not history["complete"]:
+            incomplete = sorted(year for year, item in history["seasons"].items() if item["status"] != "complete")
+            reason = f"history incomplete: seasons without verified evidence: {', '.join(incomplete) or 'none required'}"
+            logger.warning("m6_deferred", extra={"reason": reason})
+            return StageOutcome(ok=True, summary={"m6_deferred": True, "history": history}, reason=reason, deferred=True)
+    runner = ModelingRunner(ctx.settings, store=ctx.input_store, output_store=ctx.output_store)
+    reusable = runner.reusable_report()
+    if reusable is not None:
+        summary = dict(reusable.get("summary", {}))
+        summary["reused"] = True
+        summary["reused_from_run_id"] = reusable["run_id"]
+        logger.info(
+            "m6_reused",
+            extra={"run_id": reusable["run_id"], "input_fingerprint": reusable["source"]["input_fingerprint"]},
+        )
+        return StageOutcome(ok=True, summary=summary)
+    report = runner.run()
     summary = report.summary()
     successful = report.verdict in (RunVerdict.VALID, RunVerdict.VALID_WITH_WARNINGS)
     details = report.aborted or ", ".join(report.blocking_failures) or "; ".join(report.warnings)
@@ -462,6 +577,8 @@ def _peak_memory_mb() -> Optional[float]:
 def stage_status(outcome: StageOutcome) -> str:
     """Classify reported outcomes without changing a stage's exit semantics."""
     global_status = outcome.summary.get("global_status")
+    if outcome.deferred:
+        return "deferred"
     if not outcome.ok or global_status == "FAIL":
         return "failed"
     if global_status == "WARNING" or outcome.summary.get("verdict") == "VALID_WITH_WARNINGS":
@@ -521,6 +638,12 @@ def main(
 
     try:
         stages = parse_stages(args.stage)
+        if args.refresh_catalogs and stages != ["plan"]:
+            raise ValueError("--refresh-catalogs is only valid with --stage plan")
+        if args.require_complete_history and stages != ["m6"]:
+            raise ValueError("--require-complete-history is only valid with --stage m6")
+        if args.overwrite_derived and not any(stage in stages for stage in ("m4", "m5")):
+            raise ValueError("--overwrite-derived requires stage m4 or m5")
         if "verify-m6" in stages and (len(stages) != 1 or not args.report):
             raise ValueError("verify-m6 must be run alone and requires --report")
         if "m7" in stages and len(stages) != 1:
@@ -568,6 +691,9 @@ def main(
             print(f"{name}: FAILED - {outcome.reason}", file=sys.stderr)
             return EXIT_FAILED
         status = stage_status(outcome)
+        if status == "deferred":
+            print(f"{name}: DEFERRED - {outcome.reason}", file=sys.stderr)
+            return EXIT_DEFERRED
         if status == "failed":
             label = "FAILED (non-strict; pipeline continues)"
         elif status == "partial":

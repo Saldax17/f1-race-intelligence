@@ -16,7 +16,7 @@ Metadata:
       - Label: { default: Storage }
         Parameters: [S3BucketName, NoncurrentVersionExpirationDays]
       - Label: { default: Orchestration }
-        Parameters: [AvailabilitySchedule, AvailabilityScheduleState, PipelineEnabled, OpenF1BaseUrl]
+        Parameters: [AvailabilitySchedule, AvailabilityScheduleState, PipelineIntervalHours, PipelineEnabled, ExtractionYears, OpenF1BaseUrl]
       - Label: { default: Batch tasks }
         Parameters: [PipelineImageUri]
       - Label: { default: Observability }
@@ -88,6 +88,27 @@ Parameters:
       Whether an available OpenF1 lets the state machine continue into M2-M6 (Fargate
       tasks). Keep "false" until a first controlled run has been verified; "true"
       requires PipelineImageUri (rule PipelineNeedsAnImage).
+
+  PipelineIntervalHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 8760
+    Description: >-
+      Minimum elapsed hours between automatic pipeline starts after a positive
+      availability check. Manual Step Functions starts are not subject to this interval.
+
+  ExtractionYears:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{4}(,[0-9]{4})*$"
+    ConstraintDescription: Empty, or comma-separated four-digit seasons such as 2023 or 2023,2024.
+    Description: >-
+      Seasons the pipeline plans and extracts (exposed to the plan task as F1_EXTRACTION_YEARS).
+      Empty keeps the seasons of configs/config.yaml. An execution can override it with
+      "extraction_years" in its input, which is how a historical backfill runs one season
+      per execution. Modelling (M6) always needs every modelling season and only runs when
+      stored evidence proves them all complete.
 
   PipelineImageUri:
     Type: String
@@ -253,6 +274,16 @@ Resources:
         - { Key: Environment, Value: !Ref Environment }
         - { Key: ManagedBy, Value: sam }
         - { Key: DataClassification, Value: public-source-derived }
+
+  PipelineAdmissionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-pipeline-admission"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: sam }
 
   DataBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -570,28 +601,49 @@ Resources:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
 
-  AvailabilityResultRuleRole:
+  PipelineAdmissionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ProjectName}-${Environment}-availability-to-states"
-      Description: Lets EventBridge start the pipeline state machine with an availability result.
+      RoleName: !Sub "${ProjectName}-${Environment}-pipeline-admission"
+      Description: Reserves the automatic pipeline interval in S3 and starts the state machine.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: events.amazonaws.com }
+            Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
-        - PolicyName: start-pipeline
+        - PolicyName: write-own-logs
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${PipelineAdmissionLogGroup.Arn}:*"
+        - PolicyName: reserve-automatic-pipeline-interval
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DetectMissingCadenceObject
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringEquals:
+                    s3:prefix: manifests/control/pipeline-cadence.json
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${DataBucket.Arn}/manifests/control/pipeline-cadence.json"
+              - Effect: Allow
                 Action: states:StartExecution
                 Resource: !Ref PipelineStateMachine
+        - PolicyName: publish-admission-failure
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
@@ -637,7 +689,12 @@ Resources:
                   - !Sub "${DataBucket.Arn}/consolidated/*"
                   - !Sub "${DataBucket.Arn}/features/*"
                   - !Sub "${DataBucket.Arn}/modeling/*"
-                  - !Sub "${DataBucket.Arn}/manifests/*"
+                  - !Sub "${DataBucket.Arn}/manifests/extraction/*"
+                  - !Sub "${DataBucket.Arn}/manifests/incremental/*"
+                  - !Sub "${DataBucket.Arn}/manifests/consolidation/*"
+                  - !Sub "${DataBucket.Arn}/manifests/features/*"
+                  - !Sub "${DataBucket.Arn}/manifests/modeling/*"
+                  - !Sub "${DataBucket.Arn}/manifests/plan/*"
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
@@ -891,6 +948,30 @@ Resources:
             Type: SNS
             Destination: !Ref AlertTopic
 
+  PipelineAdmissionFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PipelineAdmissionLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-pipeline-admission"
+      Description: Applies a persistent minimum interval before automatically starting the pipeline.
+      CodeUri: functions/pipeline_admission/
+      Handler: handler.handler
+      Role: !GetAtt PipelineAdmissionRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          PIPELINE_STATE_MACHINE_ARN: !Ref PipelineStateMachine
+          PIPELINE_ENABLED: !Ref PipelineEnabled
+          PIPELINE_INTERVAL_HOURS: !Ref PipelineIntervalHours
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 900
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref AlertTopic
+
   AvailabilityScheduleRule:
     Type: AWS::Events::Rule
     Properties:
@@ -927,8 +1008,8 @@ Resources:
     Properties:
       Name: !Sub "${ProjectName}-${Environment}-availability-result"
       Description: >-
-        Every successful availability check starts the pipeline state machine with the
-        checker's JSON result; the state machine decides whether anything runs.
+        A successful availability check is passed to the persistent pipeline-admission
+        function; availability checks remain independent of pipeline cadence.
       EventBusName: !Ref OrchestrationEventBus
       EventPattern:
         source: [lambda]
@@ -937,13 +1018,21 @@ Resources:
           - prefix: !GetAtt AvailabilityCheckerFunction.Arn
       State: ENABLED
       Targets:
-        - Id: pipeline-state-machine
-          Arn: !Ref PipelineStateMachine
-          RoleArn: !GetAtt AvailabilityResultRuleRole.Arn
+        - Id: pipeline-admission
+          Arn: !GetAtt PipelineAdmissionFunction.Arn
           InputPath: $.detail.responsePayload
           RetryPolicy:
             MaximumRetryAttempts: 3
             MaximumEventAgeInSeconds: 900
+
+  AvailabilityResultInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineAdmissionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AvailabilityResultRule.Arn
+      SourceAccount: !Ref AWS::AccountId
 
   # ---------------------------------------------------------------------------
   # Pipeline orchestration
@@ -958,6 +1047,7 @@ Resources:
         Environment: !Ref Environment
         PipelineEnabled: !Ref PipelineEnabled
         DataBucketName: !Ref DataBucket
+        DefaultExtractionYears: !Ref ExtractionYears
         AlertTopicArn: !Ref AlertTopic
         ClusterArn: !GetAtt PipelineCluster.Arn
         # Without an image there is no task definition; the PipelineNeedsAnImage
@@ -1476,6 +1566,24 @@ Resources:
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
 
+  PipelineAdmissionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-pipeline-admission-errors"
+      AlarmDescription: "Errors of pipeline-admission count every failed attempt, including ones a retry later resolves; inspect the structured logs."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref PipelineAdmissionFunction }
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
   PipelineExecutionsFailedAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -1696,6 +1804,23 @@ Resources:
                 "metrics": [
                   ["AWS/Events", "FailedInvocations", "RuleName", "${ProjectName}-${Environment}-openf1-availability-schedule", {"label": "Availability schedule"}],
                   ["AWS/Events", "FailedInvocations", "EventBusName", "${ProjectName}-${Environment}-orchestration", "RuleName", "${ProjectName}-${Environment}-availability-result", {"label": "Availability result"}]
+                ],
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "Pipeline admission requests and faults",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "stat": "Sum",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${PipelineAdmissionFunction}", {"label": "Invocations"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PipelineAdmissionFunction}", {"label": "Errors"}],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${PipelineAdmissionFunction}", {"label": "Throttles"}]
                 ],
                 "yAxis": {"left": {"min": 0}}
               }

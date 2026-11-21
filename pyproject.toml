@@ -65,6 +65,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-m 'not integration'"
 markers = [
     "integration: tests that call the real OpenF1 API (require internet; run explicitly with `pytest -m integration`)",

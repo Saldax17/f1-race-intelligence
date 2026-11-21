@@ -65,6 +65,7 @@ class Layer(str, Enum):
     CONSOLIDATION_REPORTS = "consolidation_reports"
     FEATURES = "features"
     FEATURE_REPORTS = "feature_reports"
+    INCREMENTAL_STATE = "incremental_state"
     MODELING = "modeling"
     MODELING_REPORTS = "modeling_reports"
     MODELS = "models"
@@ -82,6 +83,7 @@ LAKE_ROOTS: Dict[Layer, str] = {
     Layer.CONSOLIDATION_REPORTS: "manifests/consolidation",
     Layer.FEATURES: "features",
     Layer.FEATURE_REPORTS: "manifests/features",
+    Layer.INCREMENTAL_STATE: "manifests/incremental",
     Layer.MODELING: "modeling",
     Layer.MODELING_REPORTS: "manifests/modeling",
     Layer.MODELS: "models",

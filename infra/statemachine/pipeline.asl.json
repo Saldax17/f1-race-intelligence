@@ -95,7 +95,7 @@
           "Next": "AnotherRunInProgress"
         }
       ],
-      "Default": "PlanSessions"
+      "Default": "ResolveExtractionScope"
     },
     "AnotherRunInProgress": {
       "Type": "Succeed",
@@ -103,7 +103,7 @@
     },
     "PlanSessions": {
       "Type": "Task",
-      "Comment": "Discover the session work units of the configured seasons (historical_extraction.years) and write them to S3: a task's stdout cannot be read by Step Functions.",
+      "Comment": "Plan only sessions whose M2-M5 artifacts are missing, changed or unverifiable. Current-season metadata is refreshed only when its saved catalog is stale; a task's stdout cannot be read by Step Functions. F1_EXTRACTION_YEARS limits planning to the seasons of this backfill phase (empty keeps the configured seasons).",
       "Resource": "arn:aws:states:::ecs:runTask.sync",
       "Parameters": {
         "LaunchType": "FARGATE",
@@ -126,15 +126,15 @@
                 {
                   "Name": "F1_PIPELINE_EXECUTION_ID",
                   "Value.$": "$$.Execution.Id"
+                },
+                {
+                  "Name": "F1_EXTRACTION_YEARS",
+                  "Value.$": "$.scope.value"
                 }
               ]
             }
           ]
         }
-      },
-      "ResultSelector": {
-        "exit_code.$": "$.Containers[0].ExitCode",
-        "task_arn.$": "$.TaskArn"
       },
       "ResultPath": "$.plan_task",
       "TimeoutSeconds": 1800,
@@ -162,15 +162,40 @@
     },
     "CheckPlanExitCode": {
       "Type": "Choice",
-      "Comment": "A non-zero exit fails the stage even if runTask.sync reported the stopped task as a success.",
+      "Comment": "Validates the stored ECS result in separate steps: a numeric ExitCode of 0 is the only success; any other number is a failed stage; a missing Containers/ExitCode or a non-numeric one is a malformed result. Nothing dereferences Containers[0].ExitCode before this Choice, so a bad result cannot raise States.Runtime.",
       "Choices": [
         {
-          "Variable": "$.plan_task.exit_code",
-          "NumericEquals": 0,
+          "And": [
+            {
+              "Variable": "$.plan_task.Containers[0].ExitCode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.plan_task.Containers[0].ExitCode",
+              "IsNumeric": true
+            },
+            {
+              "Variable": "$.plan_task.Containers[0].ExitCode",
+              "NumericEquals": 0
+            }
+          ],
           "Next": "LoadPlan"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.plan_task.Containers[0].ExitCode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.plan_task.Containers[0].ExitCode",
+              "IsNumeric": true
+            }
+          ],
+          "Next": "PlanExitedNonZero"
         }
       ],
-      "Default": "PlanExitedNonZero"
+      "Default": "PlanResultMalformed"
     },
     "PlanExitedNonZero": {
       "Type": "Pass",
@@ -183,14 +208,14 @@
     },
     "LoadPlan": {
       "Type": "Task",
-      "Comment": "Read the work units the plan task wrote: [{year, meeting_key, session_key, session_name}, ...].",
+      "Comment": "Read the plan document written to S3, retaining both included sessions and per-session inclusion/omission reasons.",
       "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
       "Parameters": {
         "Bucket": "${DataBucketName}",
         "Key.$": "States.Format('manifests/plan/{}.json', $$.Execution.Name)"
       },
       "ResultSelector": {
-        "sessions.$": "States.StringToJson($.Body)"
+        "document.$": "States.StringToJson($.Body)"
       },
       "ResultPath": "$.plan",
       "Catch": [
@@ -205,7 +230,7 @@
     "PerSessionPipeline": {
       "Type": "Map",
       "Comment": "One iteration per session: M2 -> M3 -> M4 -> M5, one Fargate task each, every stage reading its inputs from and writing its outputs to S3. MaxConcurrency stays at 1 because every M2 calls OpenF1, a shared public API with a per-client rate limit.",
-      "ItemsPath": "$.plan.sessions",
+      "ItemsPath": "$.plan.document.sessions",
       "MaxConcurrency": 1,
       "ItemSelector": {
         "session.$": "$$.Map.Item.Value"
@@ -247,10 +272,6 @@
                 ]
               }
             },
-            "ResultSelector": {
-              "exit_code.$": "$.Containers[0].ExitCode",
-              "task_arn.$": "$.TaskArn"
-            },
             "ResultPath": "$.m2",
             "TimeoutSeconds": 1800,
             "Retry": [
@@ -273,12 +294,38 @@
             "Type": "Choice",
             "Choices": [
               {
-                "Variable": "$.m2.exit_code",
-                "NumericEquals": 0,
+                "And": [
+                  {
+                    "Variable": "$.m2.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m2.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  },
+                  {
+                    "Variable": "$.m2.Containers[0].ExitCode",
+                    "NumericEquals": 0
+                  }
+                ],
                 "Next": "M3_Validation"
+              },
+              {
+                "And": [
+                  {
+                    "Variable": "$.m2.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m2.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  }
+                ],
+                "Next": "M2ExitedNonZero"
               }
             ],
-            "Default": "M2ExitedNonZero"
+            "Default": "M2ResultMalformed",
+            "Comment": "Validates the stored ECS result in separate steps: a numeric ExitCode of 0 is the only success; any other number is a failed stage; a missing Containers/ExitCode or a non-numeric one is a malformed result. Nothing dereferences Containers[0].ExitCode before this Choice, so a bad result cannot raise States.Runtime."
           },
           "M2ExitedNonZero": {
             "Type": "Fail",
@@ -316,10 +363,6 @@
                 ]
               }
             },
-            "ResultSelector": {
-              "exit_code.$": "$.Containers[0].ExitCode",
-              "task_arn.$": "$.TaskArn"
-            },
             "ResultPath": "$.m3",
             "TimeoutSeconds": 900,
             "Retry": [
@@ -341,12 +384,38 @@
             "Type": "Choice",
             "Choices": [
               {
-                "Variable": "$.m3.exit_code",
-                "NumericEquals": 0,
+                "And": [
+                  {
+                    "Variable": "$.m3.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m3.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  },
+                  {
+                    "Variable": "$.m3.Containers[0].ExitCode",
+                    "NumericEquals": 0
+                  }
+                ],
                 "Next": "M4_Consolidation"
+              },
+              {
+                "And": [
+                  {
+                    "Variable": "$.m3.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m3.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  }
+                ],
+                "Next": "M3ExitedNonZero"
               }
             ],
-            "Default": "M3ExitedNonZero"
+            "Default": "M3ResultMalformed",
+            "Comment": "Validates the stored ECS result in separate steps: a numeric ExitCode of 0 is the only success; any other number is a failed stage; a missing Containers/ExitCode or a non-numeric one is a malformed result. Nothing dereferences Containers[0].ExitCode before this Choice, so a bad result cannot raise States.Runtime."
           },
           "M3ExitedNonZero": {
             "Type": "Fail",
@@ -373,7 +442,7 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm4', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Command.$": "States.Array('--stage', 'm4', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key), '--overwrite-derived')",
                     "Environment": [
                       {
                         "Name": "F1_PIPELINE_EXECUTION_ID",
@@ -383,10 +452,6 @@
                   }
                 ]
               }
-            },
-            "ResultSelector": {
-              "exit_code.$": "$.Containers[0].ExitCode",
-              "task_arn.$": "$.TaskArn"
             },
             "ResultPath": "$.m4",
             "TimeoutSeconds": 900,
@@ -409,12 +474,38 @@
             "Type": "Choice",
             "Choices": [
               {
-                "Variable": "$.m4.exit_code",
-                "NumericEquals": 0,
+                "And": [
+                  {
+                    "Variable": "$.m4.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m4.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  },
+                  {
+                    "Variable": "$.m4.Containers[0].ExitCode",
+                    "NumericEquals": 0
+                  }
+                ],
                 "Next": "M5_Features"
+              },
+              {
+                "And": [
+                  {
+                    "Variable": "$.m4.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m4.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  }
+                ],
+                "Next": "M4ExitedNonZero"
               }
             ],
-            "Default": "M4ExitedNonZero"
+            "Default": "M4ResultMalformed",
+            "Comment": "Validates the stored ECS result in separate steps: a numeric ExitCode of 0 is the only success; any other number is a failed stage; a missing Containers/ExitCode or a non-numeric one is a malformed result. Nothing dereferences Containers[0].ExitCode before this Choice, so a bad result cannot raise States.Runtime."
           },
           "M4ExitedNonZero": {
             "Type": "Fail",
@@ -441,7 +532,7 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm5', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Command.$": "States.Array('--stage', 'm5', '--year', States.Format('{}', $.session.year), '--session-key', States.Format('{}', $.session.session_key), '--overwrite-derived')",
                     "Environment": [
                       {
                         "Name": "F1_PIPELINE_EXECUTION_ID",
@@ -451,10 +542,6 @@
                   }
                 ]
               }
-            },
-            "ResultSelector": {
-              "exit_code.$": "$.Containers[0].ExitCode",
-              "task_arn.$": "$.TaskArn"
             },
             "ResultPath": "$.m5",
             "TimeoutSeconds": 900,
@@ -477,12 +564,38 @@
             "Type": "Choice",
             "Choices": [
               {
-                "Variable": "$.m5.exit_code",
-                "NumericEquals": 0,
+                "And": [
+                  {
+                    "Variable": "$.m5.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m5.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  },
+                  {
+                    "Variable": "$.m5.Containers[0].ExitCode",
+                    "NumericEquals": 0
+                  }
+                ],
                 "Next": "SessionDone"
+              },
+              {
+                "And": [
+                  {
+                    "Variable": "$.m5.Containers[0].ExitCode",
+                    "IsPresent": true
+                  },
+                  {
+                    "Variable": "$.m5.Containers[0].ExitCode",
+                    "IsNumeric": true
+                  }
+                ],
+                "Next": "M5ExitedNonZero"
               }
             ],
-            "Default": "M5ExitedNonZero"
+            "Default": "M5ResultMalformed",
+            "Comment": "Validates the stored ECS result in separate steps: a numeric ExitCode of 0 is the only success; any other number is a failed stage; a missing Containers/ExitCode or a non-numeric one is a malformed result. Nothing dereferences Containers[0].ExitCode before this Choice, so a bad result cannot raise States.Runtime."
           },
           "M5ExitedNonZero": {
             "Type": "Fail",
@@ -491,6 +604,26 @@
           },
           "SessionDone": {
             "Type": "Succeed"
+          },
+          "M2ResultMalformed": {
+            "Type": "Fail",
+            "Error": "StageResultMalformed",
+            "Cause": "M2 (extraction) finished without a numeric container ExitCode in the ECS result; see the task and state machine logs."
+          },
+          "M3ResultMalformed": {
+            "Type": "Fail",
+            "Error": "StageResultMalformed",
+            "Cause": "M3 (validation) finished without a numeric container ExitCode in the ECS result; see the task and state machine logs."
+          },
+          "M4ResultMalformed": {
+            "Type": "Fail",
+            "Error": "StageResultMalformed",
+            "Cause": "M4 (consolidation) finished without a numeric container ExitCode in the ECS result; see the task and state machine logs."
+          },
+          "M5ResultMalformed": {
+            "Type": "Fail",
+            "Error": "StageResultMalformed",
+            "Cause": "M5 (features) finished without a numeric container ExitCode in the ECS result; see the task and state machine logs."
           }
         }
       },
@@ -524,7 +657,7 @@
           "ContainerOverrides": [
             {
               "Name": "pipeline",
-              "Command": ["--stage", "m6"],
+              "Command": ["--stage", "m6", "--require-complete-history"],
               "Environment": [
                 {
                   "Name": "F1_PIPELINE_EXECUTION_ID",
@@ -534,10 +667,6 @@
             }
           ]
         }
-      },
-      "ResultSelector": {
-        "exit_code.$": "$.Containers[0].ExitCode",
-        "task_arn.$": "$.TaskArn"
       },
       "ResultPath": "$.m6",
       "TimeoutSeconds": 1800,
@@ -565,15 +694,57 @@
     },
     "CheckM6ExitCode": {
       "Type": "Choice",
-      "Comment": "The M6 CLI returns zero only for VALID or VALID_WITH_WARNINGS after all blocking checks pass.",
+      "Comment": "Validates the stored ECS result in separate steps: a numeric ExitCode of 0 is the only success; any other number is a failed stage; a missing Containers/ExitCode or a non-numeric one is a malformed result. Nothing dereferences Containers[0].ExitCode before this Choice, so a bad result cannot raise States.Runtime.",
       "Choices": [
         {
-          "Variable": "$.m6.exit_code",
-          "NumericEquals": 0,
+          "And": [
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "IsNumeric": true
+            },
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "NumericEquals": 0
+            }
+          ],
           "Next": "PipelineSucceeded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "IsNumeric": true
+            },
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "NumericEquals": 3
+            }
+          ],
+          "Next": "ModelingDeferredHistoryIncomplete"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.m6.Containers[0].ExitCode",
+              "IsNumeric": true
+            }
+          ],
+          "Next": "M6ExitedNonZero"
         }
       ],
-      "Default": "M6ExitedNonZero"
+      "Default": "M6ResultMalformed"
     },
     "M6ExitedNonZero": {
       "Type": "Pass",
@@ -603,6 +774,74 @@
       "Type": "Fail",
       "Error": "PipelineFailed",
       "Cause": "A pipeline stage failed; details were published to the alert topic."
+    },
+    "ResolveExtractionScope": {
+      "Type": "Choice",
+      "Comment": "Backfill phases: an execution may name the seasons it covers in availability.extraction_years (comma-separated, e.g. \"2023\"). Absent means the stack default (ExtractionYears parameter; empty = the configured seasons). Any other type is rejected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.availability.extraction_years",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.availability.extraction_years",
+              "IsString": true
+            }
+          ],
+          "Next": "UseRequestedYears"
+        },
+        {
+          "Variable": "$.availability.extraction_years",
+          "IsPresent": false,
+          "Next": "UseConfiguredYears"
+        }
+      ],
+      "Default": "InvalidExtractionScope"
+    },
+    "UseRequestedYears": {
+      "Type": "Pass",
+      "Parameters": {
+        "value.$": "$.availability.extraction_years"
+      },
+      "ResultPath": "$.scope",
+      "Next": "PlanSessions"
+    },
+    "UseConfiguredYears": {
+      "Type": "Pass",
+      "Result": {
+        "value": "${DefaultExtractionYears}"
+      },
+      "ResultPath": "$.scope",
+      "Next": "PlanSessions"
+    },
+    "InvalidExtractionScope": {
+      "Type": "Fail",
+      "Error": "InvalidExtractionScope",
+      "Cause": "availability.extraction_years must be a string such as \"2023\" or \"2023,2024\"."
+    },
+    "ModelingDeferredHistoryIncomplete": {
+      "Type": "Succeed",
+      "Comment": "M6 exited 3: stored evidence does not prove every modelling season complete, so it deliberately did not run. The phase succeeded; the backfill is NOT complete. Reasons are in the task logs (m6_deferred, backfill_history_status)."
+    },
+    "PlanResultMalformed": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "StageResultMalformed",
+        "Cause": "The plan task finished without a numeric container ExitCode in the ECS result; see the task and state machine logs."
+      },
+      "ResultPath": "$.error",
+      "Next": "NotifyPipelineFailure"
+    },
+    "M6ResultMalformed": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "StageResultMalformed",
+        "Cause": "M6 (modelling dataset) finished without a numeric container ExitCode in the ECS result; see the task and state machine logs."
+      },
+      "ResultPath": "$.error",
+      "Next": "NotifyPipelineFailure"
     }
   }
 }

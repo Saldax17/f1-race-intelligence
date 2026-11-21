@@ -9,12 +9,12 @@
 # credentials supplied by the IAM role of the task that runs the container.
 
 # Base pinned by digest (the multi-arch index of python:3.12-slim-bookworm,
-# Python 3.12.15), so a rebuild of the same commit gets the same base and an
+# Python 3.12.16), so a rebuild of the same commit gets the same base and an
 # immutable ECR tag always means the same image. The tag is kept for readers;
 # the digest decides. To take base-image security fixes, bump it on purpose:
 #   docker buildx imagetools inspect python:3.12-slim-bookworm   (Digest: line)
 # then rebuild and rerun pip check, --help, id and an M3-M5 smoke run.
-FROM python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

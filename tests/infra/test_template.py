@@ -11,7 +11,14 @@ import shlex
 
 import pytest
 
-REQUIRED_PARAMETERS = {"Environment", "ProjectName", "S3BucketName", "AvailabilitySchedule", "LogRetentionDays"}
+REQUIRED_PARAMETERS = {
+    "Environment",
+    "ProjectName",
+    "S3BucketName",
+    "AvailabilitySchedule",
+    "PipelineIntervalHours",
+    "LogRetentionDays",
+}
 REQUIRED_OUTPUTS = {
     "DataBucketName",
     "AvailabilityCheckerFunctionArn",
@@ -243,7 +250,25 @@ def test_bucket_is_versioned_encrypted_private_retained_and_tagged(template) -> 
     for rule in properties["LifecycleConfiguration"]["Rules"]:
         if "ExpirationInDays" in rule:
             assert rule["Prefix"] == "logs/"
-    assert {tag["Key"] for tag in properties["Tags"]} >= {"Project", "Environment"}
+    assert {tag["Key"]: tag["Value"] for tag in properties["Tags"]} == {
+        "Project": {"Ref": "ProjectName"},
+        "Environment": {"Ref": "Environment"},
+        "ManagedBy": "sam",
+        "DataClassification": "public-source-derived",
+    }
+
+
+def test_log_group_tags_are_operational_and_not_dataset_classification(template) -> None:
+    tags = {
+        tag["Key"]: tag["Value"]
+        for tag in template["Resources"]["PipelineAdmissionLogGroup"]["Properties"]["Tags"]
+    }
+    assert tags == {
+        "Project": {"Ref": "ProjectName"},
+        "Environment": {"Ref": "Environment"},
+        "ManagedBy": "sam",
+    }
+    assert "DataClassification" not in tags
 
 
 def test_image_repository_is_retained_immutable_and_scanned(template) -> None:
@@ -274,9 +299,11 @@ def test_roles_are_separated(template) -> None:
     principals = {name: role["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]["Principal"]["Service"] for name, role in roles.items()}
 
     assert principals["AvailabilityCheckerRole"] == "lambda.amazonaws.com"
+    assert principals["PipelineAdmissionRole"] == "lambda.amazonaws.com"
     assert principals["PipelineStateMachineRole"] == "states.amazonaws.com"
     assert principals["DataProcessingTaskRole"] == "ecs-tasks.amazonaws.com"
     assert template["Resources"]["AvailabilityCheckerFunction"]["Properties"]["Role"] == {"Fn::GetAtt": "AvailabilityCheckerRole.Arn"}
+    assert template["Resources"]["PipelineAdmissionFunction"]["Properties"]["Role"] == {"Fn::GetAtt": "PipelineAdmissionRole.Arn"}
     assert template["Resources"]["PipelineStateMachine"]["Properties"]["Role"] == {"Fn::GetAtt": "PipelineStateMachineRole.Arn"}
 
 
@@ -286,7 +313,7 @@ def test_lambda_role_uses_the_standard_trust_and_the_others_keep_source_account(
     for name, role in roles.items():
         statements = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
         assert len(statements) == 1 and statements[0]["Action"] == "sts:AssumeRole", name
-        if name in ("AvailabilityCheckerRole", "ForecastFunctionRole"):
+        if name in {"AvailabilityCheckerRole", "PipelineAdmissionRole", "ForecastFunctionRole"}:
             assert statements[0] == {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
         else:
             assert statements[0]["Condition"]["StringEquals"]["aws:SourceAccount"] == {"Ref": "AWS::AccountId"}, name
@@ -335,7 +362,7 @@ def _s3_writes(role):
     }
 
 
-def test_only_the_data_and_model_roles_touch_s3_and_none_can_delete(template) -> None:
+def test_s3_roles_are_scoped_and_none_can_delete(template) -> None:
     roles = resources_of(template, "AWS::IAM::Role")
     s3_roles = {
         name
@@ -344,7 +371,10 @@ def test_only_the_data_and_model_roles_touch_s3_and_none_can_delete(template) ->
         if any(action.startswith("s3:") for action in as_list(statement["Action"]))
     }
 
-    assert s3_roles == {"DataProcessingTaskRole", "PipelineStateMachineRole", "RaceModelTaskRole", "ForecastFunctionRole"}
+    assert s3_roles == {
+        "DataProcessingTaskRole", "PipelineStateMachineRole", "PipelineAdmissionRole",
+        "RaceModelTaskRole", "ForecastFunctionRole",
+    }
     for name in s3_roles:
         actions = {action for _, s in policy_statements(roles[name]) for action in as_list(s["Action"]) if action.startswith("s3:")}
         assert not {action for action in actions if "Delete" in action}, name
@@ -353,6 +383,23 @@ def test_only_the_data_and_model_roles_touch_s3_and_none_can_delete(template) ->
     # The state machine only reads the session plan the plan task wrote.
     states_s3 = [s for _, s in policy_statements(roles["PipelineStateMachineRole"]) if any(a.startswith("s3:") for a in as_list(s["Action"]))]
     assert states_s3 == [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": {"Fn::Sub": "${DataBucket.Arn}/manifests/plan/*"}}]
+    admission_s3 = [
+        statement
+        for _, statement in policy_statements(roles["PipelineAdmissionRole"])
+        if any(action.startswith("s3:") for action in as_list(statement["Action"]))
+    ]
+    assert len(admission_s3) == 2
+    list_bucket = next(statement for statement in admission_s3 if "s3:ListBucket" in as_list(statement["Action"]))
+    assert list_bucket["Resource"] == {"Fn::GetAtt": "DataBucket.Arn"}
+    assert list_bucket["Condition"]["StringEquals"]["s3:prefix"] == "manifests/control/pipeline-cadence.json"
+    cadence_object = next(statement for statement in admission_s3 if "s3:GetObject" in as_list(statement["Action"]))
+    assert set(as_list(cadence_object["Action"])) == {"s3:GetObject", "s3:PutObject"}
+    assert cadence_object["Resource"] == {"Fn::Sub": "${DataBucket.Arn}/manifests/control/pipeline-cadence.json"}
+
+    processing_statements = list(policy_statements(roles["DataProcessingTaskRole"]))
+    processing_objects = json.dumps(processing_statements)
+    assert "manifests/control/" not in processing_objects
+    assert "manifests/*" not in processing_objects
 
 
 def test_model_roles_write_only_their_own_prefixes(template) -> None:
@@ -381,20 +428,65 @@ def test_state_machine_is_standard_and_logs(template) -> None:
     assert properties["Logging"]["Destinations"]
 
 
-def test_availability_results_reach_the_state_machine_unmodified(template) -> None:
+def test_availability_results_reach_the_persistent_admission_gate(template) -> None:
     function = template["Resources"]["AvailabilityCheckerFunction"]["Properties"]
     rule = template["Resources"]["AvailabilityResultRule"]["Properties"]
+    admission = template["Resources"]["PipelineAdmissionFunction"]["Properties"]
 
     assert function["Environment"]["Variables"]["F1_COMPONENT"] == "availability-checker"
     assert function["EventInvokeConfig"]["DestinationConfig"]["OnSuccess"]["Type"] == "EventBridge"
     assert function["EventInvokeConfig"]["DestinationConfig"]["OnFailure"] == {"Type": "SNS", "Destination": {"Ref": "AlertTopic"}}
     assert rule["Targets"][0]["InputPath"] == "$.detail.responsePayload"
-    assert rule["Targets"][0]["Arn"] == {"Ref": "PipelineStateMachine"}
+    assert rule["Targets"][0]["Arn"] == {"Fn::GetAtt": "PipelineAdmissionFunction.Arn"}
+    assert admission["Environment"]["Variables"] == {
+        "DATA_BUCKET": {"Ref": "DataBucket"},
+        "PIPELINE_STATE_MACHINE_ARN": {"Ref": "PipelineStateMachine"},
+        "PIPELINE_ENABLED": {"Ref": "PipelineEnabled"},
+        "PIPELINE_INTERVAL_HOURS": {"Ref": "PipelineIntervalHours"},
+    }
+    assert admission["EventInvokeConfig"]["MaximumRetryAttempts"] == 2
+    assert admission["EventInvokeConfig"]["DestinationConfig"]["OnFailure"] == {
+        "Type": "SNS",
+        "Destination": {"Ref": "AlertTopic"},
+    }
+
+
+def test_pipeline_cadence_defaults_to_at_least_one_day_and_manual_starts_are_unlocked(template) -> None:
+    parameter = template["Parameters"]["PipelineIntervalHours"]
+    assert parameter["Default"] == 24
+    assert parameter["MinValue"] == 24
+    assert parameter["MaxValue"] >= 24
+    role_statements = list(policy_statements(template["Resources"]["PipelineAdmissionRole"]))
+    start = [statement for _, statement in role_statements if "states:StartExecution" in as_list(statement["Action"])]
+    assert len(start) == 1
+    assert start[0]["Resource"] == {"Ref": "PipelineStateMachine"}
+
+
+def test_pipeline_admission_alarm_and_failure_destination_publish_to_existing_topic(template) -> None:
+    alarm = template["Resources"]["PipelineAdmissionErrorsAlarm"]["Properties"]
+    assert alarm["Namespace"] == "AWS/Lambda"
+    assert alarm["MetricName"] == "Errors"
+    assert alarm["Dimensions"] == [{"Name": "FunctionName", "Value": {"Ref": "PipelineAdmissionFunction"}}]
+    assert alarm["AlarmActions"] == [{"Ref": "AlertTopic"}]
+    assert alarm["OKActions"] == [{"Ref": "AlertTopic"}]
+
+    sns_statements = [
+        statement
+        for _, statement in policy_statements(template["Resources"]["PipelineAdmissionRole"])
+        if "sns:Publish" in as_list(statement["Action"])
+    ]
+    assert sns_statements == [{"Effect": "Allow", "Action": "sns:Publish", "Resource": {"Ref": "AlertTopic"}}]
+    invoke_config = template["Resources"]["PipelineAdmissionFunction"]["Properties"]["EventInvokeConfig"]
+    assert invoke_config["DestinationConfig"]["OnFailure"] == {
+        "Type": "SNS",
+        "Destination": {"Ref": "AlertTopic"},
+    }
 
 
 @pytest.mark.parametrize("alarm", [
     "AvailabilityCheckerErrorsAlarm",
     "AvailabilityCheckerThrottlesAlarm",
+    "PipelineAdmissionErrorsAlarm",
     "PipelineExecutionsFailedAlarm",
     "OrchestrationRulesFailedInvocationsAlarm",
     "OpenF1UnavailableSustainedAlarm",
@@ -446,10 +538,11 @@ def test_dashboard_only_references_metrics_emitted_by_deployed_components(templa
         "Environment",
         "PipelineStateMachine",
         "AvailabilityCheckerFunction",
+        "PipelineAdmissionFunction",
     }
 
     body = json.loads(re.sub(r"\$\{[^}]+\}", "test-value", body_template))
-    assert len(body["widgets"]) == 7
+    assert len(body["widgets"]) == 8
     metric_names = {
         (metric[0], metric[1])
         for widget in body["widgets"]
@@ -467,6 +560,9 @@ def test_dashboard_only_references_metrics_emitted_by_deployed_components(templa
         ("AWS/Lambda", "Throttles"),
         ("AWS/Lambda", "Duration"),
         ("AWS/Events", "FailedInvocations"),
+        ("AWS/Lambda", "Invocations"),
+        ("AWS/Lambda", "Errors"),
+        ("AWS/Lambda", "Throttles"),
         ("test-value/test-value", "OpenF1Available"),
         ("test-value/test-value", "OpenF1LatencyMs"),
     }
@@ -729,7 +825,12 @@ def test_the_task_role_keeps_its_scoped_s3_access(template) -> None:
     assert statements["ListProjectBucket"] == {"Sid": "ListProjectBucket", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": {"Fn::GetAtt": "DataBucket.Arn"}}
     assert statements["ReadWritePipelineObjects"]["Action"] == ["s3:GetObject", "s3:PutObject"]
     prefixes = {item["Fn::Sub"].split("/", 1)[1] for item in statements["ReadWritePipelineObjects"]["Resource"]}
-    assert prefixes == {"raw/*", "validated/*", "consolidated/*", "features/*", "modeling/*", "manifests/*"}
+    assert prefixes == {
+        "raw/*", "validated/*", "consolidated/*", "features/*", "modeling/*",
+        "manifests/extraction/*", "manifests/incremental/*", "manifests/consolidation/*",
+        "manifests/features/*", "manifests/modeling/*", "manifests/plan/*",
+    }
+    assert "manifests/control/" not in json.dumps(statements)
 
 
 def test_the_state_machine_is_wired_to_the_task_resources(template) -> None:
@@ -739,3 +840,17 @@ def test_the_state_machine_is_wired_to_the_task_resources(template) -> None:
     assert substitutions["TaskDefinitionArn"] == {"Fn::If": ["HasPipelineImage", {"Ref": "PipelineTaskDefinition"}, "not-configured"]}
     assert (substitutions["SubnetA"], substitutions["SubnetB"]) == ({"Ref": "PipelineSubnetA"}, {"Ref": "PipelineSubnetB"})
     assert substitutions["TaskSecurityGroupId"] == {"Ref": "PipelineTaskSecurityGroup"}
+
+
+def test_extraction_years_parameter_feeds_the_state_machine_default(template) -> None:
+    import re
+
+    parameter = template["Parameters"]["ExtractionYears"]
+    assert parameter["Default"] == ""  # the default keeps today's behaviour
+    pattern = re.compile(parameter["AllowedPattern"])
+    for valid in ("", "2023", "2023,2024,2025"):
+        assert pattern.fullmatch(valid)
+    for invalid in ("23", "2023;2024", "2023,", " 2023", "abcd"):
+        assert not pattern.fullmatch(invalid)
+    substitutions = template["Resources"]["PipelineStateMachine"]["Properties"]["DefinitionSubstitutions"]
+    assert substitutions["DefaultExtractionYears"] == {"Ref": "ExtractionYears"}

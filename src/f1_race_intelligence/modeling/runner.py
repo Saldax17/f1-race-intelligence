@@ -33,7 +33,7 @@ import pandas as pd
 from f1_race_intelligence.config.settings import AppSettings, load_settings
 from f1_race_intelligence.features.selection import TARGET_COLUMN, TRACEABILITY
 from f1_race_intelligence.modeling import checks, preprocessing, split as split_module
-from f1_race_intelligence.modeling.fingerprints import ArtifactFile, sha256_hex
+from f1_race_intelligence.modeling.fingerprints import INPUT_FINGERPRINT_SCHEME, ArtifactFile, sha256_hex
 from f1_race_intelligence.modeling.loaders import FeatureDatasetLoader, feature_columns
 from f1_race_intelligence.modeling.models import ModelingReport, SplitArtifacts
 from f1_race_intelligence.modeling.report import save_report
@@ -44,6 +44,7 @@ from f1_race_intelligence.modeling.traceability import (
     new_run_id,
     source_revision,
 )
+from f1_race_intelligence.modeling.verification import verify_report
 from f1_race_intelligence.storage.backends.base import StorageError, join_key
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
@@ -91,6 +92,65 @@ class ModelingRunner:
         self._store = store or DataStore.from_settings(self._settings)
         self._output_store = output_store or self._store
         self._loader = loader or FeatureDatasetLoader(input_path=self._config.input_path, store=self._store)
+
+    def reusable_report(self) -> Optional[Dict[str, Any]]:
+        """Return the latest verified VALID M6 report if its inputs and runtime match."""
+        backend = self._output_store.backend
+        report_root = self._output_store.root(Layer.MODELING_REPORTS, self._config.report_path)
+        report_keys = [
+            key
+            for key in backend.list(report_root)
+            if key.endswith(".json") and key.rsplit("/", 1)[-1].startswith("modeling_report_")
+        ]
+        if not report_keys:
+            return None
+
+        report_key = report_keys[-1]
+        try:
+            report = backend.read_json(report_key)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            logger.warning("m6_reuse_rejected", extra={"reason": "latest report unreadable", "error": str(exc)})
+            return None
+        if not isinstance(report, dict):
+            return None
+        source = report.get("source")
+        if not isinstance(source, dict):
+            return None
+
+        dataset = self._loader.load(
+            years=list(self._config.years) or None,
+            session_keys=list(self._config.session_keys) or None,
+        )
+        current_commit, current_dirty = source_revision()
+        current_lock = dependency_lock_sha256()
+        checks = (
+            (report.get("schema_version") == 2, "unsupported report schema"),
+            (report.get("pipeline_name") == PIPELINE_NAME, "report belongs to a different pipeline"),
+            (report.get("pipeline_version") == PIPELINE_VERSION, "M6 pipeline version changed"),
+            (report.get("verdict") == RunVerdict.VALID.value, "latest result is not VALID"),
+            (source.get("input_fingerprint") == dataset.input_fingerprint, "input_fingerprint changed"),
+            (
+                source.get("input_fingerprint_scheme") == INPUT_FINGERPRINT_SCHEME,
+                "input fingerprint scheme changed",
+            ),
+            (report.get("config_fingerprint") == config_fingerprint(self._config_snapshot()), "M6 configuration changed"),
+            (current_commit is not None and report.get("source_commit") == current_commit, "source commit changed or unavailable"),
+            (current_dirty is False and report.get("source_dirty") is False, "source is dirty or cleanliness is unknown"),
+            (current_lock is not None and report.get("dependency_lock_sha256") == current_lock, "dependency lock changed or unavailable"),
+        )
+        rejection = next((reason for passed, reason in checks if not passed), None)
+        if rejection:
+            logger.info("m6_reuse_rejected", extra={"report": backend.uri(report_key), "reason": rejection})
+            return None
+
+        integrity = verify_report(backend.uri(report_key), storage=self._settings.storage)
+        if not integrity["ok"]:
+            logger.warning(
+                "m6_reuse_rejected",
+                extra={"report": backend.uri(report_key), "reason": "artifact integrity failed", "errors": integrity["errors"]},
+            )
+            return None
+        return report
 
     def run(self) -> ModelingReport:
         """Build the modelling datasets and return the run's report."""

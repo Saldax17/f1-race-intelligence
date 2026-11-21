@@ -14,9 +14,12 @@ infra/
 ├── template.yaml                          # stack SAM (CloudFormation + Transform)
 ├── samconfig.toml                         # parámetros por entorno (dev, prod); confirma changesets
 ├── functions/
-│   └── availability_checker/
-│       ├── app.py                         # Lambda: sondeo liviano a OpenF1 (solo stdlib)
-│       └── requirements.txt               # vacío a propósito
+│   ├── availability_checker/
+│   │   ├── app.py                         # Lambda: sondeo liviano a OpenF1 (solo stdlib)
+│   │   └── requirements.txt               # vacío a propósito
+│   └── pipeline_admission/
+│       ├── handler.py                     # Lambda: cadencia automática persistida en S3
+│       └── requirements.txt               # cierre transitivo fijado para escrituras condicionales
 └── statemachine/
     └── pipeline.asl.json                  # Step Functions STANDARD: disponibilidad → M2…M6
 tests/infra/                               # tests de la Lambda, la state machine y el template
@@ -36,7 +39,11 @@ tests/infra/                               # tests de la Lambda, la state machin
                      │                                 ▲        ▲
       rule availability-result                         │        │
       InputPath $.detail.responsePayload               │   CloudWatch alarms
-                     ▼                                 │   · errores de la Lambda
+                     ▼                                 │   · errores de las Lambdas
+      Lambda pipeline-admission ─ OnFailure (tras reintentos) ─► SNS critical-alerts
+      CAS persistente en S3 (manifests/control/)       ▲
+                     │ inicia como máximo 1 pipeline por intervalo
+                     ▼
       Step Functions STANDARD  <p>-<env>-pipeline      │   · ejecuciones fallidas/timeout/abortadas
         LoadContext                                    │   · FailedInvocations de las reglas
         IsAvailabilityResultValid ── no ─► Fail        │   · OpenF1 no disponible 6 h seguidas (EMF)
@@ -44,7 +51,7 @@ tests/infra/                               # tests de la Lambda, la state machin
         IsPipelineEnabled ── false ─► PipelineDisabled (Succeed)   ← valor por defecto
         CheckForConcurrentRun ── otra ejecución RUNNING ─► AnotherRunInProgress (Succeed)
         PlanSessions        Fargate --stage plan --plan-output s3://…/manifests/plan/<ejecución>.json
-        LoadPlan            s3:getObject del plan → $.plan.sessions
+        LoadPlan            s3:getObject del plan → $.plan.document.sessions
         PerSessionPipeline  Map, concurrencia 1, una tarea Fargate por etapa
           M2_Extraction → M3_Validation → M4_Consolidation → M5_Features
         M6_ModelingDataset  Fargate --stage m6 (global)
@@ -59,11 +66,12 @@ tests/infra/                               # tests de la Lambda, la state machin
   ECS cluster <p>-<env>-pipeline (sin Container Insights) · task definition Fargate x86_64 0,5 vCPU / 1 GB
 ```
 
-Por qué la Lambda no llama a Step Functions: se limita a responder. Su
-resultado viaja por el *destination* OnSuccess a un bus de EventBridge, y una
-regla arranca la state machine con ese JSON. Así la Lambda no tiene permisos
-para iniciar nada y cada chequeo queda registrado como ejecución, que decide
-explícitamente si termina (`available == false`) o sigue.
+El availability checker solo sondea OpenF1 a la frecuencia de
+`AvailabilitySchedule`; su resultado viaja por el *destination* OnSuccess a un
+bus de EventBridge. La regla invoca `pipeline-admission`, que reserva de forma
+atómica en S3 el intervalo automático antes de iniciar Step Functions. Los
+sondeos continúan aunque el pipeline esté limitado a una ejecución cada
+`PipelineIntervalHours`; un sondeo no consume por sí solo el intervalo.
 
 ## Recursos
 
@@ -71,13 +79,14 @@ explícitamente si termina (`available == false`) o sigue.
 |---|---|
 | S3 `DataBucket` | versionado; SSE-S3; bloqueo total de acceso público; `BucketOwnerEnforced`; política que niega tráfico sin TLS; lifecycle: aborta multipart a 7 d, expira versiones no actuales (parámetro, 90 d), limpia delete markers, `raw/` a Intelligent-Tiering a 30 d, `manifests/` a 90 d, `logs/` expira a 365 d; **nunca expira datasets actuales**; `DeletionPolicy: RetainExceptOnCreate`, `UpdateReplacePolicy: Retain` |
 | Lambda `openf1-availability` | Python 3.12 arm64, 128 MB, 15 s; sin VPC; sin reintentos asíncronos; destinos OnSuccess→bus, OnFailure→SNS; métricas EMF `OpenF1Available`, `OpenF1LatencyMs` |
+| Lambda `pipeline-admission` | Python 3.12 arm64, 128 MB, 15 s; invocada por la regla de resultados; reserva el intervalo automático en S3 con `If-None-Match`/`If-Match` y solo entonces llama `StartExecution` |
 | EventBridge | regla programada (parámetros `AvailabilitySchedule`, `AvailabilityScheduleState`); bus propio + regla de resultados |
 | Step Functions | STANDARD; logs `ALL` a CloudWatch; timeout global 12 h; plan y M2–M6 como `ecs:runTask.sync` (ver "Tareas Fargate") |
 | ECS | cluster sin Container Insights; task definition Fargate `X86_64`, 512 CPU / 1024 MB, usuario `10001:10001`, raíz de solo lectura, `capabilities.drop: [ALL]`, sin puertos ni volúmenes; solo si `PipelineImageUri` tiene valor |
 | Red | VPC dedicada `10.42.0.0/24`, 2 subredes públicas en 2 AZ, Internet Gateway, security group sin entrada y salida solo TCP 443 |
 | SNS | topic de alertas críticas; política para CloudWatch de la misma cuenta; suscripción e-mail opcional |
 | ECR | tags inmutables, escaneo al subir, expira sin tag a 7 d, conserva 30 imágenes; `RetainExceptOnCreate` |
-| CloudWatch | 3 log groups con retención `LogRetentionDays`; 4 alarmas base y una condicional; dashboard operativo |
+| CloudWatch | 4 log groups con retención `LogRetentionDays`; 5 alarmas base y una condicional; dashboard operativo |
 
 ## IAM (mínimo privilegio)
 
@@ -85,23 +94,32 @@ explícitamente si termina (`available == false`) o sigue.
 |---|---|---|
 | `…-availability-lambda` | `lambda.amazonaws.com` | escribir en su log group; `events:PutEvents` en el bus de orquestación; `sns:Publish` en el topic de alertas. **Sin S3.** |
 | `…-pipeline-states` | `states.amazonaws.com` | `sns:Publish` en el topic; APIs de entrega de logs (`Resource: "*"` exigido por AWS); `ecs:RunTask` solo de la familia `<p>-<env>-pipeline` y con condición `ecs:cluster`; `ecs:DescribeTasks`/`StopTask` solo sobre tareas del cluster; `events:PutRule/PutTargets/DescribeRule` solo sobre la regla administrada `StepFunctionsGetEventsForECSTaskRule`; `iam:PassRole` solo de los dos roles de tarea y con `iam:PassedToService=ecs-tasks.amazonaws.com`; `s3:GetObject` solo en `manifests/plan/*`; `states:ListExecutions` solo sobre esta state machine |
-| `…-availability-to-states` | `events.amazonaws.com` | `states:StartExecution` solo sobre la state machine |
-| `…-data-processing` (tarea) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` en `raw/ validated/ consolidated/ features/ modeling/ manifests/`. Sin `Delete*`, sin `models/`. |
+| `…-pipeline-admission` | `lambda.amazonaws.com` | escribir en su log group; `s3:ListBucket` condicionado exactamente a `manifests/control/pipeline-cadence.json`; `GetObject`/`PutObject` solo en ese objeto; `states:StartExecution` solo en esta state machine; `sns:Publish` solo en el topic |
+| `…-data-processing` (tarea) | `ecs-tasks.amazonaws.com` | `s3:ListBucket` del bucket; `GetObject`/`PutObject` solo en `raw/ validated/ consolidated/ features/ modeling/ manifests/{extraction,incremental,consolidation,features,modeling,plan}/`. No puede escribir `manifests/control/`. Sin `Delete*`, sin `models/`. |
 | `…-data-processing-exec` (ejecución) | `ecs-tasks.amazonaws.com` | pull de la imagen del repositorio ECR (`GetAuthorizationToken` requiere `*`); escribir en `/aws/ecs/…` |
 
-Todas las relaciones de confianza llevan `aws:SourceAccount`, salvo la del rol
-de la Lambda, que usa la confianza estándar de `lambda.amazonaws.com`: no se
-pudo verificar que Lambda admita esa condición en roles de ejecución, y si no la
-admite `CreateFunction` podría fallar. No hay políticas administradas de AWS ni
-`AdministratorAccess`.
+Las relaciones de confianza de Step Functions, EventBridge y ECS llevan
+`aws:SourceAccount`. Los dos roles Lambda usan la confianza estándar de
+`lambda.amazonaws.com`: no se pudo verificar que Lambda admita esa condición en
+roles de ejecución, y si no la admite `CreateFunction` podría fallar. No hay
+políticas administradas de AWS ni `AdministratorAccess`.
 
 `ecs:DescribeTasks`/`StopTask` se limitan a `task/<cluster>/*` aunque la
 política que genera AWS usa `"*"`; la condición `ecs:cluster` y ese ámbito se
 verifican en la primera ejecución controlada.
 
-`s3:ListBucket` no se restringe por `s3:prefix` a propósito: sin ese permiso,
-`HeadObject` sobre una clave inexistente devuelve 403 en vez de 404 y la
-idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
+`PipelineAdmissionRole` limita `s3:ListBucket` con `StringEquals` al prefijo
+exacto del objeto de cadencia, sin dar acceso de listado general. La Lambda no
+interpreta el error de `GetObject` para decidir si la reserva existe (sin
+`ListBucket` efectivo S3 responde 403 también para una clave ausente): llama a
+`ListObjectsV2` con `Prefix` igual a la clave y exige que un resultado tenga
+`Key` idéntica (una clave que solo comparte el prefijo no cuenta). Si existe, la
+lee con `GetObject`; si no, la crea con `PutObject` y `If-None-Match: *`. Un 403
+del listado se propaga y falla de forma cerrada. Con un 409/412 relee y resuelve
+con el CAS. Esta semántica está modelada en un Fake S3; el comportamiento real
+de IAM/S3 sigue sin verificarse en AWS. El rol Fargate conserva `ListBucket` del bucket porque sus chequeos `HeadObject`
+necesitan distinguir objetos ausentes; sus recursos de escritura excluyen
+explícitamente `manifests/control/`, por lo que no puede cambiar la reserva.
 
 ## Parámetros
 
@@ -112,6 +130,7 @@ idempotencia del pipeline ("¿ya existe este archivo?") dejaría de funcionar.
 | `S3BucketName` | vacío | vacío ⇒ `<project>-<env>-<account>-<region>` |
 | `AvailabilitySchedule` | `rate(15 minutes)` | solo valores ≥ 15 min; la alarma sostenida solo se crea para 15/30 min |
 | `AvailabilityScheduleState` | `DISABLED` | `samconfig.toml` también lo fija en `DISABLED` (dev y prod); activarlo es una decisión explícita |
+| `PipelineIntervalHours` | `24` | intervalo mínimo entre inicios automáticos tras una comprobación positiva; mínimo permitido 24 horas. No limita inicios manuales autorizados |
 | `PipelineEnabled` | `false` | `true` exige `PipelineImageUri` (regla `PipelineNeedsAnImage`); dejar en `false` hasta verificar una primera ejecución controlada |
 | `PipelineImageUri` | vacío | imagen batch **por digest** (`…/f1-race-intelligence-dev-pipeline@sha256:<64 hex>`); vacío ⇒ no se crea la task definition. No se guarda en `samconfig.toml` |
 | `LogRetentionDays` | `30` | valores válidos de CloudWatch |
@@ -137,8 +156,11 @@ componente, el estado `completed`, hora de inicio/fin y duración. Un sondeo
 HTTP no disponible sigue siendo una invocación completada: no es un error de
 ejecución Lambda.
 
-Los logs se escriben en los tres grupos descritos arriba y retienen el periodo
-configurado. No se registran secretos, credenciales ni contenido de artefactos.
+Los logs se escriben en los grupos descritos arriba y retienen el periodo
+configurado. `pipeline-admission` emite líneas JSON con
+`component=pipeline-admission`, `status`, `check_id`, `correlation_id` derivado
+por hash y `execution_name` cuando se conoce. No se registra el evento completo,
+ni secretos, credenciales o contenido de artefactos.
 Los IDs de ejecución, `run_id`, `input_fingerprint`, estados y rutas de
 artefactos son metadatos de diagnóstico, no sus contenidos. La ejecución M7 /
 MLflow y el prototipo M8 no forman parte de esta infraestructura desplegable;
@@ -148,8 +170,8 @@ no hay métricas AWS de entrenamiento, publicación ni HTTP 5xx del serving.
 |---|---|---|---|
 | `ExecutionsStarted`, `ExecutionsSucceeded`, `ExecutionsFailed`, `ExecutionsTimedOut`, `ExecutionsAborted` | `AWS/States`, `StateMachineArn=<pipeline>` | Count / Sum | Volumen y desenlace de ejecuciones |
 | `ExecutionTime` | `AWS/States`, `StateMachineArn=<pipeline>` | Milliseconds / Average, Maximum | Duración de las ejecuciones |
-| `Invocations`, `Errors`, `Throttles` | `AWS/Lambda`, `FunctionName=<availability checker>` | Count / Sum | Actividad, errores de ejecución y limitación de concurrencia |
-| `Duration` | `AWS/Lambda`, `FunctionName=<availability checker>` | Milliseconds / Average, Maximum | Duración de la Lambda |
+| `Invocations`, `Errors`, `Throttles` | `AWS/Lambda`, `FunctionName=<availability checker>` y `<pipeline admission>` | Count / Sum | Actividad, errores de ejecución y limitación de concurrencia |
+| `Duration` | `AWS/Lambda`, `FunctionName=<availability checker>` y `<pipeline admission>` | Milliseconds / Average, Maximum | Duración de cada Lambda |
 | `FailedInvocations` | `AWS/Events`, `RuleName`; para la regla de resultados también `EventBusName` | Count / Sum | Fallos al invocar la Lambda o iniciar Step Functions |
 | `OpenF1Available` | `f1-race-intelligence/<env>`, `Environment=<env>` | Count / Maximum (0 o 1) | Resultado del sondeo, emitido por EMF |
 | `OpenF1LatencyMs` | `f1-race-intelligence/<env>`, `Environment=<env>` | Milliseconds / Average | Latencia del sondeo, emitida por EMF |
@@ -161,7 +183,7 @@ group y no necesita `cloudwatch:PutMetricData`.
 
 ### Alarmas y dashboard
 
-Las cuatro alarmas base y, cuando la cadencia lo permite, la alarma sostenida
+Las cinco alarmas base y, cuando la cadencia lo permite, la alarma sostenida
 publican al mismo `AlertTopic`; las acciones `OKActions` también notifican la
 recuperación:
 
@@ -169,6 +191,7 @@ recuperación:
 |---|---|---|
 | `AvailabilityCheckerErrorsAlarm` | ≥1 error Lambda en 1 h; incluye timeout de función | `notBreaching` |
 | `AvailabilityCheckerThrottlesAlarm` | ≥1 throttling Lambda en 1 h | `notBreaching` |
+| `PipelineAdmissionErrorsAlarm` | ≥1 error de `pipeline-admission` en 1 h | `notBreaching` |
 | `PipelineExecutionsFailedAlarm` | ≥1 fallo, timeout o aborto de Step Functions en 1 h | `notBreaching` |
 | `OrchestrationRulesFailedInvocationsAlarm` | ≥1 fallo de invocación EventBridge en 1 h | `notBreaching` |
 | `OpenF1UnavailableSustainedAlarm` | Solo creada para sondeos cada 15/30 min; 6 de 6 periodos horarios con `OpenF1Available < 1` | `notBreaching` |
@@ -187,18 +210,154 @@ esté deshabilitada, aunque se cree la alarma para una cadencia compatible.
 
 `<ProjectName>-<Environment>-operations` contiene gráficos de resultados y
 duración de Step Functions, errores/throttling y duración Lambda, resultados y
-latencia OpenF1 y fallos EventBridge. Usa solo métricas y dimensiones presentes
-en este stack. No hay un panel ni alarma de serving hasta que exista una
-integración de despliegue que emita métricas HTTP compatibles.
+latencia OpenF1, fallos EventBridge y actividad/error/throttling de
+`pipeline-admission`. Usa solo métricas y dimensiones presentes en este stack.
+No hay un panel ni alarma de serving hasta que exista una integración de
+despliegue que emita métricas HTTP compatibles.
 
 El correo sigue siendo opcional. Crear `AlertEmailSubscription` con una
 dirección solo significa que se solicitó la suscripción: estará
 `PendingConfirmation` hasta que el destinatario acepte el correo de SNS. Solo
 un `SubscriptionArn` confirmado representa notificaciones efectivas. Con
 `AlertEmail` vacío, el topic y las alarmas existen, pero no hay destinatario.
-La Lambda también tiene destino `OnFailure` a SNS y Step Functions publica
-detalles en `NotifyPipelineFailure`; por tanto, un mismo fallo puede generar
-tanto la notificación directa como la de la alarma agregada.
+La invocación asíncrona de `pipeline-admission` envía a SNS solo después de
+agotar sus reintentos; la alarma `PipelineAdmissionErrorsAlarm` también publica
+una notificación agregada por errores en la hora. Un mismo fallo final puede
+generar ambos avisos: uno por invocación y otro por alarma, intencionalmente.
+La métrica `Errors` cuenta **cada intento fallido**, también los que un reintento
+resuelve después, así que un fallo transitorio puede disparar la alarma sin
+llegar a `OnFailure`; un fallo definitivo puede producir hasta tres avisos
+(`OnFailure`, ALARM y OK).
+Step Functions mantiene su propia notificación de fallo, independiente de
+estas dos rutas.
+
+### Reserva, reintentos y ejecución manual
+
+La escritura inicial del objeto usa `If-None-Match: *`; al vencer el intervalo
+se reemplaza con `If-Match` del ETag leído. El mismo `check_id` y el mismo
+payload reutilizan el `reserved_at` original y el nombre determinista de la
+ejecución. Si `StartExecution` falla antes de ser aceptado, el mismo evento
+puede volver a intentarlo sin mover la ventana. Si la respuesta es ambigua, el
+reintento usa el mismo nombre y `ExecutionAlreadyExists` se trata como inicio
+aceptado. Un nuevo `check_id` queda bloqueado durante `PipelineIntervalHours`,
+también si el pipeline posteriormente falla; no hay liberación automática.
+
+La reserva aplica solo a inicios automáticos desde la Lambda. Una persona o
+automatización autorizada puede iniciar manualmente la state machine mediante
+la consola de Step Functions o `aws stepfunctions start-execution`; esa
+autorización manual no está protegida por el CAS y no se probó contra AWS en
+esta validación local. La state machine sí conserva su chequeo de ejecución
+concurrente activa.
+
+## Planificación incremental e idempotencia M6 (R1)
+
+El plan usa los catálogos de meetings/sessions guardados cuando todavía son
+vigentes; los catálogos del año actual se refrescan después de 24 horas y
+`--refresh-catalogs` permite pedir un refresco explícito de metadatos. No se
+descargan datos de sesión al planificar. Cada sesión se incluye salvo que el
+estado persistido `manifests/incremental/config=<fingerprint>/year=<año>/session=<id>/state.json` (layout lake; en el layout local, bajo `<manifest_path>/incremental/`, dentro de la raíz del almacén y nunca en el directorio de trabajo)
+demuestre que M2–M5 finalizaron y que la configuración, los envelopes raw, los
+reportes de etapa y los Parquet consolidados/features siguen coincidiendo con
+sus hashes. Sidecars vinculan M3 con raw/M2, M4 con M3 y su salida, y M5 con
+M4 y su salida; `--stage m5` aislado después de un cambio raw no puede
+refrescar la completitud. Los HTTP 404 se aceptan como ausencia solo con una
+entrada M2 fallida, no reintentable y correspondiente a la sesión; el estado
+registra explícitamente esa ausencia. Perder o alterar la evidencia vuelve a
+incluir la sesión. El estado respeta la raíz del `DataStore` local o S3 y se
+separa por fingerprint de configuración. El plan guarda `sessions` para el Map de Step Functions y
+`decisions` con motivo de inclusión u omisión. Un artefacto ausente, ilegible,
+alterado o con procedencia no verificable fuerza reprocesamiento.
+
+Medición sintética local: planificar 30 sesiones completadas con 500 filas
+raw por sesión (1.312 MiB de raw en total) tardó 1.960 s y omitió las 30
+sesiones. La verificación recalcula hashes
+de envelopes raw, informes y Parquet en varios pasos (los Parquet y informes se
+leen más de una vez). Es una medición local ilustrativa con datos sintéticos
+diminutos: no demuestra el rendimiento sobre el histórico completo ni sobre
+S3/Fargate, y no permite fijar el timeout de 1800 s. El coste remoto debe medirse
+antes de depender del plan en producción.
+
+Esta verificación detecta cambios en los bytes de los datos ya almacenados,
+pero no puede detectar una corrección remota de OpenF1 sin volver a obtener el
+contenido. Para una sesión histórica, el refresco del catálogo solo detecta
+cambios de metadatos; para reevaluar contenido remoto se requiere una operación
+explícita de M2 con `--overwrite`. Los hashes SHA-256 no se sustituyen por ETags.
+
+M6 se reutiliza solo si el reporte más reciente es `VALID`, tiene el mismo
+`input_fingerprint` y huellas de configuración, código y dependencias, y
+`verify_report` confirma los ocho artefactos declarados. En cualquier duda se
+ejecuta M6 nuevamente. La reutilización conserva el `run_id` y fingerprint del
+reporte original; no crea un reporte falso para la nueva ejecución.
+
+La función `pipeline-admission` utiliza una escritura condicional sobre un único
+objeto S3 como compare-and-set: eventos concurrentes no pueden reservar el
+mismo intervalo, y el estado sobrevive a reinicios de Lambda. Una reserva se
+mantiene aunque Step Functions falle; por diseño, el siguiente inicio
+automático se permite al cumplirse el intervalo, no en cada reintento de
+disponibilidad. Una repetición del mismo evento/check ID conserva el timestamp
+original, puede reintentar un inicio que falló antes de ser aceptado y usa un
+nombre de ejecución determinista.
+Los inicios manuales autorizados a `states:StartExecution` evitan esa compuerta
+diaria y siguen sujetos a la comprobación de concurrencia de la state machine;
+el calendario permanece `DISABLED` por defecto.
+
+## Backfill histórico por fases (R2)
+
+La primera carga (2023–2025) no cabe en una sola ejecución (límite de 12 h de la
+state machine), así que se hace **una temporada por ejecución**.
+
+**Cómo se acota una fase.** El input de la ejecución es el resultado de
+disponibilidad; un inicio manual añade `extraction_years` (cadena, p. ej.
+`"2024"` o `"2023,2024"`):
+
+```
+{"available": true, "extraction_years": "2024"}
+```
+
+`ResolveExtractionScope` copia ese valor a `$.scope.value` (si falta, usa el
+parámetro de pila `ExtractionYears`, vacío por defecto = las temporadas de
+`configs/config.yaml`; cualquier valor que no sea una cadena termina en
+`InvalidExtractionScope` antes de lanzar ninguna tarea). `PlanSessions` lo recibe
+como `F1_EXTRACTION_YEARS` en el contenedor, y el plan solo lista esas
+temporadas. Las tareas M2–M5 reciben la sesión por línea de comando y no
+dependen de esa variable. `years` no forma parte de la huella de configuración
+del estado incremental, de modo que lo registrado por una fase lo ven las demás.
+
+**Reanudación e idempotencia.** Se apoya en R1: tras una fase fallida, repetir la
+misma ejecución solo planifica las sesiones sin evidencia verificada (las
+completas se omiten sin escribir nada); repetir una temporada completa no
+planifica ni escribe nada.
+
+**Compuerta de M6.** La tarea M6 se lanza siempre con `--require-complete-history`.
+Antes de modelar, `history_completeness` recorre cada temporada de
+`modeling.years` y comprueba, solo con evidencia almacenada, que su catálogo
+guardado lista al menos una sesión configurada y que **cada** sesión supera la
+verificación de R1 (raw con hash, manifiesto M2, informes M3–M5 y salidas, y
+configuración vigente). No hay ningún parámetro que la salte. Si falta algo, M6
+termina con código **3** sin escribir artefactos de modelado; la state machine
+va a `ModelingDeferredHistoryIncomplete` (ejecución *Succeeded*, sin alerta, y
+sin pasar por `PipelineSucceeded`) y el motivo queda en los logs de la tarea
+(`m6_deferred`, `backfill_history_status`, con las sesiones pendientes de cada
+temporada). Cuando las tres temporadas están completas, M6 se ejecuta sobre
+todo el dataset consolidado con sus guardas anti-leakage y su idempotencia
+habituales. Esto cambia el semáforo de una ejecución completa: un `Succeeded`
+en una fase intermedia **no** significa que el histórico esté completo.
+
+**Secuencia de una carga completa**
+
+1. Arrancar manualmente una ejecución con `{"available": true, "extraction_years": "2023"}`.
+2. Comprobar que termina en `ModelingDeferredHistoryIncomplete`; repetir con `"2024"`.
+3. Con `"2025"` el histórico queda completo y la misma ejecución termina en `PipelineSucceeded` tras ejecutar M6.
+4. Si una fase falla, lanzar de nuevo la misma temporada.
+
+**Límites de esta validación.** Las pruebas locales usan un cliente OpenF1
+simulado, tres temporadas sintéticas de dos sesiones y la CLI real; no miden
+duración, memoria ni coste. La duración de una temporada real (unas 22
+carreras × 4 tareas en serie, con arranque de Fargate por tarea) no está
+medida y debe confirmarse en la primera fase real antes de asumir que cabe en
+las 12 h. Que ECS acepte `F1_EXTRACTION_YEARS` con valor vacío en el override
+(el valor por defecto) no está verificado en AWS; el código lo trata como
+«sin override».
 
 ## Tareas Fargate (Fase 1B)
 
@@ -209,7 +368,7 @@ que ninguna tarea depende del disco de otra.
 
 | Estado | Comando | Lee | Escribe |
 |---|---|---|---|
-| `PlanSessions` | `--stage plan --plan-output s3://<bucket>/manifests/plan/<ejecución>.json` | OpenF1 (`meetings`, `sessions`) | `raw/…/endpoint=meetings|sessions/`, `manifests/extraction/`, el plan |
+| `PlanSessions` | `--stage plan --plan-output s3://<bucket>/manifests/plan/<ejecución>.json` | Catálogos guardados; OpenF1 solo si faltan o requieren refresco (`meetings`, `sessions`) | `raw/…/endpoint=meetings|sessions/`, `manifests/extraction/`, decisiones del plan |
 | `M2_Extraction` | `--stage m2 --year Y --meeting-key M --session-key S` | OpenF1 | `raw/year=Y/meeting=M/session=S/…`, `manifests/extraction/year=Y/session=S/` |
 | `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
 | `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
@@ -218,6 +377,20 @@ que ninguna tarea depende del disco de otra.
 
 Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
 generan esos comandos y los pasan por el parser real de la CLI.
+
+**Resultado de ECS y códigos de salida (R3).** Ningún estado desreferencia
+`Containers[0].ExitCode` al terminar la tarea: el resultado completo de
+`runTask.sync` se guarda en su `ResultPath` y un `Choice` lo valida con
+`IsPresent` + `IsNumeric` antes de comparar. Solo un `ExitCode` numérico igual a
+0 continúa (M6: `PipelineSucceeded`); otro número es `…ExitedNonZero`; un
+resultado sin `Containers`, con la lista vacía, sin `ExitCode`, nulo o no
+numérico es `…ResultMalformed` (`StageResultMalformed`). Ambos casos terminan en
+`NotifyPipelineFailure`. (Antes, un `ResultSelector` con esa ruta habría lanzado
+`States.Runtime`, que un `Catch` no captura, sin aviso.) El código 3 de M6 sigue
+siendo el único diferimiento controlado (`ModelingDeferredHistoryIncomplete`, sin
+alerta); en cualquier otra etapa, 3 es un fallo. Las simulaciones locales
+recorren estos caminos; cómo informa realmente ECS de un contenedor que no llegó
+a arrancar solo se verifica en AWS.
 
 **Endurecimiento**
 
@@ -231,6 +404,88 @@ generan esos comandos y los pasan por el parser real de la CLI.
 
 Estas medidas **mitigan** la explotación local; **no corrigen** los paquetes
 vulnerables de la imagen base Debian 12 (sin parche publicado en bookworm).
+
+**Hallazgos del escaneo de ECR (imagen `88514b4`)**
+
+*Procedencia.* Verificado el 2026-11-21: escaneo de ECR del digest
+`sha256:ad1d546424cdcf263020cd7813889f0c86b1aceccc2d501d49fbaa3803132799`
+(base `python:3.12-slim-bookworm` con el digest anterior): **17 HIGH, 28 MEDIUM y
+8 LOW**. El estado de parche procede del Debian Security Tracker (consultado el
+mismo día); la presencia de cada biblioteca, de los ejecutables y de las
+bibliotecas cargadas se comprobó dentro de la imagen. Sustituye a los 13
+hallazgos (7 HIGH) reportados en el ROADMAP (D2), que no eran verificables
+desde el repositorio.
+
+*Remediación.* Subir el digest de la base a
+`sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df`
+(Python 3.12.16, misma distribución Bookworm) actualiza `apt` a 2.6.2 y
+`openssl`/`libssl3` a `3.0.22-1~deb12u2`, y es el único cambio. No se usa
+`apt-get upgrade` (no sería reproducible) ni se migra a Trixie.
+
+*Resultado medido.* La imagen resultante (commit
+`3d3b4e685f3456f33c1bf9ed169f826dcef93083`, etiqueta `3d3b4e6`, digest
+`sha256:b4c0f5012acd02062d0bb236e99b4cd55ecc4545fe4054a35618ca0a80cd5fdf`) se
+publicó en ECR y su escaneo terminó `COMPLETE` el 2026-11-21. Comparado con el de
+`88514b4` (verificado en ECR, no estimado):
+
+| Severidad | `88514b4` | `3d3b4e6` |
+|---|---|---|
+| HIGH | 17 | **15** |
+| MEDIUM | 28 | **25** |
+| LOW | 8 | **6** |
+| Total | 53 | **46** |
+
+Desaparecieron **exactamente siete hallazgos** y **no apareció ninguno nuevo**:
+HIGH `apt` CVE-2026-109518 y `openssl` CVE-2026-84782; MEDIUM `openssl`
+CVE-2026-35189, CVE-2026-75805 y CVE-2026-75806; LOW `openssl` CVE-2026-54872 y
+CVE-2026-77696. Coincide con lo previsto a partir del Debian Security Tracker.
+
+*Resumen de los 17 HIGH de `88514b4`:* **2 con parche disponible** (ya aplicado
+en `3d3b4e6`) y **15 sin parche disponible en Bookworm**, que son los 15 HIGH que
+siguen abiertos en `3d3b4e6`: 3 mitigados por configuración verificada y 12 que
+requieren aceptación de riesgo. **Ninguno de los doce está aceptado todavía**:
+la aceptación formal debe registrarla el responsable humano.
+
+| CVE | Paquete (versión) | Estado en Debian | Tratamiento |
+|---|---|---|---|
+| CVE-2026-109518 | apt 2.6.1 | corregido: 2.6.2 (`bookworm-security`) | **Parche disponible**: lo aplica el nuevo digest |
+| CVE-2026-84782 | openssl 3.0.22-1~deb12u1 | corregido: `~deb12u2` (`bookworm-security`) | **Parche disponible**: lo aplica el nuevo digest |
+| CVE-2026-53613 | util-linux 2.38.1-5+deb12u3 | sin parche en Bookworm | **Mitigado por configuración verificada** |
+| CVE-2026-78410 | util-linux (igual) | sin parche en Bookworm | **Mitigado por configuración verificada** |
+| CVE-2026-84243 | glibc 2.36-9+deb12u14 | sin parche en Bookworm ni en Trixie | **Mitigado por configuración verificada** |
+| CVE-2026-53615 | util-linux (igual) | sin parche en Bookworm | **Requiere aceptación** |
+| CVE-2025-6020 | pam 1.5.2-6+deb12u2 | corregido solo en Trixie | **Requiere aceptación** |
+| CVE-2026-112314, -112320, -112321, -112322, -112323, -119079 | krb5 1.20.1-2+deb12u5 | sin corregir en ninguna versión de Debian | **Requieren aceptación** (6) |
+| CVE-2026-119373, -119374, -119379 | sqlite3 3.40.1-2+deb12u2 | sin parche en Bookworm ni en Trixie | **Requieren aceptación** (3) |
+| CVE-2026-85091 | zlib 1:1.2.13.dfsg-1 | corregido solo en Trixie | **Pendiente: evidencia incompleta**; requiere aceptación mientras tanto |
+
+*Mitigaciones de configuración (verificadas en la imagen y en la ejecución de la
+tarea).* CVE-2026-53613 y -78410 exigen un `mount` setuid con una entrada
+`fstab` de usuario: la imagen no tiene ningún fichero setuid/setgid (el build lo
+verifica), la tarea se ejecuta como UID 10001 con `capabilities.drop: ["ALL"]` y
+no monta nada. CVE-2026-84243 exige que un tercero fije `LANGUAGE`/`LANG` en el
+entorno del proceso y que este cruce un límite de confianza sin `AT_SECURE`: el
+entorno lo define la task definition (solo variables `F1_*`) y no hay ejecutables
+setuid ni servicios que acepten variables de entorno de clientes.
+
+*Riesgos que requieren aceptación (no son mitigaciones de configuración).* Para
+`krb5`, `sqlite3`, `pam` y CVE-2026-53615 hay **evidencia de alcance**, no
+mitigación: tras importar el paquete y sus dependencias de runtime no se cargan
+`libgssapi`/`libkrb5`, `libsqlite3`, `libpam`, `libmount` ni `libblkid`; el lock
+de runtime no incluye consumidores de sqlite, Kerberos ni PAM; no hay servicios
+(`sshd`, servidores krb5, cron). Siguen sin parche en Bookworm y la aceptación
+debe quedar registrada por el responsable humano. **zlib** (CVE-2026-85091) se
+mantiene como riesgo pendiente: el módulo `zlib` de Python no referencia ninguna
+función `gz*` (solo `deflate`/`inflate`), pero la comprobación no cubre código
+nativo que enlace `libz` por su cuenta, así que la evidencia no se considera
+completa.
+
+*Limitaciones.* La lista de bibliotecas cargadas sale de importar los módulos del
+proyecto, no de una traza exhaustiva de todas las rutas de ejecución. Los
+resultados de las etapas M3–M5 en la imagen se probaron con datos sintéticos; M2
+no se ha probado dentro de la imagen (requiere OpenF1). El escaneo de ECR es el
+escáner básico del servicio: informa de presencia y versión de paquetes, no del
+alcance de cada CVE.
 
 **Red y costes**
 
@@ -249,7 +504,10 @@ no se ha probado: se verifica en la primera ejecución controlada.
 2. Desplegar con `PipelineImageUri=<repositorio>@sha256:<digest>` (añadirlo a
    la lista completa de parámetros de "Alertas por correo"), manteniendo
    `PipelineEnabled=false`, y revisar el change set.
-3. Primera ejecución controlada **manual** de una sesión, comprobando en el
+3. Primera ejecución controlada **manual** de una sesión, iniciando la state
+   machine mediante `StartExecution` con un input de disponibilidad válido
+   (`{"available": true, ...}`); esta vía no consume ni espera el intervalo
+   automático. Comprobar en el
    historial: que un exit code ≠ 0 se detecta (la documentación no aclara si
    `runTask.sync` falla el estado o termina con éxito; la definición cubre
    ambos casos), el formato de `Containers[0].ExitCode` en la salida, la
@@ -387,6 +645,7 @@ if ([string]::IsNullOrWhiteSpace($env:ALERT_EMAIL) -or $env:ALERT_EMAIL -notmatc
                 "ParameterKey=Environment,ParameterValue=dev" `
                 "ParameterKey=AvailabilitySchedule,ParameterValue='rate(15 minutes)'" `
                 "ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED" `
+                "ParameterKey=PipelineIntervalHours,ParameterValue=24" `
                 "ParameterKey=PipelineEnabled,ParameterValue=false" `
                 "ParameterKey=LogRetentionDays,ParameterValue=30" `
                 "ParameterKey=AlertEmail,ParameterValue=$env:ALERT_EMAIL"
@@ -414,6 +673,7 @@ sam deploy --config-env dev --parameter-overrides \
   ParameterKey=Environment,ParameterValue=dev \
   'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"' \
   ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED \
+  ParameterKey=PipelineIntervalHours,ParameterValue=24 \
   ParameterKey=PipelineEnabled,ParameterValue=false \
   ParameterKey=LogRetentionDays,ParameterValue=30 \
   "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}"
@@ -505,7 +765,19 @@ digest** (el que devuelve `docker push`), nunca por tag.
 : "${PIPELINE_IMAGE:?Define PIPELINE_IMAGE=<repositorio>@sha256:<digest> de la imagen batch}"
 : "${FORECAST_IMAGE:?Define FORECAST_IMAGE=<repositorio>@sha256:<digest> de la imagen de pronóstico}"
 cd infra && sam build
-sam deploy --config-env dev --parameter-overrides   ParameterKey=ProjectName,ParameterValue=f1-race-intelligence   ParameterKey=Environment,ParameterValue=dev   'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"'   ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED   ParameterKey=PipelineEnabled,ParameterValue=false   ParameterKey=LogRetentionDays,ParameterValue=30   "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}"   "ParameterKey=PipelineImageUri,ParameterValue=${PIPELINE_IMAGE}"   "ParameterKey=ForecastImageUri,ParameterValue=${FORECAST_IMAGE}"   ParameterKey=ModelScheduleState,ParameterValue=DISABLED   ParameterKey=LiveForecastScheduleState,ParameterValue=DISABLED
+sam deploy --config-env dev --parameter-overrides \
+  ParameterKey=ProjectName,ParameterValue=f1-race-intelligence \
+  ParameterKey=Environment,ParameterValue=dev \
+  'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"' \
+  ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED \
+  ParameterKey=PipelineIntervalHours,ParameterValue=24 \
+  ParameterKey=PipelineEnabled,ParameterValue=false \
+  ParameterKey=LogRetentionDays,ParameterValue=30 \
+  "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}" \
+  "ParameterKey=PipelineImageUri,ParameterValue=${PIPELINE_IMAGE}" \
+  "ParameterKey=ForecastImageUri,ParameterValue=${FORECAST_IMAGE}" \
+  ParameterKey=ModelScheduleState,ParameterValue=DISABLED \
+  ParameterKey=LiveForecastScheduleState,ParameterValue=DISABLED
 ```
 
 `PipelineEnabled=false` sigue apagando M2-M6: el modelo corre con su propia
@@ -559,8 +831,9 @@ que el reintento no choque con sus nombres fijos.
 ## Riesgos conocidos
 
 - El calendario está desactivado por defecto. Si se activa con el chequeo cada
-  15 min y `PipelineEnabled=false`, cada chequeo crea una ejecución STANDARD
-  (~96/día, pocas transiciones): coste bajo pero no cero.
+  15 min y `PipelineEnabled=false`, cada chequeo invoca `pipeline-admission`,
+  pero no inicia Step Functions. Con el pipeline habilitado, el intervalo S3
+  permite como máximo un inicio automático por periodo configurado.
 - Con `AlertEmail` vacío, o con la suscripción sin confirmar, las alarmas y los
   fallos de la Lambda no llegan a nadie.
 - La Lambda sale a internet sin VPC. Si más adelante se mete en una VPC hará

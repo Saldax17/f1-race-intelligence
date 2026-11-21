@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -38,6 +38,7 @@ from f1_race_intelligence.config.settings import AppSettings, load_settings
 from f1_race_intelligence.ingestion.exceptions import OpenF1Error
 from f1_race_intelligence.ingestion.openf1 import F1Client
 from f1_race_intelligence.pipelines.manifest import ExecutionManifest, ExtractionStatus, ManifestEntry
+from f1_race_intelligence.pipelines.incremental import session_reuse_decision
 from f1_race_intelligence.scope import SessionScope
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.raw_catalog import RawDataCatalog, RawFileError
@@ -49,6 +50,7 @@ logger = get_logger(__name__)
 
 PIPELINE_NAME = "historical_extraction"
 PIPELINE_VERSION = "1.0.0"
+CATALOG_REFRESH_MAX_AGE = timedelta(hours=24)
 
 # Errors that mean "this one unit of work failed" rather than "the run is
 # broken". ValueError covers F1Client's own guards against unbounded
@@ -216,6 +218,7 @@ class HistoricalExtractionPipeline:
         self._manifest_root = self._store.root(Layer.EXTRACTION_MANIFESTS, self._config.manifest_path)
         self._owns_client = client is None
         self._client = client or F1Client(settings=self._settings)
+        self.plan_decisions: List[Dict[str, Any]] = []
 
         unknown = [name for name in self._config.endpoints if name not in ENDPOINT_PLANNERS]
         if unknown:
@@ -330,17 +333,23 @@ class HistoricalExtractionPipeline:
         self._process_session(year, meeting_key, session, manifest)
         return self._finish(manifest, scope=resolved)
 
-    def plan(self, years: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:
+    def plan(
+        self,
+        years: Optional[Sequence[int]] = None,
+        *,
+        refresh_catalogs: bool = False,
+    ) -> List[Dict[str, Any]]:
         """List the sessions a run would extract, one work unit per session.
 
-        Discovery is the only thing downloaded: the meetings and sessions
-        catalogues, which are persisted (and reused on a re-run) like any
-        other raw data, so the session jobs that follow need no discovery
-        calls of their own. A manifest of the discovery is written too.
+        Existing meetings and sessions catalogues are reused. Pass
+        ``refresh_catalogs=True`` only when upstream metadata must be refreshed;
+        this requests only the meetings/sessions catalogues, not session data.
+        A session is included unless its M2-M5 completion state and all
+        referenced artifacts and reports verify against their saved hashes.
 
         Returns:
-            ``[{"year": …, "meeting_key": …, "session_key": …, "session_name": …}, …]``
-            in a stable order.
+            Included sessions in a stable order. Each has a ``process_reason``;
+            :attr:`plan_decisions` also records omitted sessions and why.
         """
         years = list(years) if years is not None else list(self._config.years)
         manifest = ExecutionManifest(
@@ -350,14 +359,44 @@ class HistoricalExtractionPipeline:
         )
 
         units: List[Dict[str, Any]] = []
+        decisions: List[Dict[str, Any]] = []
         for year in years:
-            for meeting in self.discover_meetings(year, manifest):
+            refresh_year = refresh_catalogs or (
+                year == datetime.now(timezone.utc).year
+                and self._catalog_is_stale("meetings", {"year": year})
+            )
+            for meeting in self.discover_meetings(year, manifest, refresh=refresh_year):
                 meeting_key = meeting.get("meeting_key")
                 if meeting_key is None:
                     continue
                 manifest.record_meeting(meeting_key)
-                for session in self.filter_sessions(self.discover_sessions(year, meeting_key, manifest)):
+                session_parameters = {"year": year, "meeting_key": meeting_key}
+                refresh_sessions = refresh_catalogs or (
+                    year == datetime.now(timezone.utc).year
+                    and self._catalog_is_stale("sessions", session_parameters)
+                )
+                for session in self.filter_sessions(
+                    self.discover_sessions(year, meeting_key, manifest, refresh=refresh_sessions)
+                ):
                     if session.get("session_key") is None:
+                        continue
+                    scope = SessionScope(
+                        year=year,
+                        meeting_key=meeting_key,
+                        session_key=session["session_key"],
+                    )
+                    reusable, reason = session_reuse_decision(self._store, self._settings, scope)
+                    decision = {
+                        "year": year,
+                        "meeting_key": meeting_key,
+                        "session_key": session["session_key"],
+                        "session_name": session.get("session_name"),
+                        "decision": "omit" if reusable else "include",
+                        "reason": "verified_existing_artifacts" if reusable else reason,
+                    }
+                    decisions.append(decision)
+                    if reusable:
+                        logger.info("session_plan_omitted", extra=decision)
                         continue
                     units.append(
                         {
@@ -365,12 +404,62 @@ class HistoricalExtractionPipeline:
                             "meeting_key": meeting_key,
                             "session_key": session["session_key"],
                             "session_name": session.get("session_name"),
+                            "process_reason": reason,
                         }
                     )
 
+        self.plan_decisions = decisions
+        manifest.config["session_decisions"] = decisions
         self._finish(manifest)
-        logger.info("pipeline_plan", extra={"pipeline": PIPELINE_NAME, "years": years, "work_units": len(units)})
+        logger.info(
+            "pipeline_plan",
+            extra={"pipeline": PIPELINE_NAME, "years": years, "work_units": len(units), "omitted": len(decisions) - len(units)},
+        )
         return units
+
+    def cached_work_units(self, year: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Sessions of one season from the stored catalogues only; never calls the client.
+
+        Returns ``(units, None)`` or ``([], reason)`` when a catalogue is missing,
+        unreadable or lists no configured session, so callers cannot mistake an
+        unknown season for an empty one.
+        """
+        def load(endpoint: str, parameters: Mapping[str, Any], file_name: str) -> List[Mapping[str, Any]]:
+            key = self._storage.key_for(endpoint, parameters, file_name=file_name)
+            payload = self._store.backend.read_json(key)
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                raise ValueError(f"{key}: catalogue envelope has no data list")
+            return data
+
+        units: List[Dict[str, Any]] = []
+        try:
+            meetings = _sorted_by(load("meetings", {"year": year}, "meetings.json"), "meeting_key")
+            for meeting in meetings:
+                meeting_key = meeting.get("meeting_key")
+                if meeting_key is None:
+                    continue
+                sessions = load("sessions", {"year": year, "meeting_key": meeting_key}, "sessions.json")
+                for session in self.filter_sessions(_sorted_by(sessions, "session_key")):
+                    if session.get("session_key") is not None:
+                        units.append({"year": year, "meeting_key": meeting_key, "session_key": session["session_key"]})
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return [], f"stored catalogue unavailable: {exc}"
+        if not units:
+            return [], "stored catalogue lists no configured session"
+        return units, None
+
+    def _catalog_is_stale(self, endpoint: str, parameters: Mapping[str, Any]) -> bool:
+        file_name = "meetings.json" if endpoint == "meetings" else "sessions.json"
+        key = self._storage.key_for(endpoint, parameters, file_name=file_name)
+        try:
+            payload = self._store.backend.read_json(key)
+            retrieved_at = datetime.fromisoformat(payload["retrieved_at"])
+            if retrieved_at.tzinfo is None:
+                retrieved_at = retrieved_at.replace(tzinfo=timezone.utc)
+        except (OSError, ValueError, KeyError, TypeError):
+            return True
+        return datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc) > CATALOG_REFRESH_MAX_AGE
 
     def _finish(self, manifest: ExecutionManifest, scope: Optional[SessionScope] = None) -> ExecutionManifest:
         """Close the manifest, store it, and log the run summary."""
@@ -483,7 +572,13 @@ class HistoricalExtractionPipeline:
 
     # -- discovery --------------------------------------------------------
 
-    def discover_meetings(self, year: int, manifest: ExecutionManifest) -> List[Mapping[str, Any]]:
+    def discover_meetings(
+        self,
+        year: int,
+        manifest: ExecutionManifest,
+        *,
+        refresh: bool = False,
+    ) -> List[Mapping[str, Any]]:
         """Return the meetings of a season, sorted by ``meeting_key``.
 
         The response is persisted like any other raw data, so a re-run can
@@ -496,6 +591,7 @@ class HistoricalExtractionPipeline:
             fetch=partial(self._client.get_meetings, year=year),
             manifest=manifest,
             load_existing=True,
+            force_refresh=refresh,
         )
         return _sorted_by(result.data, "meeting_key")
 
@@ -504,6 +600,8 @@ class HistoricalExtractionPipeline:
         year: int,
         meeting_key: int,
         manifest: ExecutionManifest,
+        *,
+        refresh: bool = False,
     ) -> List[Mapping[str, Any]]:
         """Return every session of a meeting, sorted by ``session_key``."""
         result = self._process_unit(
@@ -513,6 +611,7 @@ class HistoricalExtractionPipeline:
             fetch=partial(self._client.get_sessions, year=year, meeting_key=meeting_key),
             manifest=manifest,
             load_existing=True,
+            force_refresh=refresh,
         )
         return _sorted_by(result.data, "session_key")
 
@@ -574,6 +673,7 @@ class HistoricalExtractionPipeline:
         fetch: Callable[[], Any],
         manifest: ExecutionManifest,
         load_existing: bool = False,
+        force_refresh: bool = False,
     ) -> _UnitResult:
         """Fetch-and-save one raw file, unless it is already there.
 
@@ -589,7 +689,9 @@ class HistoricalExtractionPipeline:
         path = self._storage.uri(endpoint, parameters, file_name=file_name)
         context = {"endpoint": endpoint, **_clean(parameters), "path": path}
 
-        if not self._config.overwrite and self._storage.exists(endpoint, parameters, file_name=file_name):
+        if not (self._config.overwrite or force_refresh) and self._storage.exists(
+            endpoint, parameters, file_name=file_name
+        ):
             data, readable = self._read_existing(endpoint, parameters, file_name, path, load_existing)
             if readable:
                 logger.info("raw_file_skipped", extra={**context, "status": ExtractionStatus.SKIPPED.value})
