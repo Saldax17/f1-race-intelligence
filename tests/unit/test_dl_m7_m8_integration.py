@@ -57,6 +57,13 @@ MLP_SETTINGS = {
     "batch_size": 8,
     "max_epochs": 30,
     "early_stopping_patience": 5,
+    # PR #25 refinements must not break the M7 -> package -> M8 contract
+    "lr_scheduler": "reduce_on_plateau",
+    "lr_scheduler_factor": 0.5,
+    "lr_scheduler_patience": 2,
+    "compute_permutation_importance": True,
+    "permutation_importance_repeats": 3,
+    "permutation_importance_top_k": 5,
 }
 REQUIRED_PACKAGE_FILES = {
     "data_provenance.json",
@@ -409,3 +416,64 @@ def test_m8_rejects_invalid_records_for_the_mlp_with_422(mlp_runs, tmp_path, no_
 
     assert response.status_code == 422
     assert empty.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# PR #25 refinements (PFI + LR scheduler + generalization) keep the contract
+# --------------------------------------------------------------------------- #
+
+
+def _assert_refinement_sections(report: Dict[str, Any]) -> None:
+    interpretability = report["interpretability"]
+    assert interpretability["method"] == "permutation_feature_importance"
+    assert interpretability["split"] == "validation"
+    top = interpretability.get("top_features", interpretability.get("importances"))
+    assert isinstance(top, list) and 0 < len(top) <= MLP_SETTINGS["permutation_importance_top_k"]
+    assert interpretability["collinearity_note"]
+    assert report["generalization_diagnosis"]["evaluated_splits"] == ["train", "validation"]
+    assert report["generalization_diagnosis"]["status"] in {
+        "underfitting",
+        "overfitting_risk",
+        "balanced",
+        "insufficient_metrics",
+    }
+    assert report["config"]["mlp"]["lr_scheduler"] == "reduce_on_plateau"
+    assert np.isfinite(report["mlp_training"]["final_learning_rate"])
+
+
+@pytest.mark.parametrize("backend_kind", ["local", "s3"])
+def test_refined_mlp_is_published_and_served_with_pfi_scheduler_and_diagnosis(
+    mlp_runs, tmp_path, no_refit, backend_kind
+) -> None:
+    runs = mlp_runs
+    result = runs.first
+    artifacts = {item.path for item in MlflowClient().list_artifacts(result.run_id)}
+    assert {"permutation_importance.json", "training_history.json", "training_report.json"} <= artifacts
+    assert MlflowClient().get_metric_history(result.run_id, "train.mlp.lr")
+    _assert_refinement_sections(json.loads(Path(result.report_path).read_text(encoding="utf-8")))
+
+    if backend_kind == "local":
+        backend = LocalStorageBackend(tmp_path / "store")
+    else:
+        backend = S3StorageBackend("dl-refined-package-test", client=FakeS3Client())
+    package = publish_model(result.model_uri, backend)
+    assert REQUIRED_PACKAGE_FILES <= set(package.manifest["files"])
+    packaged_report = json.loads(package.artifacts["training_report.json"].decode("utf-8"))
+    _assert_refinement_sections(packaged_report)
+    assert packaged_report["registered_model"]["uri"] == result.model_uri
+    assert packaged_report["registered_model"]["version"] == result.model_version
+    assert read_model_package(backend, package.prefix).manifest_sha256 == package.manifest_sha256
+
+    service = PredictionService.load_published_package(
+        backend=backend, prefix=package.prefix, loader=MlflowPyfuncLoader()
+    )
+    rows, records = _test_rows_and_records(runs)
+    with TestClient(create_app(lambda: service)) as client:
+        response = client.post("/predict", json={"records": records})
+
+    assert response.status_code == 200
+    values = [item["value"] for item in response.json()["predictions"]]
+    _assert_seconds_scale(
+        values, rows["next_lap_time"].astype(float).tolist(), packaged_report["mlp_training"]["y_mean"]
+    )
+    np.testing.assert_allclose(values, _expected_seconds(runs, len(records)), rtol=1e-5, atol=1e-5)

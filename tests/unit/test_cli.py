@@ -588,3 +588,168 @@ def test_m7_passes_model_selection_to_the_training_runner(
         {"m6_report_path": str(report), "model_type": expected_model_type, "effective_name": expected_name}
     ]
     assert f'"model_name": "{expected_name}"' in capsys.readouterr().err
+
+
+# -- M7 controlled MLP comparison (--stage m7-compare) ----------------------------
+
+
+def test_m7_compare_is_a_known_stage() -> None:
+    assert "m7-compare" in cli.STAGES
+    assert cli.parse_stages("m7-compare") == ["m7-compare"]
+    assert cli.parse_stages(" M7-Compare ") == ["m7-compare"]
+
+
+def test_m7_compare_must_run_alone(config_file, capsys) -> None:
+    code = cli.main(["--stage", "m6,m7-compare", "--m6-report", "m6-report.json", "--config", str(config_file)])
+
+    assert code == cli.EXIT_USAGE
+    assert "m7-compare must run alone" in capsys.readouterr().err
+
+
+def test_m7_compare_requires_an_m6_report(config_file, capsys) -> None:
+    assert cli.main(["--stage", "m7-compare", "--config", str(config_file)]) == cli.EXIT_USAGE
+    assert "m7-compare requires --m6-report" in capsys.readouterr().err
+
+
+def test_m7_compare_rejects_s3_storage(config_file, capsys) -> None:
+    code = cli.main(
+        [
+            "--stage",
+            "m7-compare",
+            "--m6-report",
+            "m6-report.json",
+            "--storage-backend",
+            "s3",
+            "--bucket",
+            "not-used",
+            "--config",
+            str(config_file),
+        ]
+    )
+
+    assert code == cli.EXIT_USAGE
+    assert "m7-compare supports local storage only" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--input-storage", "--output-storage"])
+def test_m7_compare_rejects_storage_uri_overrides(config_file, tmp_path, capsys, flag) -> None:
+    code = cli.main(
+        [
+            "--stage",
+            "m7-compare",
+            "--m6-report",
+            "m6-report.json",
+            flag,
+            str(tmp_path / "elsewhere"),
+            "--config",
+            str(config_file),
+        ]
+    )
+
+    assert code == cli.EXIT_USAGE
+    assert "m7-compare does not accept storage URI overrides" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("stage", "extra"),
+    [
+        ("m7", ["--m6-report", "m6-report.json"]),
+        ("m6", []),
+        ("verify-m6", ["--report", "r.json"]),
+    ],
+)
+def test_register_best_is_rejected_outside_m7_compare(config_file, capsys, stage, extra) -> None:
+    code = cli.main(["--stage", stage, *extra, "--register-best", "--config", str(config_file)])
+
+    assert code == cli.EXIT_USAGE
+    assert "--register-best is only valid with --stage m7-compare" in capsys.readouterr().err
+
+
+def test_register_best_defaults_to_false_and_adds_no_overrides() -> None:
+    args = cli.build_parser().parse_args(["--stage", "m7-compare", "--m6-report", "report.json"])
+
+    assert args.register_best is False
+    assert "training" not in cli.settings_overrides(args)
+
+
+def test_m7_compare_accepts_registered_model_name_and_register_best(
+    config_file, tmp_path, monkeypatch, capsys
+) -> None:
+    from f1_race_intelligence.modeling import experiments as experiments_module
+
+    calls = []
+
+    class FakeComparisonRunner:
+        def __init__(self, settings, *, m6_report_path=None, register_best=False):
+            calls.append(
+                {
+                    "m6_report_path": m6_report_path,
+                    "register_best": register_best,
+                    "effective_name": settings.training.effective_registered_model_name("mlp"),
+                }
+            )
+
+        def run(self):
+            return experiments_module.MLPComparisonResult(
+                comparison_id="cmp-test",
+                m6_run_id="m6-run",
+                input_fingerprint="sha256:" + "0" * 64,
+                selection_metric="validation.mlp.mae",
+                best_experiment="mlp_default",
+                candidates=[],
+                registered_winner=None,
+                json_report_path=str(tmp_path / "cmp.json"),
+                markdown_report_path=str(tmp_path / "cmp.md"),
+            )
+
+    monkeypatch.setattr(experiments_module, "MLPComparisonRunner", FakeComparisonRunner)
+    report = tmp_path / "m6-report.json"
+    report.write_text("{}", encoding="utf-8")
+
+    code = cli.main(
+        [
+            "--stage",
+            "m7-compare",
+            "--m6-report",
+            str(report),
+            "--register-best",
+            "--registered-model-name",
+            "cli-compare-mlp",
+            "--config",
+            str(config_file),
+        ]
+    )
+
+    assert code == cli.EXIT_OK
+    assert calls == [{"m6_report_path": str(report), "register_best": True, "effective_name": "cli-compare-mlp"}]
+    assert '"best_experiment": "mlp_default"' in capsys.readouterr().err
+
+
+def test_m7_compare_without_register_best_passes_false(config_file, tmp_path, monkeypatch) -> None:
+    from f1_race_intelligence.modeling import experiments as experiments_module
+
+    seen = []
+
+    class FakeComparisonRunner:
+        def __init__(self, settings, *, m6_report_path=None, register_best=False):
+            seen.append(register_best)
+
+        def run(self):
+            return experiments_module.MLPComparisonResult(
+                comparison_id="cmp-test",
+                m6_run_id="m6-run",
+                input_fingerprint="sha256:" + "0" * 64,
+                selection_metric="validation.mlp.mae",
+                best_experiment="mlp_small",
+                candidates=[],
+                registered_winner=None,
+                json_report_path=str(tmp_path / "cmp.json"),
+                markdown_report_path=str(tmp_path / "cmp.md"),
+            )
+
+    monkeypatch.setattr(experiments_module, "MLPComparisonRunner", FakeComparisonRunner)
+    report = tmp_path / "m6-report.json"
+    report.write_text("{}", encoding="utf-8")
+
+    assert cli.main(["--stage", "m7-compare", "--m6-report", str(report), "--config", str(config_file)]) == cli.EXIT_OK
+    assert seen == [False]

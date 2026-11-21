@@ -238,6 +238,17 @@ def test_integral_dl_flow(config, tmp_path, monkeypatch, capsys):
     comparison = {split: {family: round(values["mae"], 3) for family, values in training["metrics"][split].items()} for split in ("train", "validation", "test")}
     say("DL M7 MAE (s) mlp vs baselines", comparison)
     assert all(set(row) == {"mlp", "linear_regression", "reference_mean"} for row in comparison.values())
+    # interpretability (permutation feature importance on validation only) and train-vs-validation diagnosis
+    interpretability = training["interpretability"]
+    ranked = interpretability.get("top_features", interpretability.get("importances")) or []
+    top3 = [(entry["feature"], round(entry["mae_increase_mean"], 4)) for entry in ranked[:3]]
+    diagnosis = training["generalization_diagnosis"]
+    say("DL M7 PFI top-3 (validation, MAE increase s)", top3)
+    say("DL M7 generalization", {"status": diagnosis["status"], "evaluated_splits": diagnosis["evaluated_splits"], "val_to_train_mae_ratio": diagnosis["val_to_train_mae_ratio"]})
+    assert interpretability["split"] == "validation" and interpretability["collinearity_note"]
+    assert 0 < len(top3) <= 3 and all(name in m6_report["preprocessing"]["output_feature_names"] for name, _ in top3)
+    assert diagnosis["evaluated_splits"] == ["train", "validation"]
+    assert diagnosis["status"] in {"underfitting", "overfitting_risk", "balanced", "insufficient_metrics"}
     # anti-leakage: target scaling comes from the finite train targets only
     train_targets = pd.read_parquet(next(item["path"] for item in m6_report["artifact_files"] if item["split"] == "train" and item["artifact"] == "features.parquet"))["next_lap_time"].dropna()
     assert mlp_training["y_mean"] == pytest.approx(float(train_targets.mean()))

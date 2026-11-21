@@ -22,12 +22,18 @@ M7 soporta dos familias de modelos seleccionables mediante
 - **`mlp` (Deep Learning):** entrena un MLP tabular en PyTorch CPU-only
   (`f1_race_intelligence.modeling.dl.TabularMLP`, registrado vía
   `mlflow.pyfunc.log_model` bajo `f1-next-lap-mlp`), con estandarización del
-  target ajustada solo en `train` (inversa embebida en el modelo) y *early
-  stopping* sobre `validation`. En el mismo run ajusta también
-  `LinearRegression` y `DummyRegressor(strategy="mean")` sobre `train` para
-  comparación directa sobre el mismo reporte M6. Requiere el extra opcional `dl`
-  (`requirements/dl-lock.txt`); ver [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md)
-  para arquitectura, hiperparámetros, anti-leakage y portabilidad.
+  target ajustada solo en `train` (inversa embebida en el modelo), scheduler
+  `ReduceLROnPlateau` y *early stopping* sobre `validation`, diagnóstico de
+  generalización (`generalization_diagnosis`) e interpretabilidad post-hoc por
+  *Permutation Feature Importance* (PFI) exclusivamente sobre `validation`. En el
+  mismo run ajusta también `LinearRegression` y `DummyRegressor(strategy="mean")`
+  sobre `train` para comparación directa sobre el mismo reporte M6. Además, el
+  stage `--stage m7-compare` permite comparar de forma controlada las cuatro
+  configuraciones de `DEFAULT_MLP_EXPERIMENTS` seleccionando únicamente por
+  `validation.mlp.mae` sin contaminar el Model Registry con candidatos
+  descartados. Requiere el extra opcional `dl` (`requirements/dl-lock.txt`); ver
+  [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md) para arquitectura,
+  hiperparámetros, PFI, `m7-compare`, anti-leakage y portabilidad.
 
 Se calculan MAE, RMSE, MAPE y R² en train, validation y test. MAPE excluye
 targets cero y devuelve `null` cuando no hay ningún denominador válido. Los
@@ -40,8 +46,11 @@ Cada experimento registra `model_type`, `estimator`, el `run_id`/versión del
 reporte M6, versión del pipeline, `input_fingerprint`, hashes verificados de
 artefactos, commits M6/M7, configuración, seed, métricas y reporte M6 original.
 También adjunta el preprocesador y el esquema M6 (y en corridas `mlp`, las
-curvas de pérdida por época y `training_history.json`). El modelo registrado
-recibe la matriz numérica codificada de M6, en el orden de
+curvas por época `train.mlp.loss`, `validation.mlp.loss` y `train.mlp.lr`,
+`training_history.json` con `learning_rate`, el artefacto
+`permutation_importance.json` sobre `validation`, y las secciones
+`generalization_diagnosis` e `interpretability` en `training_report.json`). El
+modelo registrado recibe la matriz numérica codificada de M6, en el orden de
 `output_feature_names`; M7 carga el URI del registro al terminar vía
 `mlflow.pyfunc.load_model` y comprueba que la predicción coincida con la del
 modelo recién ajustado (`rtol`/`atol` de `1e-10` para `linear_regression` y
@@ -52,13 +61,15 @@ Tracking y Model Registry usan el mismo backend local SQLite. El extra
 versiones pandas/pyarrow del runtime-lock; el extra opcional `dl` fija
 `torch==2.12.1` (wheels CPU-only en `requirements/dl-lock.txt` para Linux y
 Windows, y macOS Apple Silicon ≥ 14 vía wheel `macosx_14_0_arm64`; en Mac Intel
-o macOS < 14 no existe wheel precompilado de `torch 2.12.1`) y se importa de
-forma perezosa para mantener aislado el runtime base M1–M6. El directorio de
-artefactos es local y separado del archivo SQLite:
+o macOS < 14 ejecutar en Linux/Windows CPU o contenedor Docker Linux, ver
+[M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#portabilidad-en-entornos-macos-no-soportados))
+y se importa de forma perezosa para mantener aislado el runtime base M1–M6. El
+directorio de artefactos es local y separado del archivo SQLite:
 
 - Tracking/Registry: `data/mlflow/tracking.db`
 - Artefactos MLflow: `data/mlflow/artifacts/`
-- Reportes de M7: `data/modeling/training/reports/`
+- Reportes de M7: `data/modeling/training/reports/` (y reportes JSON/Markdown de
+  `m7-compare` bajo `data/modeling/training/reports/comparisons/`)
 
 Los valores se pueden cambiar en la sección `training` de `configs/config.yaml`
 (incluyendo `training.model_type` y la subsección `training.mlp`).
@@ -95,12 +106,18 @@ f1-pipeline --stage m7 --m6-report data/modeling/reports/modeling_report_<timest
 
 # Deep Learning tabular (PyTorch CPU-only MLP)
 f1-pipeline --stage m7 --model-type mlp --m6-report data/modeling/reports/modeling_report_<timestamp>_<run-id>.json
+
+# Comparación experimental de configuraciones MLP (selección por validation.mlp.mae;
+# añadir --register-best para registrar únicamente el ganador en el Model Registry)
+f1-pipeline --stage m7-compare --m6-report data/modeling/reports/modeling_report_<timestamp>_<run-id>.json --register-best
 ```
 
 `--m6-report` también se puede establecer como `training.m6_report_path`,
-`--model-type` sobrescribe `training.model_type` y `--registered-model-name`
-permite fijar el nombre del modelo en el Model Registry para esa ejecución.
-Para examinar tracking y modelos localmente:
+`--model-type` sobrescribe `training.model_type`, `--registered-model-name`
+permite fijar el nombre del modelo en el Model Registry para `m7` o `m7-compare`
+y `--register-best` (exclusivo de `m7-compare`) registra únicamente la
+configuración ganadora tras el barrido experimental. Para examinar tracking y
+modelos localmente:
 
 ```powershell
 mlflow ui --backend-store-uri sqlite:///data/mlflow/tracking.db
@@ -129,22 +146,32 @@ inmutable una versión registrada (lineal o MLP) y servirla en M8, ver
 
 - `src/f1_race_intelligence/modeling/training.py`: verificación M6, carga de
   matrices M6, dispatch por `model_type` (`linear_regression` y `mlp`),
-  baselines, métricas, registro, comprobación de recuperación y reporte M7.
+  baselines, métricas, curvas por época (`train.mlp.lr` incluido), PFI sobre
+  `validation`, diagnóstico de generalización, registro opcional
+  (`register_model`), comprobación de recuperación y reporte M7.
 - `src/f1_race_intelligence/modeling/dl.py`: implementación del MLP tabular en
-  PyTorch CPU-only, escalado anti-leakage del target, checkpoint
-  `weights_only=True` y wrapper `mlflow.pyfunc.PythonModel`.
+  PyTorch CPU-only, `ReduceLROnPlateau`, escalado anti-leakage del target,
+  `compute_permutation_importance` (PFI determinista en `validation`),
+  `diagnose_generalization`, checkpoint `weights_only=True` y wrapper
+  `mlflow.pyfunc.PythonModel`.
+- `src/f1_race_intelligence/modeling/experiments.py`: comparación experimental
+  controlada (`MLPComparisonRunner`, `DEFAULT_MLP_EXPERIMENTS`), selección
+  anti-snooping por `validation.mlp.mae`, registro selectivo del ganador y
+  generación de reportes JSON/Markdown (`mlp_comparison_<id>.{json,md}`).
 - `src/f1_race_intelligence/config/settings.py` y `configs/config.yaml`:
-  configuración local M7 (`training`, `training.model_type` y `training.mlp`),
-  aditiva a las secciones existentes.
-- `src/f1_race_intelligence/cli.py`: stage `m7` y opciones `--m6-report`,
-  `--model-type` y `--registered-model-name`.
+  configuración local M7 (`training`, `training.model_type` y `training.mlp`
+  con scheduler y PFI), aditiva a las secciones existentes.
+- `src/f1_race_intelligence/cli.py`: stages `m7` y `m7-compare` y opciones
+  `--m6-report`, `--model-type`, `--registered-model-name` y `--register-best`.
 - `pyproject.toml`, `requirements/training-lock.txt` y
   `requirements/dl-lock.txt`: extras opcionales `training` y `dl` fijados y
   aislados del runtime base M1–M6.
 - `tests/unit/test_training.py`, `tests/unit/test_dl.py` y
-  `tests/unit/test_dl_m7_m8_integration.py`: métricas con ceros/nulos, flujo
-  completo M7 (lineal y MLP) con fixtures sintéticos: reproducibilidad,
-  anti-leakage, tracking, registro, publicación inmutable y serving M8.
+  `tests/unit/test_dl_m7_m8_integration.py` (junto con la cobertura CLI y de
+  comparación experimental): métricas con ceros/nulos, flujo completo M7 (lineal
+  y MLP) con fixtures sintéticos: reproducibilidad, `ReduceLROnPlateau`, PFI en
+  `validation`, diagnóstico de generalización, anti-leakage, tracking, registro,
+  publicación inmutable y serving M8.
 - `M07_DEEP_LEARNING.md` y `README.md`: documentación técnica y alcance de M7.
 
 No se cambian splits, contratos, features ni guardas M1–M6.
@@ -157,7 +184,9 @@ técnicas: **no son resultados académicos ni describen carreras reales**.
 Ninguna prueba consulta OpenF1, descarga datos o ejecuta entrenamiento sobre
 datos reales.
 
-Pendiente: ejecutar M6/M7 (tanto `linear_regression` como `mlp`) sobre los
-datos reales únicamente con autorización, revisar suficiencia de carreras y
-discutir los resultados con el equipo. LSTM/GRU y métodos estadísticos
-avanzados quedan fuera de alcance.
+Pendiente: ejecutar M6 y M7 (`m7-compare --register-best`, cubriendo baselines y
+configuraciones MLP; ver
+[M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#protocolo-de-cierre-con-datos-reales-para-la-sustentación))
+sobre los datos reales únicamente con autorización, revisar suficiencia de
+carreras y discutir los resultados con el equipo. LSTM/GRU y métodos
+estadísticos avanzados quedan fuera de alcance.

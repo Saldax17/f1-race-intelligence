@@ -31,7 +31,7 @@ informe se fabrica: cada etapa escribe los suyos.
 |---|---|
 | Backfill por temporadas con `F1_EXTRACTION_YEARS`; M2–M5 por sesión | Datos, volúmenes ni duraciones reales de OpenF1 |
 | M6 **diferido** (código de salida 3) con el histórico incompleto y **ejecutado** con el completo | Rendimiento predictivo: las métricas (lineales y del MLP) salen de 6 carreras artificiales y **no son resultados académicos** |
-| M7 por CLI (`linear_regression` y `--model-type mlp`), registro en MLflow (incluyendo curvas por época y baselines comparativos) y recuperación de la ejecución | MLflow remoto ni entrenamiento en AWS/SageMaker: aquí es SQLite local y PyTorch en CPU local |
+| M7 por CLI (`linear_regression` y `--model-type mlp`), registro en MLflow (incluyendo curvas de pérdida y `train.mlp.lr` con `ReduceLROnPlateau`, PFI sobre `validation`, diagnóstico de generalización y baselines comparativos) y recuperación de la ejecución | MLflow remoto ni entrenamiento en AWS/SageMaker: aquí es SQLite local y PyTorch en CPU local |
 | Publicación inmutable del paquete (lineal y MLP) y verificación de su manifiesto y hashes | Controles de S3 real (IAM, versionado, Object Lock) |
 | M8 cargando el paquete publicado (lineal y MLP `pyfunc`), sin reajustar el preprocesador | Despliegue de M7/M8 en AWS (no existe) |
 | La cadena de trazabilidad M6 → M7 → MLflow → paquete → M8 | La orquestación AWS (Step Functions, admisión, alarmas): solo validada estáticamente y por simulación |
@@ -115,7 +115,7 @@ planificada con la CLI real y llama a
 | Histórico | `history_completeness` | `{'2023': ('complete', 2), '2024': ('complete', 2), '2025': ('complete', 2)}` |
 | M6 | `verify_report` | veredicto `VALID`, `sessions=6`, 8 artefactos, `verify_report ok=True` |
 | M7 (lineal / DL) | `--stage m7 --m6-report <informe>` (y `--model-type mlp` en `test_integral_dl_flow`) | código `0`; versión 1 registrada en MLflow |
-| MLflow | `MlflowClient` | versión 1 en estado `READY`, run `FINISHED`; `list_artifacts` devuelve `data_provenance.json`, `m6`, `metrics.json`, `training_config.json` y `training_report.json` (más `training_history.json` y curvas por época en DL); en MLflow 3 el modelo queda como `LoggedModel` accesible vía `runs:/<id>/model` y `models:/<nombre>/<versión>` aunque `list_artifacts` no liste `model` |
+| MLflow | `MlflowClient` | versión 1 en estado `READY`, run `FINISHED`; `list_artifacts` devuelve `data_provenance.json`, `m6`, `metrics.json`, `training_config.json` y `training_report.json` (más `training_history.json` con `learning_rate`, `permutation_importance.json` y curvas `train.mlp.loss`/`validation.mlp.loss`/`train.mlp.lr` en DL); en MLflow 3 el modelo queda como `LoggedModel` accesible vía `runs:/<id>/model` y `models:/<nombre>/<versión>` aunque `list_artifacts` no liste `model` |
 | Publicación | `publish_model(...)` y `read_model_package(...)` | paquete verificado con manifiesto, hashes y marcador `PUBLISHED`; republicar es idempotente |
 | M8 | `PredictionService.load_published_package` + `TestClient` | `/live`, `/health`, `/model-info` y `/predict` con **200**; `/predict` devuelve predicciones finitas de `next_lap_time` en segundos |
 
@@ -129,11 +129,21 @@ extremo a extremo la variante Deep Learning sobre el mismo contrato MLOps:
   `--stage m7 --model-type mlp --registered-model-name integral-dl-demo-model --m6-report <informe>`.
 - Verifica en MLflow local el registro de `models:/integral-dl-demo-model/1`
   (`mlflow.pyfunc` con checkpoint PyTorch `mlp_checkpoint.pt` cargado con
-  `weights_only=True` en CPU), las curvas de pérdida por época
-  (`train.mlp.loss`, `validation.mlp.loss`, artefacto `training_history.json`)
-  y las métricas comparativas de `mlp`, `linear_regression` y `reference_mean`
-  sobre el mismo reporte M6 (comprobando además que `y_mean` coincide con la
-  media de los targets finitos de `train`).
+  `weights_only=True` en CPU), las curvas por época (`train.mlp.loss`,
+  `validation.mlp.loss` y `train.mlp.lr` bajo `ReduceLROnPlateau`, junto con el
+  artefacto `training_history.json` con `learning_rate`), el artefacto
+  `permutation_importance.json` (PFI determinista calculado exclusivamente sobre
+  `validation`), el resumen de interpretabilidad (`interpretability`) y el
+  diagnóstico de generalización (`generalization_diagnosis`, evaluado solo sobre
+  `train` y `validation`) en `training_report.json`, así como las métricas
+  comparativas de `mlp`, `linear_regression` y `reference_mean` sobre el mismo
+  reporte M6 (comprobando además que `y_mean` coincide con la media de los
+  targets finitos de `train`).
+- Para comparar de forma controlada varias configuraciones del MLP
+  (`DEFAULT_MLP_EXPERIMENTS`) sobre un reporte M6 verificado y exportar el
+  informe académico Markdown seleccionando solo por `validation.mlp.mae`, usar
+  el stage `--stage m7-compare` (y opcionalmente `--register-best`; ver
+  [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#comparación-experimental-de-configuraciones-mlp---stage-m7-compare)).
 - Publica el modelo MLP como paquete inmutable tanto en almacenamiento local
   como en un S3 simulado en memoria (`FakeS3Client`), verificando igualdad
   exacta de manifiesto y artefactos, ausencia de symlinks, marcador `PUBLISHED`
@@ -193,19 +203,22 @@ versiones de las dependencias):
 
 En `test_integral_dl_flow` la secuencia de salida es análoga, con M7 ejecutado
 en modo `--model-type mlp`, versión registrada en MLflow `READY` con
-`training_history.json` en los artefactos del run y el modelo (`pyfunc` +
-`mlp_checkpoint.pt`) como `LoggedModel` accesible vía `runs:/<id>/model` y
-`models:/integral-dl-demo-model/1`, paquete inmutable verificado y
-`POST /predict` devolviendo `200` con predicciones finitas de `next_lap_time`
-en segundos.
+`training_history.json` (incluyendo `learning_rate` de `ReduceLROnPlateau` y
+curva `train.mlp.lr`), `permutation_importance.json` en los artefactos del run,
+el resumen de interpretabilidad (`interpretability`) y diagnóstico de
+generalización (`generalization_diagnosis`) en `training_report.json`, el modelo
+(`pyfunc` + `mlp_checkpoint.pt`) como `LoggedModel` accesible vía
+`runs:/<id>/model` y `models:/integral-dl-demo-model/1`, paquete inmutable
+verificado y `POST /predict` devolviendo `200` con predicciones finitas de
+`next_lap_time` en segundos.
 
 ## Verificaciones relacionadas
 
 La demostración no sustituye a las pruebas; las complementa:
 
 ```bash
-python -m pytest -m "not integration"      # suite completa no integrada
-python -m pytest tests/unit/test_dl.py     # MLP PyTorch: determinismo, anti-leakage, pyfunc
+python -m pytest -m "not integration"      # suite completa no integrada (incluye m7-compare)
+python -m pytest tests/unit/test_dl.py     # MLP PyTorch: determinismo, ReduceLROnPlateau, PFI, generalización, anti-leakage, pyfunc
 python -m pytest tests/unit/test_training.py tests/unit/test_dl_m7_m8_integration.py tests/unit/test_m7_m8_integration.py
 python -m pytest tests/unit/test_backfill.py tests/unit/test_incremental_e2e.py
 python -m pytest tests/infra               # plantilla, ASL y Lambda de admisión

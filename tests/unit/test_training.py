@@ -417,3 +417,190 @@ def test_mlp_run_reports_the_same_linear_baseline_as_a_linear_run(synthetic_m6) 
         assert mlp.metrics[split]["linear_regression"] == linear.metrics[split]["linear_regression"]
         assert mlp.metrics[split]["reference_mean"] == linear.metrics[split]["reference_mean"]
         assert "mlp" not in linear.metrics[split]
+
+
+# -- PR #25 refinements: PFI, LR scheduler, generalization, register_model=False --
+
+
+@pytest.fixture
+def mlflow_uris():
+    """Yield MLflow and restore its global tracking/registry URIs afterwards."""
+    mlflow = pytest.importorskip("mlflow", reason="install the optional training extra")
+    previous_tracking_uri = mlflow.get_tracking_uri()
+    previous_registry_uri = mlflow.get_registry_uri()
+    try:
+        yield mlflow
+    finally:
+        mlflow.set_tracking_uri(previous_tracking_uri)
+        mlflow.set_registry_uri(previous_registry_uri)
+
+
+def _client_for(settings: AppSettings, mlflow):
+    from mlflow.tracking import MlflowClient
+
+    tracking_uri = f"sqlite:///{(Path(settings.training.tracking_db_path).resolve()).as_posix()}"
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_registry_uri(tracking_uri)
+    return MlflowClient(tracking_uri=tracking_uri, registry_uri=tracking_uri)
+
+
+def _top_features(interpretability: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Ranked PFI entries of the report (``top_features`` or the ``importances`` list)."""
+    entries = interpretability.get("top_features", interpretability.get("importances"))
+    assert isinstance(entries, list)
+    return entries
+
+
+def test_mlp_training_logs_permutation_importance_lr_schedule_and_generalization(
+    synthetic_m6, mlflow_uris
+) -> None:
+    pytest.importorskip("torch", reason="install the optional dl extra")
+    mlflow = mlflow_uris
+    base_settings, m6_report_path, m6_payload = synthetic_m6
+    settings = _with_training(
+        base_settings,
+        model_type="mlp",
+        mlp={
+            **FAST_MLP,
+            "lr_scheduler": "reduce_on_plateau",
+            "lr_scheduler_factor": 0.5,
+            "lr_scheduler_patience": 1,
+            "permutation_importance_repeats": 3,
+            "permutation_importance_top_k": 4,
+        },
+    )
+
+    result = TrainingRunner(settings, m6_report_path=str(m6_report_path)).run()
+
+    client = _client_for(settings, mlflow)
+    artifacts = {item.path for item in client.list_artifacts(result.run_id)}
+    assert "permutation_importance.json" in artifacts
+    pfi = mlflow.artifacts.load_dict(f"runs:/{result.run_id}/permutation_importance.json")
+    features = m6_payload["preprocessing"]["output_feature_names"]
+    assert pfi["split"] == "validation"
+    assert pfi["n_repeats"] == 3
+    # the logged artifact keeps every feature; the report keeps only the top-k
+    assert pfi["n_features"] == len(features) == len(pfi["importances"])
+    assert {entry["feature"] for entry in pfi["importances"]} == set(features)
+
+    saved_report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    interpretability = saved_report["interpretability"]
+    assert interpretability["method"] == "permutation_feature_importance"
+    assert interpretability["split"] == "validation"
+    top = _top_features(interpretability)
+    assert 0 < len(top) <= 4
+    assert all(entry["feature"] in features for entry in top)
+    assert all(np.isfinite(entry["mae_increase_mean"]) for entry in top)
+    mae_increases = [entry["mae_increase_mean"] for entry in top]
+    assert mae_increases == sorted(mae_increases, reverse=True)
+    assert isinstance(interpretability["collinearity_note"], str) and interpretability["collinearity_note"]
+    assert not any(name.startswith("key_") or name == "next_lap_time" for name in (e["feature"] for e in top))
+
+    diagnosis = saved_report["generalization_diagnosis"]
+    assert diagnosis["evaluated_splits"] == ["train", "validation"]
+    assert diagnosis["status"] in {"underfitting", "overfitting_risk", "balanced", "insufficient_metrics"}
+    assert diagnosis["train_mae"] == pytest.approx(result.metrics["train"]["mlp"]["mae"])
+    assert diagnosis["validation_mae"] == pytest.approx(result.metrics["validation"]["mlp"]["mae"])
+    assert diagnosis["epochs_trained"] == saved_report["mlp_training"]["epochs_trained"]
+    assert isinstance(diagnosis["explanation"], str) and diagnosis["explanation"]
+
+    # learning rate schedule: one train.mlp.lr point per epoch and in the history artifact
+    epochs = saved_report["mlp_training"]["epochs_trained"]
+    lr_curve = sorted(client.get_metric_history(result.run_id, "train.mlp.lr"), key=lambda point: point.step)
+    assert [point.step for point in lr_curve] == list(range(1, epochs + 1))
+    assert lr_curve[0].value == pytest.approx(FAST_MLP["learning_rate"])
+    assert all(later.value <= earlier.value for earlier, later in zip(lr_curve, lr_curve[1:]))
+    history = mlflow.artifacts.load_dict(f"runs:/{result.run_id}/training_history.json")
+    assert all("learning_rate" in entry for entry in history)
+    assert [entry["learning_rate"] for entry in history] == pytest.approx([point.value for point in lr_curve])
+    assert saved_report["mlp_training"]["final_learning_rate"] == pytest.approx(history[-1]["learning_rate"])
+
+    run = client.get_run(result.run_id)
+    assert run.data.params["mlp_lr_scheduler"] == "reduce_on_plateau"
+    assert saved_report["config"]["mlp"]["lr_scheduler"] == "reduce_on_plateau"
+    assert saved_report["config"]["mlp"]["compute_permutation_importance"] is True
+    assert saved_report["config"]["mlp"]["permutation_importance_top_k"] == 4
+
+
+def test_mlp_training_can_disable_permutation_importance(synthetic_m6, mlflow_uris) -> None:
+    pytest.importorskip("torch", reason="install the optional dl extra")
+    mlflow = mlflow_uris
+    base_settings, m6_report_path, _ = synthetic_m6
+    settings = _with_training(
+        base_settings,
+        model_type="mlp",
+        mlp={**FAST_MLP, "compute_permutation_importance": False, "lr_scheduler": "none"},
+    )
+
+    result = TrainingRunner(settings, m6_report_path=str(m6_report_path)).run()
+
+    saved_report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    assert saved_report["interpretability"]["status"] == "disabled"
+    assert "importances" not in saved_report["interpretability"]
+    assert saved_report["generalization_diagnosis"]["evaluated_splits"] == ["train", "validation"]
+    client = _client_for(settings, mlflow)
+    artifacts = {item.path for item in client.list_artifacts(result.run_id)}
+    assert "permutation_importance.json" not in artifacts
+    assert "training_report.json" in artifacts
+    # without a scheduler the learning rate stays constant
+    lr_curve = client.get_metric_history(result.run_id, "train.mlp.lr")
+    assert lr_curve and all(point.value == pytest.approx(FAST_MLP["learning_rate"]) for point in lr_curve)
+
+
+def test_mlp_training_without_registration_keeps_the_registry_empty(synthetic_m6, mlflow_uris) -> None:
+    pytest.importorskip("torch", reason="install the optional dl extra")
+    mlflow = mlflow_uris
+    base_settings, m6_report_path, _ = synthetic_m6
+    settings = _with_training(base_settings, model_type="mlp", mlp=FAST_MLP)
+
+    result = TrainingRunner(
+        settings,
+        m6_report_path=str(m6_report_path),
+        register_model=False,
+        extra_tags={"experiment_label": "unit-test"},
+        run_name_prefix="m7-unregistered",
+    ).run()
+
+    assert result.model_version is None
+    assert result.model_uri == f"runs:/{result.run_id}/model"
+    saved_report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    registered = saved_report["registered_model"]
+    assert registered["recovery_check"] == "passed"
+    assert registered["registered"] is False
+    assert registered["version"] is None
+    assert registered["uri"] == result.model_uri
+
+    client = _client_for(settings, mlflow)
+    assert client.search_model_versions(f"name='{MLP_REGISTERED_NAME}'") == []
+    assert client.search_registered_models() == []
+    run = client.get_run(result.run_id)
+    assert run.info.run_name.startswith("m7-unregistered-")
+    assert run.data.tags["experiment_label"] == "unit-test"
+    assert run.data.tags["stage"] == "m7-training"
+
+    # the unregistered run model is still loadable and answers in seconds
+    model = mlflow.pyfunc.load_model(result.model_uri)
+    assert model.metadata.run_id == result.run_id
+    assert list(model.metadata.get_input_schema().input_names()) == saved_report["features"]
+
+
+def test_linear_regression_report_has_no_dl_sections_and_needs_no_torch(
+    synthetic_m6, mlflow_uris, monkeypatch
+) -> None:
+    mlflow = mlflow_uris
+    settings, m6_report_path, _ = synthetic_m6
+    _block_imports(monkeypatch, "torch")
+
+    result = TrainingRunner(settings, m6_report_path=str(m6_report_path)).run()
+
+    saved_report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    assert saved_report["model_type"] == "linear_regression"
+    assert result.model_uri == f"models:/{settings.training.registered_model_name}/{result.model_version}"
+    for key in ("interpretability", "generalization_diagnosis", "mlp_training"):
+        assert key not in saved_report
+    client = _client_for(settings, mlflow)
+    artifacts = {item.path for item in client.list_artifacts(result.run_id)}
+    assert "permutation_importance.json" not in artifacts
+    assert "training_history.json" not in artifacts
+    assert client.get_metric_history(result.run_id, "train.mlp.lr") == []
+    assert len(client.search_model_versions(f"name='{settings.training.registered_model_name}'")) == 1

@@ -345,6 +345,13 @@ class MLPSettings(BaseModel):
     min_delta: float = Field(default=1e-4, ge=0.0, allow_inf_nan=False)
     loss: Literal["huber", "mse"] = "huber"
     scale_target: bool = True
+    lr_scheduler: Literal["none", "reduce_on_plateau"] = "reduce_on_plateau"
+    lr_scheduler_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
+    lr_scheduler_patience: int = Field(default=5, ge=1)
+    lr_scheduler_min_lr: float = Field(default=1e-6, ge=0.0, allow_inf_nan=False)
+    compute_permutation_importance: bool = True
+    permutation_importance_repeats: int = Field(default=5, ge=1)
+    permutation_importance_top_k: int = Field(default=10, ge=1)
 
     @model_validator(mode="after")
     def _validate_mlp_settings(self) -> "MLPSettings":

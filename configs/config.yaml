@@ -223,3 +223,12 @@ training:
     loss: "huber"
     # Standardize training target using finite train targets only; inverted inside the model.
     scale_target: true
+    # none | reduce_on_plateau
+    lr_scheduler: "reduce_on_plateau"
+    lr_scheduler_factor: 0.5
+    lr_scheduler_patience: 5
+    lr_scheduler_min_lr: 0.000001
+    # Permutation feature importance (computed strictly on the validation split).
+    compute_permutation_importance: true
+    permutation_importance_repeats: 5
+    permutation_importance_top_k: 10

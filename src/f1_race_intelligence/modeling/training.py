@@ -46,7 +46,7 @@ class TrainingResult:
     m6_run_id: str
     input_fingerprint: str
     model_name: str
-    model_version: str
+    model_version: Optional[str]
     model_uri: str
     metrics: Dict[str, Dict[str, Dict[str, Any]]]
     report_path: str
@@ -130,6 +130,9 @@ class TrainingRunner:
         *,
         m6_report_path: Optional[str] = None,
         model_type: Optional[str] = None,
+        register_model: bool = True,
+        extra_tags: Optional[Dict[str, str]] = None,
+        run_name_prefix: Optional[str] = None,
     ) -> None:
         self._settings = settings or load_settings()
         self._config = self._settings.training
@@ -141,6 +144,15 @@ class TrainingRunner:
                 f"expected one of {', '.join(SUPPORTED_MODEL_TYPES)}"
             )
         self._model_type: str = resolved_model_type
+        self._register_model: bool = bool(register_model)
+        self._extra_tags: Dict[str, str] = (
+            {str(key): str(value) for key, value in extra_tags.items()} if extra_tags else {}
+        )
+        self._run_name_prefix: Optional[str] = (
+            run_name_prefix.strip()
+            if isinstance(run_name_prefix, str) and run_name_prefix.strip()
+            else None
+        )
 
     def run(self) -> TrainingResult:
         """Verify M6, train the configured model with baselines, and register it in MLflow."""
@@ -202,9 +214,15 @@ class TrainingRunner:
 
         fitted_mlp = None
         log_mlp_pyfunc_model = None
+        diagnose_generalization_fn = None
+        pfi_result = None
+        interpretability_report: Optional[Dict[str, Any]] = None
+        final_learning_rate: Optional[float] = None
         if self._model_type == MLP_MODEL_TYPE:
             from f1_race_intelligence.modeling.dl import (
                 MLPConfig,
+                compute_permutation_importance,
+                diagnose_generalization as _diagnose_generalization,
                 log_mlp_pyfunc_model as _log_mlp_pyfunc_model,
                 train_tabular_mlp,
             )
@@ -222,6 +240,10 @@ class TrainingRunner:
                 loss=mlp_settings.loss,
                 scale_target=mlp_settings.scale_target,
                 random_seed=seed,
+                lr_scheduler=mlp_settings.lr_scheduler,
+                lr_scheduler_factor=mlp_settings.lr_scheduler_factor,
+                lr_scheduler_patience=mlp_settings.lr_scheduler_patience,
+                lr_scheduler_min_lr=mlp_settings.lr_scheduler_min_lr,
             )
             val_x, val_y = matrices[VALIDATION]
             fitted_mlp = train_tabular_mlp(
@@ -233,6 +255,35 @@ class TrainingRunner:
                 config=mlp_config,
             )
             log_mlp_pyfunc_model = _log_mlp_pyfunc_model
+            diagnose_generalization_fn = _diagnose_generalization
+            recorded_lrs = [entry.learning_rate for entry in fitted_mlp.history if entry.learning_rate is not None]
+            final_learning_rate = float(recorded_lrs[-1]) if recorded_lrs else float(fitted_mlp.config.learning_rate)
+
+            if mlp_settings.compute_permutation_importance:
+                if np.any(np.isfinite(val_y)):
+                    pfi_result = compute_permutation_importance(
+                        fitted_mlp,
+                        val_x,
+                        val_y,
+                        split=VALIDATION,
+                        n_repeats=mlp_settings.permutation_importance_repeats,
+                        random_seed=seed,
+                    )
+                    interpretability_report = {
+                        "method": "permutation_feature_importance",
+                        **pfi_result.to_dict(top_k=mlp_settings.permutation_importance_top_k),
+                    }
+                else:
+                    interpretability_report = {
+                        "method": "permutation_feature_importance",
+                        "status": "skipped",
+                        "reason": "validation split has no finite targets",
+                    }
+            else:
+                interpretability_report = {
+                    "method": "permutation_feature_importance",
+                    "status": "disabled",
+                }
 
         metrics: Dict[str, Dict[str, Dict[str, Any]]] = {}
         predictions: Dict[str, Dict[str, np.ndarray]] = {}
@@ -247,6 +298,17 @@ class TrainingRunner:
                 model_name: regression_metrics(targets, predicted)
                 for model_name, predicted in split_predictions.items()
             }
+
+        generalization_diagnosis: Optional[Dict[str, Any]] = None
+        if fitted_mlp is not None and diagnose_generalization_fn is not None:
+            generalization_diagnosis = diagnose_generalization_fn(
+                metrics,
+                model_key="mlp",
+                baseline_key="reference_mean",
+                epochs_trained=fitted_mlp.epochs_trained,
+                best_epoch=fitted_mlp.best_epoch,
+                max_epochs=fitted_mlp.config.max_epochs,
+            )
 
         mlflow, client, tracking_uri = self._configure_tracking()
         source_commit, source_dirty = source_revision()
@@ -270,6 +332,7 @@ class TrainingRunner:
             "mape_zero_policy": "exclude zero targets and report zero_target_rows",
         }
         if fitted_mlp is not None:
+            mlp_settings = self._config.mlp
             config_snapshot["mlp"] = {
                 "hidden_dims": list(fitted_mlp.config.hidden_dims),
                 "dropout": fitted_mlp.config.dropout,
@@ -282,6 +345,13 @@ class TrainingRunner:
                 "loss": fitted_mlp.config.loss,
                 "scale_target": fitted_mlp.config.scale_target,
                 "random_seed": fitted_mlp.config.random_seed,
+                "lr_scheduler": fitted_mlp.config.lr_scheduler,
+                "lr_scheduler_factor": fitted_mlp.config.lr_scheduler_factor,
+                "lr_scheduler_patience": fitted_mlp.config.lr_scheduler_patience,
+                "lr_scheduler_min_lr": fitted_mlp.config.lr_scheduler_min_lr,
+                "compute_permutation_importance": mlp_settings.compute_permutation_importance,
+                "permutation_importance_repeats": mlp_settings.permutation_importance_repeats,
+                "permutation_importance_top_k": mlp_settings.permutation_importance_top_k,
             }
         provenance = {
             "m6_run_id": m6_run_id,
@@ -304,7 +374,8 @@ class TrainingRunner:
         }
 
         mlflow.set_experiment(self._config.experiment_name)
-        run_prefix = "m7-mlp" if self._model_type == MLP_MODEL_TYPE else "m7-linear-regression"
+        default_prefix = "m7-mlp" if self._model_type == MLP_MODEL_TYPE else "m7-linear-regression"
+        run_prefix = self._run_name_prefix or default_prefix
         run_name = f"{run_prefix}-{uuid.uuid4().hex[:8]}"
         with mlflow.start_run(run_name=run_name) as active_run:
             run_id = active_run.info.run_id
@@ -331,29 +402,35 @@ class TrainingRunner:
                         "mlp_min_delta": fitted_mlp.config.min_delta,
                         "mlp_loss": fitted_mlp.config.loss,
                         "mlp_scale_target": fitted_mlp.config.scale_target,
+                        "mlp_lr_scheduler": fitted_mlp.config.lr_scheduler,
+                        "mlp_lr_scheduler_factor": fitted_mlp.config.lr_scheduler_factor,
+                        "mlp_lr_scheduler_patience": fitted_mlp.config.lr_scheduler_patience,
+                        "mlp_lr_scheduler_min_lr": fitted_mlp.config.lr_scheduler_min_lr,
+                        "mlp_final_learning_rate": final_learning_rate,
                         "mlp_total_params": fitted_mlp.total_params,
                         "mlp_best_epoch": fitted_mlp.best_epoch,
                         "mlp_epochs_trained": fitted_mlp.epochs_trained,
                     }
                 )
             mlflow.log_params(run_params)
-            mlflow.set_tags(
-                {
-                    "project": "f1-race-intelligence",
-                    "stage": "m7-training",
-                    "model_type": self._model_type,
-                    "data_version": provenance["data_version"],
-                    "input_fingerprint": input_fingerprint,
-                    "m6_run_id": m6_run_id,
-                    "m6_source_commit": str(m6_report.get("source_commit") or "unavailable"),
-                    "m7_source_commit": str(source_commit or "unavailable"),
-                }
-            )
+            core_tags = {
+                "project": "f1-race-intelligence",
+                "stage": "m7-training",
+                "model_type": self._model_type,
+                "data_version": provenance["data_version"],
+                "input_fingerprint": input_fingerprint,
+                "m6_run_id": m6_run_id,
+                "m6_source_commit": str(m6_report.get("source_commit") or "unavailable"),
+                "m7_source_commit": str(source_commit or "unavailable"),
+            }
+            mlflow.set_tags({**self._extra_tags, **core_tags})
             if fitted_mlp is not None:
                 for entry in fitted_mlp.history:
                     mlflow.log_metric("train.mlp.loss", float(entry.train_loss), step=entry.epoch)
                     if entry.val_loss is not None:
                         mlflow.log_metric("validation.mlp.loss", float(entry.val_loss), step=entry.epoch)
+                    if entry.learning_rate is not None:
+                        mlflow.log_metric("train.mlp.lr", float(entry.learning_rate), step=entry.epoch)
             for split in SPLITS:
                 for model_name, values in metrics[split].items():
                     mlflow.log_metrics(
@@ -373,10 +450,13 @@ class TrainingRunner:
                         "epoch": entry.epoch,
                         "train_loss": entry.train_loss,
                         "val_loss": entry.val_loss,
+                        "learning_rate": entry.learning_rate,
                     }
                     for entry in fitted_mlp.history
                 ]
                 mlflow.log_dict(history_payload, "training_history.json")
+                if pfi_result is not None:
+                    mlflow.log_dict(pfi_result.to_dict(), "permutation_importance.json")
             mlflow.log_artifact(str(report_path), artifact_path="m6")
             mlflow.log_artifact(str(artifacts[(None, PREPROCESSOR_ARTIFACT)]), artifact_path="m6")
             schema_path = artifacts.get((None, SCHEMA_ARTIFACT))
@@ -384,6 +464,7 @@ class TrainingRunner:
                 mlflow.log_artifact(str(schema_path), artifact_path="m6")
 
             example = train_x.head(min(5, len(train_x)))
+            target_registered_name = registered_name if self._register_model else None
             if self._model_type == LINEAR_MODEL_TYPE:
                 from mlflow.models import infer_signature
                 import mlflow.sklearn
@@ -392,7 +473,7 @@ class TrainingRunner:
                 mlflow.sklearn.log_model(
                     linear,
                     artifact_path="model",
-                    registered_model_name=registered_name,
+                    registered_model_name=target_registered_name,
                     signature=signature,
                     input_example=example,
                 )
@@ -403,14 +484,18 @@ class TrainingRunner:
                 log_mlp_pyfunc_model(
                     fitted_mlp,
                     example=example,
-                    registered_model_name=registered_name,
+                    registered_model_name=target_registered_name,
                     artifact_path="model",
                 )
                 primary_predict = fitted_mlp.predict
                 recovery_tol = 1e-5
 
-            version = self._registered_version(client, registered_name, run_id)
-            model_uri = f"models:/{registered_name}/{version}"
+            if self._register_model:
+                version: Optional[str] = self._registered_version(client, registered_name, run_id)
+                model_uri = f"models:/{registered_name}/{version}"
+            else:
+                version = None
+                model_uri = f"runs:/{run_id}/model"
             import mlflow.pyfunc
 
             loaded_model = mlflow.pyfunc.load_model(model_uri)
@@ -423,6 +508,24 @@ class TrainingRunner:
                 raise RuntimeError("registered model inference did not reproduce the fitted model prediction")
 
             finished_at = datetime.now(timezone.utc).isoformat()
+            inference_input_desc = "M6 encoded feature matrix columns from preprocessing.output_feature_names"
+            if self._register_model:
+                registered_model_report: Dict[str, Any] = {
+                    "name": registered_name,
+                    "version": version,
+                    "uri": model_uri,
+                    "inference_input": inference_input_desc,
+                    "recovery_check": "passed",
+                }
+            else:
+                registered_model_report = {
+                    "name": None,
+                    "version": None,
+                    "uri": model_uri,
+                    "registered": False,
+                    "inference_input": inference_input_desc,
+                    "recovery_check": "passed",
+                }
             report: Dict[str, Any] = {
                 "schema_version": 1,
                 "run_id": run_id,
@@ -440,13 +543,7 @@ class TrainingRunner:
                 "features": feature_names,
                 "target": TARGET_COLUMN,
                 "metrics": metrics,
-                "registered_model": {
-                    "name": registered_name,
-                    "version": version,
-                    "uri": model_uri,
-                    "inference_input": "M6 encoded feature matrix columns from preprocessing.output_feature_names",
-                    "recovery_check": "passed",
-                },
+                "registered_model": registered_model_report,
                 "m6_integrity": integrity,
             }
             if fitted_mlp is not None:
@@ -457,7 +554,10 @@ class TrainingRunner:
                     "total_params": fitted_mlp.total_params,
                     "y_mean": fitted_mlp.y_mean,
                     "y_std": fitted_mlp.y_std,
+                    "final_learning_rate": final_learning_rate,
                 }
+                report["generalization_diagnosis"] = generalization_diagnosis
+                report["interpretability"] = interpretability_report
             mlflow.log_dict(report, "training_report.json")
 
         output_dir = Path(self._config.output_path).resolve()

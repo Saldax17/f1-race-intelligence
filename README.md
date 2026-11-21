@@ -64,7 +64,7 @@ paso puede repetirse sin duplicar ni corromper resultados.
 | M4 | Consolidación a Piloto × Carrera × Vuelta | `raw/` + informe M3 → dataset por sesión | §11 |
 | M5 | Features y target `next_lap_time`, con guardas anti-leakage | dataset M4 → features por sesión | §12 |
 | M6 | Dataset de modelado: split cronológico por carrera y preprocesado ajustado solo con train | features de **todo** el histórico → splits, preprocesador y esquema con hashes | §13 |
-| M7 | Entrenamiento (`linear_regression`, MLP tabular PyTorch y referencia), métricas, MLflow y registro | informe M6 verificado → modelo registrado | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md), [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md) |
+| M7 | Entrenamiento (`linear_regression`, MLP tabular PyTorch con `ReduceLROnPlateau`, PFI en `validation` y diagnóstico de generalización), comparación experimental (`m7-compare`), MLflow y registro | informe M6 verificado → modelo registrado y reportes | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md), [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md) |
 | Publicación | Paquete inmutable y verificable de una versión registrada | modelo + artefactos M6 → `published-models/…` con manifiesto y `PUBLISHED` | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
 | M8 | Serving FastAPI (`/live`, `/health`, `/model-info`, `/predict`) | paquete publicado (o URIs de MLflow) → predicciones | §19 |
 
@@ -301,7 +301,7 @@ f1-race-intelligence/
 │   └── f1_race_intelligence/
 │       ├── __init__.py
 │       ├── __main__.py            # python -m f1_race_intelligence (CLI batch)
-│       ├── cli.py                 # --stage plan|m2|m3|m4|m5|m6|verify-m6|m7|copy-raw
+│       ├── cli.py                 # --stage plan|m2|m3|m4|m5|m6|verify-m6|m7|m7-compare|copy-raw
 │       ├── scope.py               # SessionScope: unidad de trabajo (sesión)
 │       │
 │       ├── config/
@@ -1296,8 +1296,11 @@ salida; contexto de logging.
 
 M7 y Deep Learning: `tests/unit/test_dl.py`, `tests/unit/test_training.py`,
 `tests/unit/test_dl_m7_m8_integration.py` y `tests/unit/test_m7_m8_integration.py`
-cubren el entrenamiento reproducible (`linear_regression` y `mlp` en PyTorch
-CPU-only), anti-leakage del target, early stopping, importación perezosa sin
+(junto con las pruebas CLI y de comparación experimental) cubren el
+entrenamiento reproducible (`linear_regression` y `mlp` en PyTorch CPU-only),
+anti-leakage del target, `ReduceLROnPlateau`, *early stopping*, *Permutation
+Feature Importance* (PFI) sobre `validation`, diagnóstico de generalización,
+comparación controlada `--stage m7-compare`, importación perezosa sin
 `torch`/`mlflow`, publicación inmutable y serving M8 sin reajuste.
 
 La cadena M1–M8 se puede recorrer de extremo a extremo, sin red y con datos
@@ -1348,9 +1351,11 @@ temporadas y protección de M6. Queda pendiente:
 
 - Entrenamiento con datos reales de OpenF1 (requiere autorización) y evaluación
   académica comparativa de los resultados (`DummyRegressor`, `LinearRegression`
-  y `TabularMLP`); explorar arquitecturas adicionales solo si el análisis con
-  datos reales lo justifica (LSTM/GRU y métodos secuenciales siguen fuera de
-  alcance).
+  y configuraciones `TabularMLP` mediante `--stage m7-compare --register-best`;
+  ver
+  [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#protocolo-de-cierre-con-datos-reales-para-la-sustentación));
+  explorar arquitecturas adicionales solo si el análisis con datos reales lo
+  justifica (LSTM/GRU y métodos secuenciales siguen fuera de alcance).
 - Validación de la infraestructura AWS en una cuenta real (despliegue
   controlado, IAM y S3 reales, Step Functions, alarmas y SNS); hoy solo está
   validada estáticamente y por simulación.

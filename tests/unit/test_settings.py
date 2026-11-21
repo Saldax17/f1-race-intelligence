@@ -145,6 +145,13 @@ def test_mlp_settings_defaults_match_the_design() -> None:
     assert mlp.min_delta == 1e-4
     assert mlp.loss == "huber"
     assert mlp.scale_target is True
+    assert mlp.lr_scheduler == "reduce_on_plateau"
+    assert mlp.lr_scheduler_factor == 0.5
+    assert mlp.lr_scheduler_patience == 5
+    assert mlp.lr_scheduler_min_lr == 1e-6
+    assert mlp.compute_permutation_importance is True
+    assert mlp.permutation_importance_repeats == 5
+    assert mlp.permutation_importance_top_k == 10
 
 
 def test_training_settings_default_to_the_unchanged_linear_baseline() -> None:
@@ -229,12 +236,78 @@ training:
         {"loss": "mae"},
         {"registered_model_name": ""},
         {"registered_model_name": "   "},
+        {"lr_scheduler": "cosine"},
+        {"lr_scheduler": "step"},
+        {"lr_scheduler_factor": 0.0},
+        {"lr_scheduler_factor": 1.0},
+        {"lr_scheduler_factor": 1.5},
+        {"lr_scheduler_factor": -0.5},
+        {"lr_scheduler_factor": float("nan")},
+        {"lr_scheduler_patience": 0},
+        {"lr_scheduler_patience": -1},
+        {"lr_scheduler_min_lr": -1e-6},
+        {"lr_scheduler_min_lr": float("inf")},
+        {"lr_scheduler_min_lr": float("nan")},
+        {"compute_permutation_importance": "maybe"},
+        {"permutation_importance_repeats": 0},
+        {"permutation_importance_repeats": -3},
+        {"permutation_importance_top_k": 0},
+        {"permutation_importance_top_k": -1},
     ],
     ids=lambda overrides: "-".join(f"{key}={value!r}" for key, value in overrides.items()),
 )
 def test_mlp_settings_reject_invalid_hyperparameters(overrides: dict) -> None:
     with pytest.raises(ValidationError):
         MLPSettings(**overrides)
+
+
+def test_load_settings_reads_lr_scheduler_and_permutation_importance(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """
+training:
+  mlp:
+    lr_scheduler: none
+    lr_scheduler_factor: 0.25
+    lr_scheduler_patience: 2
+    lr_scheduler_min_lr: 0.0
+    compute_permutation_importance: false
+    permutation_importance_repeats: 3
+    permutation_importance_top_k: 4
+""",
+        encoding="utf-8",
+    )
+
+    mlp = load_settings(config_file).training.mlp
+
+    assert mlp.lr_scheduler == "none"
+    assert mlp.lr_scheduler_factor == 0.25
+    assert mlp.lr_scheduler_patience == 2
+    assert mlp.lr_scheduler_min_lr == 0.0
+    assert mlp.compute_permutation_importance is False
+    assert mlp.permutation_importance_repeats == 3
+    assert mlp.permutation_importance_top_k == 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lr_scheduler", "exponential"),
+        ("lr_scheduler_factor", 1.0),
+        ("lr_scheduler_patience", 0),
+        ("lr_scheduler_min_lr", -0.1),
+        ("permutation_importance_repeats", 0),
+        ("permutation_importance_top_k", 0),
+    ],
+)
+def test_invalid_scheduler_and_importance_settings_in_yaml_name_the_field(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"training:\n  mlp:\n    {field}: {value}\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match=field):
+        load_settings(config_file)
 
 
 def test_invalid_mlp_settings_in_yaml_fail_settings_loading(tmp_path: Path) -> None:

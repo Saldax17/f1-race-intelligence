@@ -15,6 +15,13 @@ MLflow → M8 contract:
 * the registered pyfunc accepts the ``float64`` DataFrame M8 sends, selects
   the declared feature columns in order and returns a 1-D ``float64`` array.
 
+Training optionally reduces the learning rate on a validation-loss plateau
+(``ReduceLROnPlateau``) and records the learning rate of every epoch. Two
+post-hoc analyses complete the model: :func:`compute_permutation_importance`
+(deterministic permutation feature importance on a held-out split, meant for
+``validation``) and :func:`diagnose_generalization` (a transparent
+train-vs-validation over/underfitting verdict that never reads ``test``).
+
 PyTorch and MLflow are optional (the ``dl`` and ``training`` extras), so
 neither is imported at module level: the M1–M6 runtime must be able to
 import this module without them. The only exception is the guarded import
@@ -29,7 +36,7 @@ import random
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,6 +58,11 @@ __all__ = [
     "save_mlp_checkpoint",
     "load_mlp_checkpoint",
     "log_mlp_pyfunc_model",
+    "PERMUTATION_COLLINEARITY_NOTE",
+    "FeatureImportanceEntry",
+    "PermutationImportanceResult",
+    "compute_permutation_importance",
+    "diagnose_generalization",
 ]
 
 TORCH_INSTALL_HINT = 'python -m pip install -e ".[training,dl]"'
@@ -67,6 +79,18 @@ _CHECKPOINT_KEYS = (
     "y_mean",
     "y_std",
     "scale_target",
+)
+UNDERFITTING_TRAIN_RATIO_VS_BASELINE = 0.95
+OVERFITTING_VAL_TO_TRAIN_MAE_RATIO = 1.25
+_MIN_MAE_FOR_RATIO = 1e-12
+
+PERMUTATION_COLLINEARITY_NOTE = (
+    "Permutation importance shuffles one encoded column at a time. Correlated features "
+    "(e.g. lap_duration, its rolling means and the sector durations) and the columns of a "
+    "one-hot encoded category share signal: while one of them is shuffled the model can "
+    "still read the same information from the others, so the importance of redundant "
+    "columns may be split between them or underestimated individually. Read low values "
+    "of correlated columns as 'redundant given the rest', not as 'irrelevant'."
 )
 
 
@@ -85,15 +109,23 @@ class MLPConfig:
     loss: Literal["huber", "mse"] = "huber"
     scale_target: bool = True
     random_seed: int = 42
+    lr_scheduler: Literal["none", "reduce_on_plateau"] = "reduce_on_plateau"
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 5
+    lr_scheduler_min_lr: float = 1e-6
 
 
 @dataclass(frozen=True)
 class MLPEpochMetrics:
-    """Mean losses of one epoch, in the (possibly scaled) training target units."""
+    """Mean losses of one epoch, in the (possibly scaled) training target units.
+
+    ``learning_rate`` is the optimizer learning rate used during the epoch.
+    """
 
     epoch: int
     train_loss: float
     val_loss: Optional[float]
+    learning_rate: Optional[float] = None
 
 
 @dataclass
@@ -128,6 +160,66 @@ class FittedTabularMLP:
             self._network = network
         matrix = _feature_matrix(features, self.feature_names, label="features")
         return _predict_original_scale(torch, self._network, matrix, self.y_mean, self.y_std)
+
+
+@dataclass(frozen=True)
+class FeatureImportanceEntry:
+    """Increase of the error metrics (seconds) when one feature column is shuffled."""
+
+    feature: str
+    mae_increase_mean: float
+    mae_increase_std: float
+    rmse_increase_mean: float
+    rmse_increase_std: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "feature": self.feature,
+            "mae_increase_mean": float(self.mae_increase_mean),
+            "mae_increase_std": float(self.mae_increase_std),
+            "rmse_increase_mean": float(self.rmse_increase_mean),
+            "rmse_increase_std": float(self.rmse_increase_std),
+        }
+
+
+@dataclass(frozen=True)
+class PermutationImportanceResult:
+    """Permutation feature importance of a fitted MLP on one split.
+
+    ``importances`` is sorted from the most to the least important feature
+    (by mean MAE increase, then mean RMSE increase, then feature name).
+    """
+
+    split: str
+    n_rows: int
+    n_repeats: int
+    random_seed: int
+    baseline_mae: float
+    baseline_rmse: float
+    importances: List[FeatureImportanceEntry]
+    collinearity_note: str = PERMUTATION_COLLINEARITY_NOTE
+
+    def top(self, k: int = 10) -> List[FeatureImportanceEntry]:
+        """Return the ``k`` most important features."""
+        if not _is_int(k) or k < 0:
+            raise ValueError(f"k must be an integer >= 0, got {k!r}")
+        return list(self.importances[: int(k)])
+
+    def to_dict(self, *, top_k: Optional[int] = None) -> Dict[str, Any]:
+        """JSON-serialisable view; ``top_k`` keeps only the most important features."""
+        entries = self.importances if top_k is None else self.top(top_k)
+        return {
+            "method": "permutation_feature_importance",
+            "split": self.split,
+            "n_rows": int(self.n_rows),
+            "n_repeats": int(self.n_repeats),
+            "random_seed": int(self.random_seed),
+            "baseline_mae": float(self.baseline_mae),
+            "baseline_rmse": float(self.baseline_rmse),
+            "n_features": len(self.importances),
+            "importances": [entry.to_dict() for entry in entries],
+            "collinearity_note": self.collinearity_note,
+        }
 
 
 class TabularMLPPyfuncModel(PythonModel):
@@ -228,6 +320,18 @@ def train_tabular_mlp(
         optimizer = torch.optim.Adam(
             network.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
+        scheduler: Any = None
+        if config.lr_scheduler == "reduce_on_plateau":
+            # Same improvement rule as early stopping: an absolute ``min_delta`` drop.
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=config.lr_scheduler_factor,
+                patience=config.lr_scheduler_patience,
+                threshold=config.min_delta,
+                threshold_mode="abs",
+                min_lr=config.lr_scheduler_min_lr,
+            )
 
         train_x_t = torch.from_numpy(np.ascontiguousarray(train_matrix, dtype=np.float32)).to(device)
         train_y_t = torch.from_numpy(
@@ -254,6 +358,7 @@ def train_tabular_mlp(
         epochs_trained = 0
 
         for epoch in range(1, config.max_epochs + 1):
+            current_lr = float(optimizer.param_groups[0]["lr"])
             network.train()
             loss_sum = 0.0
             seen = 0
@@ -269,7 +374,9 @@ def train_tabular_mlp(
             val_loss: Optional[float] = None
             if has_validation:
                 val_loss = _evaluate_loss(torch, network, loss_fn, val_x_t, val_y_t)
-            history.append(MLPEpochMetrics(epoch=epoch, train_loss=train_loss, val_loss=val_loss))
+            history.append(
+                MLPEpochMetrics(epoch=epoch, train_loss=train_loss, val_loss=val_loss, learning_rate=current_lr)
+            )
             epochs_trained = epoch
 
             monitored = val_loss if val_loss is not None else train_loss
@@ -284,6 +391,8 @@ def train_tabular_mlp(
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= config.early_stopping_patience:
                     break
+            if scheduler is not None:
+                scheduler.step(monitored)
 
         network.load_state_dict(best_state)
         network.eval()
@@ -304,6 +413,204 @@ def train_tabular_mlp(
     )
     fitted._network = network
     return fitted
+
+
+def compute_permutation_importance(
+    fitted: FittedTabularMLP,
+    features: Any,
+    targets: Any,
+    *,
+    split: str = "validation",
+    n_repeats: int = 5,
+    random_seed: Optional[int] = None,
+) -> PermutationImportanceResult:
+    """Permutation feature importance of ``fitted`` on a held-out split.
+
+    Each feature column is shuffled ``n_repeats`` times and the increase of MAE
+    and RMSE (in seconds) over the unshuffled baseline is averaged. Rows
+    without a finite target are dropped. Shuffling uses an isolated
+    ``numpy.random.Generator`` seeded with ``random_seed`` (the model's seed by
+    default), so the result is deterministic and the global RNG state is left
+    untouched; the caller's ``features`` are never modified. Compute it on
+    ``validation`` (never ``test``, which would leak evaluation data into model
+    analysis). See :data:`PERMUTATION_COLLINEARITY_NOTE` for how to read it.
+    """
+    if not isinstance(fitted, FittedTabularMLP):
+        raise TypeError("fitted must be a FittedTabularMLP")
+    if not _is_int(n_repeats) or n_repeats < 1:
+        raise ValueError(f"n_repeats must be an integer >= 1, got {n_repeats!r}")
+    if not isinstance(split, str) or not split.strip():
+        raise ValueError("split must be a non-empty string")
+    if random_seed is not None and not _is_int(random_seed):
+        raise ValueError(f"random_seed must be an integer or None, got {random_seed!r}")
+    seed = int(fitted.config.random_seed if random_seed is None else random_seed)
+
+    # ``_feature_matrix`` returns a new array, so the caller's data is never mutated.
+    matrix_all = _feature_matrix(features, fitted.feature_names, label="features", require_finite=False)
+    target_all = _target_vector(targets, len(matrix_all), label="targets")
+    mask = np.isfinite(target_all)
+    if not np.any(mask):
+        raise ValueError("targets contain no finite values")
+    valid_matrix = np.array(matrix_all[mask], dtype=np.float32, copy=True)
+    valid_targets = target_all[mask]
+    if not np.isfinite(valid_matrix).all():
+        raise ValueError("features have missing or non-finite values in rows with a finite target")
+    n_rows = int(len(valid_targets))
+
+    baseline_mae, baseline_rmse = _mae_rmse(fitted.predict(valid_matrix), valid_targets)
+    rng = np.random.default_rng(seed)
+    entries: List[FeatureImportanceEntry] = []
+    for column, name in enumerate(fitted.feature_names):
+        original = valid_matrix[:, column].copy()
+        mae_increases: List[float] = []
+        rmse_increases: List[float] = []
+        try:
+            for _ in range(int(n_repeats)):
+                valid_matrix[:, column] = original[rng.permutation(n_rows)]
+                perm_mae, perm_rmse = _mae_rmse(fitted.predict(valid_matrix), valid_targets)
+                mae_increases.append(perm_mae - baseline_mae)
+                rmse_increases.append(perm_rmse - baseline_rmse)
+        finally:
+            valid_matrix[:, column] = original
+        entries.append(
+            FeatureImportanceEntry(
+                feature=str(name),
+                mae_increase_mean=float(np.mean(mae_increases)),
+                mae_increase_std=float(np.std(mae_increases, ddof=0)),
+                rmse_increase_mean=float(np.mean(rmse_increases)),
+                rmse_increase_std=float(np.std(rmse_increases, ddof=0)),
+            )
+        )
+    entries.sort(key=lambda entry: (-entry.mae_increase_mean, -entry.rmse_increase_mean, entry.feature))
+    return PermutationImportanceResult(
+        split=split,
+        n_rows=n_rows,
+        n_repeats=int(n_repeats),
+        random_seed=seed,
+        baseline_mae=baseline_mae,
+        baseline_rmse=baseline_rmse,
+        importances=entries,
+    )
+
+
+def diagnose_generalization(
+    metrics: Mapping[str, Mapping[str, Any]],
+    *,
+    model_key: str = "mlp",
+    baseline_key: str = "reference_mean",
+    epochs_trained: int,
+    best_epoch: int,
+    max_epochs: int,
+) -> Dict[str, Any]:
+    """Transparent over/underfitting verdict from the ``train`` and ``validation`` metrics.
+
+    ``metrics`` follows the M7 ``metrics.json`` layout
+    (``metrics[split][model_key]["mae"]``). Only ``train`` and ``validation``
+    are read; ``test`` never takes part, so the verdict cannot be tuned on it.
+
+    * ``underfitting``: the model does not beat the mean baseline on
+      validation, or its train MAE is within 95 % of the baseline's;
+    * ``overfitting_risk``: validation MAE is at least 1.25x the train MAE;
+    * ``balanced``: neither of the above;
+    * ``insufficient_metrics``: train or validation MAE is missing.
+
+    Pure Python/NumPy: it imports neither PyTorch nor MLflow.
+    """
+    train = metrics.get("train", {}) or {}
+    validation = metrics.get("validation", {}) or {}
+
+    train_mae = _metric_value(train, model_key, "mae")
+    validation_mae = _metric_value(validation, model_key, "mae")
+    train_rmse = _metric_value(train, model_key, "rmse")
+    validation_rmse = _metric_value(validation, model_key, "rmse")
+    baseline_train_mae = _metric_value(train, baseline_key, "mae")
+    baseline_validation_mae = _metric_value(validation, baseline_key, "mae")
+
+    val_minus_train_mae = (
+        validation_mae - train_mae if train_mae is not None and validation_mae is not None else None
+    )
+    val_to_train_mae_ratio = (
+        validation_mae / train_mae
+        if train_mae is not None and validation_mae is not None and train_mae > _MIN_MAE_FOR_RATIO
+        else None
+    )
+    val_vs_baseline_mae_delta = (
+        validation_mae - baseline_validation_mae
+        if validation_mae is not None and baseline_validation_mae is not None
+        else None
+    )
+
+    if train_mae is None or validation_mae is None:
+        status = "insufficient_metrics"
+        missing = [label for label, value in (("train", train_mae), ("validation", validation_mae)) if value is None]
+        explanation = (
+            f"Cannot diagnose generalization: {model_key!r} MAE is missing for {' and '.join(missing)}."
+        )
+    elif (baseline_validation_mae is not None and validation_mae >= baseline_validation_mae) or (
+        baseline_train_mae is not None
+        and train_mae >= baseline_train_mae * UNDERFITTING_TRAIN_RATIO_VS_BASELINE
+    ):
+        status = "underfitting"
+        reasons = []
+        if baseline_validation_mae is not None and validation_mae >= baseline_validation_mae:
+            reasons.append(
+                f"validation MAE {validation_mae:.4f} does not beat the {baseline_key!r} baseline "
+                f"({baseline_validation_mae:.4f})"
+            )
+        if baseline_train_mae is not None and train_mae >= baseline_train_mae * UNDERFITTING_TRAIN_RATIO_VS_BASELINE:
+            reasons.append(
+                f"train MAE {train_mae:.4f} is >= {UNDERFITTING_TRAIN_RATIO_VS_BASELINE:.2f}x the "
+                f"{baseline_key!r} train MAE ({baseline_train_mae:.4f})"
+            )
+        explanation = "Underfitting: " + "; ".join(reasons) + "."
+    elif val_to_train_mae_ratio is not None and val_to_train_mae_ratio >= OVERFITTING_VAL_TO_TRAIN_MAE_RATIO:
+        status = "overfitting_risk"
+        explanation = (
+            f"Overfitting risk: validation MAE {validation_mae:.4f} is {val_to_train_mae_ratio:.2f}x the "
+            f"train MAE {train_mae:.4f} (threshold {OVERFITTING_VAL_TO_TRAIN_MAE_RATIO:.2f}x)."
+        )
+    else:
+        status = "balanced"
+        ratio_text = f"{val_to_train_mae_ratio:.2f}x" if val_to_train_mae_ratio is not None else "n/a"
+        baseline_text = (
+            f" and beats the {baseline_key!r} baseline by {-val_vs_baseline_mae_delta:.4f}"
+            if val_vs_baseline_mae_delta is not None
+            else ""
+        )
+        explanation = (
+            f"Balanced: validation MAE {validation_mae:.4f} is {ratio_text} the train MAE {train_mae:.4f} "
+            f"(below {OVERFITTING_VAL_TO_TRAIN_MAE_RATIO:.2f}x){baseline_text}."
+        )
+
+    early_stopped = bool(epochs_trained < max_epochs)
+    explanation += (
+        f" Training ran {epochs_trained}/{max_epochs} epochs (best epoch {best_epoch}"
+        f"{', early stopped' if early_stopped else ''})."
+    )
+    return {
+        "status": status,
+        "model_key": model_key,
+        "baseline_key": baseline_key,
+        "train_mae": train_mae,
+        "validation_mae": validation_mae,
+        "train_rmse": train_rmse,
+        "validation_rmse": validation_rmse,
+        "baseline_train_mae": baseline_train_mae,
+        "baseline_validation_mae": baseline_validation_mae,
+        "val_minus_train_mae": val_minus_train_mae,
+        "val_to_train_mae_ratio": val_to_train_mae_ratio,
+        "val_vs_baseline_mae_delta": val_vs_baseline_mae_delta,
+        "early_stopped": early_stopped,
+        "epochs_trained": epochs_trained,
+        "best_epoch": best_epoch,
+        "max_epochs": max_epochs,
+        "thresholds": {
+            "underfitting_train_ratio_vs_baseline": UNDERFITTING_TRAIN_RATIO_VS_BASELINE,
+            "overfitting_val_to_train_mae_ratio": OVERFITTING_VAL_TO_TRAIN_MAE_RATIO,
+        },
+        "explanation": explanation,
+        "evaluated_splits": ["train", "validation"],
+    }
 
 
 def save_mlp_checkpoint(fitted: FittedTabularMLP, path: Path) -> Path:
@@ -347,10 +654,15 @@ def log_mlp_pyfunc_model(
     fitted: FittedTabularMLP,
     *,
     example: pd.DataFrame,
-    registered_model_name: str,
+    registered_model_name: Optional[str] = None,
     artifact_path: str = "model",
 ) -> None:
-    """Log and register the MLP as an ``mlflow.pyfunc`` model in the active run.
+    """Log the MLP as an ``mlflow.pyfunc`` model in the active run.
+
+    With a non-empty ``registered_model_name`` the model is also registered as
+    a new version in the Model Registry; with ``None`` it is only logged under
+    ``runs:/<run_id>/<artifact_path>`` (useful for experimental comparisons
+    that must not add candidates to the registry).
 
     The signature is inferred from ``example`` and the model's own predictions,
     so the named input schema follows ``example``'s columns; pass the encoded
@@ -368,6 +680,10 @@ def log_mlp_pyfunc_model(
             f"`{TORCH_INSTALL_HINT}` first"
         ) from exc
 
+    if registered_model_name is not None and (
+        not isinstance(registered_model_name, str) or not registered_model_name.strip()
+    ):
+        raise ValueError("registered_model_name must be a non-empty string or None")
     if list(example.columns) != list(fitted.feature_names):
         raise ValueError("example columns must equal the fitted feature_names in the same order")
     signature = infer_signature(example, fitted.predict(example))
@@ -428,6 +744,24 @@ def _evaluate_loss(torch: Any, network: Any, loss_fn: Any, features: Any, target
             batch_y = targets[start:start + _EVAL_BATCH_SIZE]
             total += float(loss_fn(network(batch_x).reshape(-1), batch_y).item()) * int(batch_y.shape[0])
     return total / int(targets.shape[0])
+
+
+def _mae_rmse(predictions: np.ndarray, targets: np.ndarray) -> Tuple[float, float]:
+    errors = np.asarray(predictions, dtype=np.float64) - np.asarray(targets, dtype=np.float64)
+    return float(np.mean(np.abs(errors))), float(np.sqrt(np.mean(errors ** 2)))
+
+
+def _metric_value(split_metrics: Any, model_key: str, metric: str) -> Optional[float]:
+    """``split_metrics[model_key][metric]`` as a finite float, or ``None``."""
+    if not isinstance(split_metrics, Mapping):
+        return None
+    model_metrics = split_metrics.get(model_key)
+    if not isinstance(model_metrics, Mapping):
+        return None
+    value = model_metrics.get(metric)
+    if not _is_real(value) or not math.isfinite(float(value)):
+        return None
+    return float(value)
 
 
 def _predict_original_scale(torch: Any, network: Any, matrix: np.ndarray, y_mean: float, y_std: float) -> np.ndarray:
@@ -529,6 +863,16 @@ def _validated_config(config: MLPConfig) -> MLPConfig:
         (config.loss in ("huber", "mse"), "loss must be 'huber' or 'mse'"),
         (isinstance(config.scale_target, (bool, np.bool_)), "scale_target must be a boolean"),
         (_is_int(config.random_seed), "random_seed must be an integer"),
+        (isinstance(config.lr_scheduler, str) and config.lr_scheduler in ("none", "reduce_on_plateau"),
+         "lr_scheduler must be 'none' or 'reduce_on_plateau'"),
+        (_is_real(config.lr_scheduler_factor) and math.isfinite(config.lr_scheduler_factor)
+         and 0.0 < config.lr_scheduler_factor < 1.0,
+         "lr_scheduler_factor must be a finite number in (0.0, 1.0)"),
+        (_is_int(config.lr_scheduler_patience) and config.lr_scheduler_patience >= 1,
+         "lr_scheduler_patience must be an integer >= 1"),
+        (_is_real(config.lr_scheduler_min_lr) and math.isfinite(config.lr_scheduler_min_lr)
+         and config.lr_scheduler_min_lr >= 0.0,
+         "lr_scheduler_min_lr must be a finite number >= 0"),
     )
     for ok, message in checks:
         if not ok:
@@ -545,4 +889,7 @@ def _validated_config(config: MLPConfig) -> MLPConfig:
         min_delta=float(config.min_delta),
         scale_target=bool(config.scale_target),
         random_seed=int(config.random_seed),
+        lr_scheduler_factor=float(config.lr_scheduler_factor),
+        lr_scheduler_patience=int(config.lr_scheduler_patience),
+        lr_scheduler_min_lr=float(config.lr_scheduler_min_lr),
     )
