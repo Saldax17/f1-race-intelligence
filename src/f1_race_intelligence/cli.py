@@ -128,6 +128,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
     config.add_argument("--m6-report", help="Verified local M6 report to use as M7 training input")
+    config.add_argument(
+        "--model-type",
+        choices=["linear_regression", "mlp"],
+        default=None,
+        help="M7 model family to train (default: training.model_type from config)",
+    )
+    config.add_argument(
+        "--registered-model-name",
+        default=None,
+        help="Override the MLflow registered model name for M7",
+    )
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -189,6 +200,14 @@ def settings_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     elif args.overwrite_derived:
         overrides["consolidation"] = {"overwrite": True}
         overrides["features"] = {"overwrite": True}
+    training: Dict[str, Any] = {}
+    if getattr(args, "model_type", None) is not None:
+        training["model_type"] = args.model_type
+    if getattr(args, "registered_model_name", None) is not None:
+        training["registered_model_name"] = args.registered_model_name
+        training["mlp"] = {"registered_model_name": args.registered_model_name}
+    if training:
+        overrides["training"] = training
     return overrides
 
 
@@ -452,7 +471,11 @@ def run_m7(ctx: RunContext) -> StageOutcome:
     report_path = ctx.args.m6_report or ctx.settings.training.m6_report_path
     if not report_path:
         return StageOutcome(ok=False, reason="M7 requires --m6-report or training.m6_report_path")
-    result = TrainingRunner(ctx.settings, m6_report_path=report_path).run()
+    result = TrainingRunner(
+        ctx.settings,
+        m6_report_path=report_path,
+        model_type=getattr(ctx.args, "model_type", None),
+    ).run()
     return StageOutcome(ok=True, summary=result.summary())
 
 
@@ -582,6 +605,10 @@ def main(
             raise ValueError("--report is only valid with --stage verify-m6")
         if args.m6_report and "m7" not in stages:
             raise ValueError("--m6-report is only valid with --stage m7")
+        if args.model_type is not None and "m7" not in stages:
+            raise ValueError("--model-type is only valid with --stage m7")
+        if args.registered_model_name is not None and "m7" not in stages:
+            raise ValueError("--registered-model-name is only valid with --stage m7")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
         if args.plan_output:

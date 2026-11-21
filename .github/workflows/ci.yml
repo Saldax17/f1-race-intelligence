@@ -65,12 +65,14 @@ jobs:
             requirements/runtime-lock.txt
             requirements/training-lock.txt
             requirements/dev-lock.txt
+            requirements/dl-lock.txt
       - name: Install locked dependencies
         run: |
           python -m pip install -r requirements/runtime-lock.txt
           python -m pip install -r requirements/training-lock.txt
           python -m pip install -r requirements/dev-lock.txt
-          python -m pip install --editable ".[training,serve]" --no-deps --no-build-isolation
+          python -m pip install -r requirements/dl-lock.txt
+          python -m pip install --editable ".[training,serve,dl]" --no-deps --no-build-isolation
           python -m pip check
       - name: Run test suite
         run: python -m pytest -p no:cacheprovider -m "not integration" -ra --junitxml=pytest-results.xml
@@ -113,7 +115,8 @@ jobs:
           .venv-base/bin/python -m pip install --editable . --no-deps --no-build-isolation
           .venv-base/bin/python -m pip check
           .venv-base/bin/python -c "import importlib.util; assert importlib.util.find_spec('mlflow') is None"
-      - name: Run M1-M6 and optional-dependency tests without MLflow
+          .venv-base/bin/python -c "import importlib.util; assert importlib.util.find_spec('torch') is None"
+      - name: Run M1-M6 and optional-dependency tests without MLflow or PyTorch
         run: .venv-base/bin/python -m pytest -p no:cacheprovider -m "not integration" -ra
 
   hash-parity:

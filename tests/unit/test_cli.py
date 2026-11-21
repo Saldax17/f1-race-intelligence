@@ -442,3 +442,149 @@ def test_copy_raw_between_layouts(build_raw, config_file, raw_root, tmp_path) ->
 
     assert code == cli.EXIT_OK
     assert (tmp_path / "lake" / "raw" / f"year={YEAR}" / "endpoint=meetings" / "meetings.json").exists()
+
+
+# -- M7 model selection (--model-type / --registered-model-name) -----------------
+
+
+@pytest.mark.parametrize(
+    ("stage", "flags", "message"),
+    [
+        ("m6", ["--model-type", "mlp"], "--model-type is only valid with --stage m7"),
+        ("m5", ["--model-type", "linear_regression"], "--model-type is only valid with --stage m7"),
+        ("verify-m6", ["--report", "r.json", "--model-type", "mlp"], "--model-type is only valid with --stage m7"),
+        ("m6", ["--registered-model-name", "custom"], "--registered-model-name is only valid with --stage m7"),
+        ("m4", ["--registered-model-name", "custom"], "--registered-model-name is only valid with --stage m7"),
+    ],
+)
+def test_m7_model_flags_are_rejected_outside_m7(config_file, capsys, stage, flags, message) -> None:
+    assert cli.main(["--stage", stage, *flags, "--config", str(config_file)]) == cli.EXIT_USAGE
+    assert message in capsys.readouterr().err
+
+
+def test_an_unknown_model_type_is_rejected_by_the_parser(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.build_parser().parse_args(["--stage", "m7", "--model-type", "random_forest"])
+    assert excinfo.value.code == 2
+    assert "random_forest" in capsys.readouterr().err
+
+
+def test_model_flags_default_to_none_and_add_no_training_overrides() -> None:
+    args = cli.build_parser().parse_args(["--stage", "m7", "--m6-report", "report.json"])
+
+    assert args.model_type is None
+    assert args.registered_model_name is None
+    assert "training" not in cli.settings_overrides(args)
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        (["--model-type", "mlp"], {"model_type": "mlp"}),
+        (["--model-type", "linear_regression"], {"model_type": "linear_regression"}),
+        (
+            ["--registered-model-name", "custom"],
+            {"registered_model_name": "custom", "mlp": {"registered_model_name": "custom"}},
+        ),
+        (
+            ["--model-type", "mlp", "--registered-model-name", "custom-mlp"],
+            {
+                "model_type": "mlp",
+                "registered_model_name": "custom-mlp",
+                "mlp": {"registered_model_name": "custom-mlp"},
+            },
+        ),
+    ],
+)
+def test_model_flags_become_training_overrides(flags, expected) -> None:
+    args = cli.build_parser().parse_args(["--stage", "m7", "--m6-report", "report.json", *flags])
+
+    assert cli.settings_overrides(args)["training"] == expected
+
+
+@pytest.mark.parametrize(
+    ("flags", "model_type", "registered_name"),
+    [
+        ([], "linear_regression", "f1-next-lap-linear-regression"),
+        (["--model-type", "mlp"], "mlp", "f1-next-lap-mlp"),
+        (["--model-type", "mlp", "--registered-model-name", "custom-mlp"], "mlp", "custom-mlp"),
+        (["--model-type", "linear_regression", "--registered-model-name", "custom-lr"], "linear_regression", "custom-lr"),
+    ],
+)
+def test_model_overrides_resolve_the_effective_settings(config_file, flags, model_type, registered_name) -> None:
+    args = cli.build_parser().parse_args(["--stage", "m7", "--m6-report", "report.json", *flags])
+
+    settings = cli.load_settings(str(config_file), overrides=cli.settings_overrides(args))
+
+    assert settings.training.model_type == model_type
+    assert settings.training.effective_registered_model_name() == registered_name
+    # the overlay is merged deeply: the configured MLP hyperparameters survive
+    assert settings.training.mlp.hidden_dims == [64, 32]
+
+
+def test_registered_model_name_override_keeps_yaml_mlp_hyperparameters(config_file) -> None:
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["training"] = {"model_type": "mlp", "mlp": {"hidden_dims": [8], "max_epochs": 3}}
+    config_file.write_text(yaml.safe_dump(data), encoding="utf-8")
+    args = cli.build_parser().parse_args(
+        ["--stage", "m7", "--m6-report", "report.json", "--registered-model-name", "from-cli"]
+    )
+
+    settings = cli.load_settings(str(config_file), overrides=cli.settings_overrides(args))
+
+    assert settings.training.model_type == "mlp"
+    assert settings.training.mlp.hidden_dims == [8]
+    assert settings.training.mlp.max_epochs == 3
+    assert settings.training.effective_registered_model_name() == "from-cli"
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_model_type", "expected_name"),
+    [
+        ([], None, "f1-next-lap-linear-regression"),
+        (["--model-type", "mlp"], "mlp", "f1-next-lap-mlp"),
+        (["--model-type", "mlp", "--registered-model-name", "cli-mlp"], "mlp", "cli-mlp"),
+    ],
+)
+def test_m7_passes_model_selection_to_the_training_runner(
+    config_file, tmp_path, monkeypatch, capsys, flags, expected_model_type, expected_name
+) -> None:
+    from f1_race_intelligence.modeling import training as training_module
+
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, settings, *, m6_report_path=None, model_type=None):
+            calls.append(
+                {
+                    "m6_report_path": m6_report_path,
+                    "model_type": model_type,
+                    "effective_name": settings.training.effective_registered_model_name(model_type),
+                }
+            )
+
+        def run(self):
+            return training_module.TrainingResult(
+                run_id="m7-run",
+                m6_run_id="m6-run",
+                input_fingerprint="sha256:" + "0" * 64,
+                model_name=calls[-1]["effective_name"],
+                model_version="1",
+                model_uri=f"models:/{calls[-1]['effective_name']}/1",
+                metrics={},
+                report_path=str(tmp_path / "report.json"),
+                source_commit=None,
+                model_type=calls[-1]["model_type"] or "linear_regression",
+            )
+
+    monkeypatch.setattr(training_module, "TrainingRunner", FakeRunner)
+    report = tmp_path / "m6-report.json"
+    report.write_text("{}", encoding="utf-8")
+
+    code = cli.main(["--stage", "m7", "--m6-report", str(report), *flags, "--config", str(config_file)])
+
+    assert code == cli.EXIT_OK
+    assert calls == [
+        {"m6_report_path": str(report), "model_type": expected_model_type, "effective_name": expected_name}
+    ]
+    assert f'"model_name": "{expected_name}"' in capsys.readouterr().err
