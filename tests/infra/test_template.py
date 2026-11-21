@@ -746,3 +746,20 @@ def test_extraction_years_parameter_feeds_the_state_machine_default(template) ->
         assert not pattern.fullmatch(invalid)
     substitutions = template["Resources"]["PipelineStateMachine"]["Properties"]["DefinitionSubstitutions"]
     assert substitutions["DefaultExtractionYears"] == {"Ref": "ExtractionYears"}
+
+
+def test_temporary_smoke_test_permission_is_exactly_get_put_on_one_prefix(template) -> None:
+    """TEMPORARY statement for the synthetic Fargate smoke test; remove it with this test afterwards."""
+    role = template["Resources"]["DataProcessingTaskRole"]["Properties"]
+    statements = [s for policy in role["Policies"] for s in policy["PolicyDocument"]["Statement"]]
+    smoke = [s for s in statements if s.get("Sid") == "TemporarySyntheticFargateSmokeTest"]
+
+    assert len(smoke) == 1
+    assert smoke[0]["Effect"] == "Allow"
+    assert sorted(as_list(smoke[0]["Action"])) == ["s3:GetObject", "s3:PutObject"]
+    assert smoke[0]["Resource"] == {"Fn::Sub": "${DataBucket.Arn}/smoke-tests/fargate-synthetic/20261121-856868e1/*"}
+    # nothing else grants a delete, and no other statement mentions the smoke-test prefix
+    for statement in statements:
+        assert not any(action.startswith("s3:Delete") for action in as_list(statement["Action"]))
+        if statement is not smoke[0]:
+            assert "smoke-tests" not in str(statement.get("Resource"))

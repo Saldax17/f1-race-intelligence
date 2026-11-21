@@ -608,6 +608,16 @@ Resources:
                   - !Sub "${DataBucket.Arn}/manifests/features/*"
                   - !Sub "${DataBucket.Arn}/manifests/modeling/*"
                   - !Sub "${DataBucket.Arn}/manifests/plan/*"
+              # TEMPORARY - remove after the synthetic Fargate smoke test.
+              # Exists only so a one-off, synthetic-data run of copy-raw/M3/M4/M5
+              # can write under an isolated prefix of the data bucket. Get/Put on
+              # exactly this prefix; no delete, no other prefix, no other bucket.
+              # Part of the verification record: remove this statement (and its
+              # test) in a separate change once the smoke test has been reviewed.
+              - Sid: TemporarySyntheticFargateSmokeTest
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${DataBucket.Arn}/smoke-tests/fargate-synthetic/20261121-856868e1/*"
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref Environment }
