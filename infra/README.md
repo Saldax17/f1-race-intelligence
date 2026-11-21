@@ -405,6 +405,69 @@ a arrancar solo se verifica en AWS.
 Estas medidas **mitigan** la explotación local; **no corrigen** los paquetes
 vulnerables de la imagen base Debian 12 (sin parche publicado en bookworm).
 
+**Hallazgos del escaneo de ECR (imagen `88514b4`)**
+
+*Procedencia.* Verificado el 2026-11-21: escaneo de ECR del digest
+`sha256:ad1d546424cdcf263020cd7813889f0c86b1aceccc2d501d49fbaa3803132799`
+(base `python:3.12-slim-bookworm` con el digest anterior): **17 HIGH, 28 MEDIUM y
+8 LOW**. El estado de parche procede del Debian Security Tracker (consultado el
+mismo día); la presencia de cada biblioteca, de los ejecutables y de las
+bibliotecas cargadas se comprobó dentro de la imagen. Sustituye a los 13
+hallazgos (7 HIGH) reportados en el ROADMAP (D2), que no eran verificables
+desde el repositorio.
+
+*Remediación.* Subir el digest de la base a
+`sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df`
+(Python 3.12.16, misma distribución Bookworm) actualiza `apt` a 2.6.2 y
+`openssl`/`libssl3` a `3.0.22-1~deb12u2`, y es el único cambio. No se usa
+`apt-get upgrade` (no sería reproducible) ni se migra a Trixie. El efecto sobre
+el escaneo es **esperado, no medido**: la imagen nueva aún no se ha publicado ni
+escaneado en ECR.
+
+*Resumen de los 17 HIGH:* **2 con parche disponible** y **15 sin parche
+disponible en Bookworm** (3 mitigados por configuración verificada y 12 que
+requieren aceptación de riesgo).
+
+| CVE | Paquete (versión) | Estado en Debian | Tratamiento |
+|---|---|---|---|
+| CVE-2026-109518 | apt 2.6.1 | corregido: 2.6.2 (`bookworm-security`) | **Parche disponible**: lo aplica el nuevo digest |
+| CVE-2026-84782 | openssl 3.0.22-1~deb12u1 | corregido: `~deb12u2` (`bookworm-security`) | **Parche disponible**: lo aplica el nuevo digest |
+| CVE-2026-53613 | util-linux 2.38.1-5+deb12u3 | sin parche en Bookworm | **Mitigado por configuración verificada** |
+| CVE-2026-78410 | util-linux (igual) | sin parche en Bookworm | **Mitigado por configuración verificada** |
+| CVE-2026-84243 | glibc 2.36-9+deb12u14 | sin parche en Bookworm ni en Trixie | **Mitigado por configuración verificada** |
+| CVE-2026-53615 | util-linux (igual) | sin parche en Bookworm | **Requiere aceptación** |
+| CVE-2025-6020 | pam 1.5.2-6+deb12u2 | corregido solo en Trixie | **Requiere aceptación** |
+| CVE-2026-112314, -112320, -112321, -112322, -112323, -119079 | krb5 1.20.1-2+deb12u5 | sin corregir en ninguna versión de Debian | **Requieren aceptación** (6) |
+| CVE-2026-119373, -119374, -119379 | sqlite3 3.40.1-2+deb12u2 | sin parche en Bookworm ni en Trixie | **Requieren aceptación** (3) |
+| CVE-2026-85091 | zlib 1:1.2.13.dfsg-1 | corregido solo en Trixie | **Pendiente: evidencia incompleta**; requiere aceptación mientras tanto |
+
+*Mitigaciones de configuración (verificadas en la imagen y en la ejecución de la
+tarea).* CVE-2026-53613 y -78410 exigen un `mount` setuid con una entrada
+`fstab` de usuario: la imagen no tiene ningún fichero setuid/setgid (el build lo
+verifica), la tarea se ejecuta como UID 10001 con `capabilities.drop: ["ALL"]` y
+no monta nada. CVE-2026-84243 exige que un tercero fije `LANGUAGE`/`LANG` en el
+entorno del proceso y que este cruce un límite de confianza sin `AT_SECURE`: el
+entorno lo define la task definition (solo variables `F1_*`) y no hay ejecutables
+setuid ni servicios que acepten variables de entorno de clientes.
+
+*Riesgos que requieren aceptación (no son mitigaciones de configuración).* Para
+`krb5`, `sqlite3`, `pam` y CVE-2026-53615 hay **evidencia de alcance**, no
+mitigación: tras importar el paquete y sus dependencias de runtime no se cargan
+`libgssapi`/`libkrb5`, `libsqlite3`, `libpam`, `libmount` ni `libblkid`; el lock
+de runtime no incluye consumidores de sqlite, Kerberos ni PAM; no hay servicios
+(`sshd`, servidores krb5, cron). Siguen sin parche en Bookworm y la aceptación
+debe quedar registrada por el responsable humano. **zlib** (CVE-2026-85091) se
+mantiene como riesgo pendiente: el módulo `zlib` de Python no referencia ninguna
+función `gz*` (solo `deflate`/`inflate`), pero la comprobación no cubre código
+nativo que enlace `libz` por su cuenta, así que la evidencia no se considera
+completa.
+
+*Limitaciones.* La lista de bibliotecas cargadas sale de importar los módulos del
+proyecto, no de una traza exhaustiva de todas las rutas de ejecución. Los
+resultados de las etapas M3–M5 en la imagen se probaron con datos sintéticos; M2
+no se ha probado dentro de la imagen (requiere OpenF1). Hasta que ECR escanee la
+imagen nueva, las cifras posteriores a la remediación no están verificadas.
+
 **Red y costes**
 
 VPC dedicada con subredes públicas e Internet Gateway; cada tarea recibe una
