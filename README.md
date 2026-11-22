@@ -1251,7 +1251,42 @@ CloudWatch Logs + alarmas                            IAM role por tarea (mínimo
 Glue Data Catalog / Athena (opcional, partition projection)
 ```
 
-## 15. Ejecutar tests
+## 15. Modelo de carrera (M7): pronóstico en carrera desde la vuelta *k*
+
+Dado todo lo observado hasta el final de la vuelta *k*, el modelo entrega la
+matriz N×N `P[i, j] = Pr(piloto i termina j-ésimo)` más `Pr(DNF)` por piloto. Los
+coches retirados ocupan las últimas posiciones, así que la matriz es doblemente
+estocástica por construcción. La matemática y cada decisión están en
+`docs/f1-model-math.md`; el alcance, en `docs/f1-model-scope.md`; la
+especificación implementada (formulación, supuestos, censura y DNF, priors,
+alcance y protocolo anti-leakage), en `docs/m7-model-spec.md`.
+
+| Módulo (`race_model/`) | Qué hace |
+|---|---|
+| `racedata` | Lee una carrera del raw (local o S3) o en vivo de OpenF1; `truncate_at_lap` es la guarda anti-leakage: corta todo después de que el líder completa la vuelta *k* y elimina el resultado oficial |
+| `regime` | Vuelta a vuelta: verde / SC / VSC / bandera roja desde `race_control` |
+| `pace` | Nivel 1: vueltas limpias, ritmo θ̂ por carrera (ridge, SE por covarianza, AR(1)), degradación por compuesto |
+| `season` | Nivel 2: forma de coche y piloto entre carreras (Kalman, ρ ≡ 1) + clasificación como medición |
+| `events` | Riesgos de SC/VSC/roja y de abandono por vuelta (pooling por circuito), pérdida en boxes, momento de parada |
+| `forecast` | Posterior del ritmo con las vueltas 1..*k* y Monte Carlo vectorizado → matriz |
+| `scoring`, `baselines` | RPS, log-loss por pares, calibración; baselines "orden persiste + parada" y matriz de transición |
+| `artifact`, `runner` | Versiones inmutables en `models/m7/`, puntero `latest.json`, etapas `m7-*` |
+| `lambda_handler` | Entrada de la Lambda de pronóstico (bajo demanda o en vivo) |
+
+```bash
+python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote     # entrenar y promover si supera al baseline
+python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
+python -m f1_race_intelligence --stage m7-update                          # tras cada GP: estado de temporada al día
+```
+
+Split por fechas fijas: 2023–24 entrenamiento; 2025 hasta Spa validación; de
+Budapest a Abu Dabi test. **El test está sellado** (`race_model.test_sealed`):
+ninguna etapa lee sus carreras, salvo `m7-evaluate --split test --unseal-test`,
+que queda registrado en `test_ledger.json` y se rechaza una segunda vez. Las
+iteraciones del modelo se registran en `docs/m7-experiments.md`. Despliegue y mantenimiento en AWS: `infra/README.md`, sección
+"Modelo de carrera (M7)".
+
+## 16. Ejecutar tests
 
 ```bash
 # Unit tests (sin red, con mocks) — se ejecutan por defecto
@@ -1280,7 +1315,7 @@ sintéticos, con la demostración descrita en [DEMO_LOCAL.md](DEMO_LOCAL.md)
 (`python -m pytest scripts/demo_local_mlops.py -s`). Esa demostración no forma
 parte de la suite por defecto.
 
-## 16. Limitaciones actuales
+## 17. Limitaciones actuales
 
 - No hay modelos de datos tipados para las respuestas de OpenF1 (se
   devuelven como `list`/`dict` crudos).
@@ -1298,7 +1333,7 @@ parte de la suite por defecto.
   y compara los hashes de M6 entre ambos. No ejecuta `cfn-lint` ni
   `sam validate`, no construye la imagen y no despliega (sin CD).
 
-## 17. Licencia y uso de datos
+## 18. Licencia y uso de datos
 
 Este proyecto consume la API pública [OpenF1](https://openf1.org/), cuyos
 términos de uso la destinan a fines educativos, proyectos personales de
@@ -1307,7 +1342,7 @@ Maestría en Ciencia de Datos y Analítica. No se distribuyen ni republican
 los datos crudos obtenidos de OpenF1 fuera de este repositorio; los archivos
 bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 
-## 18. Próximos pasos (fuera del alcance de esta etapa)
+## 19. Próximos pasos (fuera del alcance de esta etapa)
 
 Ya implementado y demostrado **localmente** (con datos sintéticos): features
 (M5), dataset de modelado (M6), entrenamiento con MLflow (M7), publicación del
@@ -1332,7 +1367,7 @@ temporadas y protección de M6. Queda pendiente:
 
 ---
 
-## 19. Prototipo de serving (M8)
+## 20. Prototipo de serving (M8)
 
 > Prototipo **local**. No entrena modelos ni despliega en AWS/SageMaker. M7
 > ya registra modelos localmente y la publicación los empaqueta (ver

@@ -117,6 +117,26 @@ class F1Client(BaseAPIClient):
         params = build_params(session_key=session_key, driver_number=driver_number, **filters)
         return self._get("/car_data", params)
 
+    def get_location(
+        self,
+        *,
+        session_key: Optional[int] = None,
+        driver_number: Optional[int] = None,
+        **filters: Any,
+    ) -> Any:
+        """GET /location — car position on track (x, y, z), ~3.7 Hz per car.
+
+        Same volume as ``car_data``, so the same guard: ``driver_number`` and/or a
+        date-range filter is required.
+        """
+        if driver_number is None and not any(key.startswith("date") for key in filters):
+            raise ValueError(
+                "get_location requires 'driver_number' and/or a date range filter "
+                "(e.g. date>=...) — an unfiltered call can return millions of rows"
+            )
+        params = build_params(session_key=session_key, driver_number=driver_number, **filters)
+        return self._get("/location", params)
+
     def get_positions(
         self,
         *,
@@ -182,3 +202,30 @@ class F1Client(BaseAPIClient):
         """GET /race_control"""
         params = build_params(session_key=session_key, meeting_key=meeting_key, **filters)
         return self._get("/race_control", params)
+
+    def get_session_result(
+        self,
+        *,
+        session_key: Optional[int] = None,
+        driver_number: Optional[int] = None,
+        **filters: Any,
+    ) -> Any:
+        """GET /session_result — official classification (position, laps, dnf/dns/dsq)."""
+        params = build_params(session_key=session_key, driver_number=driver_number, **filters)
+        return self._get("/session_result", params)
+
+    def get_starting_grid(
+        self,
+        *,
+        session_key: Optional[int] = None,
+        meeting_key: Optional[int] = None,
+        **filters: Any,
+    ) -> Any:
+        """GET /starting_grid — grid position and qualifying lap per driver.
+
+        OpenF1 answers 404 for a *race* ``session_key``: query the qualifying
+        session or the whole meeting (which on sprint weekends also returns the
+        sprint grid; readers keep the rows of the ``Qualifying`` session).
+        """
+        params = build_params(session_key=session_key, meeting_key=meeting_key, **filters)
+        return self._get("/starting_grid", params)

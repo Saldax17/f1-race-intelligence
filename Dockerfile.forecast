@@ -1,0 +1,39 @@
+# Lambda container image for race forecasts (M7), see race_model/lambda_handler.py.
+#
+# Build:  see infra/README.md ("Para publicar la imagen batch en ECR"): clean tree only,
+#         --platform linux/amd64 and the F1_GIT_COMMIT/F1_GIT_DIRTY build args.
+# Local:  docker run --rm -p 9000:8080 -e F1_ENVIRONMENT=aws -e F1_STORAGE_BUCKET=<bucket> f1-race-forecast:dev
+#         curl -XPOST localhost:9000/2015-03-31/functions/function/invocations -d '{"mode":"live"}'
+#
+# Same code, configuration and dependency lock as the batch image (Dockerfile);
+# only the base differs, because Lambda needs its runtime interface client.
+# Pin the base by digest before the first production deploy, as the batch
+# image does:
+#   docker buildx imagetools inspect public.ecr.aws/lambda/python:3.12   (Digest: line)
+FROM public.ecr.aws/lambda/python:3.12
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# The exact commit, as in the batch image: build with
+#   --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" --build-arg F1_GIT_DIRTY=false
+ARG F1_GIT_COMMIT
+ARG F1_GIT_DIRTY
+
+COPY requirements/runtime-lock.txt requirements/runtime-lock.txt
+RUN pip install --requirement requirements/runtime-lock.txt
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY configs ./configs
+RUN pip install --no-deps . && pip check
+
+# Lambda's file system is read-only except /tmp; nothing here writes locally.
+ENV F1_CONFIG_PATH=${LAMBDA_TASK_ROOT}/configs/config.yaml \
+    F1_ENVIRONMENT=aws \
+    F1_COMPONENT=race-forecast \
+    F1_GIT_COMMIT=${F1_GIT_COMMIT} \
+    F1_GIT_DIRTY=${F1_GIT_DIRTY}
+
+CMD ["f1_race_intelligence.race_model.lambda_handler.handler"]

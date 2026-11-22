@@ -181,7 +181,8 @@ def test_an_installed_package_runs_with_f1_config_path(installed_package: Path, 
     extraction = load_settings().historical_extraction
 
     assert extraction.years == [2023, 2024, 2025]
-    assert len(extraction.endpoints) == 9
+    assert len(extraction.endpoints) == 11
+    assert {"session_result", "starting_grid"} <= set(extraction.endpoints)
 
 
 def test_an_empty_f1_config_path_counts_as_unset(monkeypatch) -> None:

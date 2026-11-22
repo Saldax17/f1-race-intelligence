@@ -1,0 +1,111 @@
+{
+  "Comment": "F1 race model (M7) lifecycle. Input {\"action\": \"train\"} fits a new version and promotes it only if it beats the baseline on validation; {\"action\": \"update\"} refreshes the season state after a race weekend with frozen hyperparameters. Every task is the batch image on Fargate.",
+  "StartAt": "ChooseAction",
+  "States": {
+    "ChooseAction": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.action", "StringEquals": "update", "Next": "UpdateModel" }
+      ],
+      "Default": "TrainModel"
+    },
+    "TrainModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ClusterArn}",
+        "TaskDefinition": "${TaskDefinitionArn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            { "Name": "race-model", "Command": ["--stage", "m7-train"] }
+          ]
+        }
+      },
+      "ResultPath": "$.train",
+      "TimeoutSeconds": 7200,
+      "Retry": [
+        { "ErrorEquals": ["ECS.AmazonECSException", "States.Timeout"], "IntervalSeconds": 60, "MaxAttempts": 1, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "EvaluateAndPromote"
+    },
+    "EvaluateAndPromote": {
+      "Type": "Task",
+      "Comment": "Scores the newest version on validation; exits non-zero (and alerts) when it does not beat the baseline, leaving 'latest' unchanged.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ClusterArn}",
+        "TaskDefinition": "${TaskDefinitionArn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            { "Name": "race-model", "Command": ["--stage", "m7-evaluate", "--promote"] }
+          ]
+        }
+      },
+      "ResultPath": "$.evaluate",
+      "TimeoutSeconds": 7200,
+      "Retry": [
+        { "ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 60, "MaxAttempts": 1, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Done"
+    },
+    "UpdateModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ClusterArn}",
+        "TaskDefinition": "${TaskDefinitionArn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${SubnetA}", "${SubnetB}"],
+            "SecurityGroups": ["${TaskSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            { "Name": "race-model", "Command": ["--stage", "m7-update"] }
+          ]
+        }
+      },
+      "ResultPath": "$.update",
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        { "ErrorEquals": ["ECS.AmazonECSException", "States.Timeout"], "IntervalSeconds": 60, "MaxAttempts": 1, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Done"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "[${Environment}] F1 race model run failed",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "RaceModelRunFailed", "Cause": "A race model task failed; see the alert and the ECS task logs." },
+    "Done": { "Type": "Succeed" }
+  }
+}

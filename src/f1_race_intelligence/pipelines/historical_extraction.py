@@ -147,17 +147,48 @@ def _plan_car_data(context: SessionContext) -> Iterator[ExtractionUnit]:
         )
 
 
+def _plan_location(context: SessionContext) -> Iterator[ExtractionUnit]:
+    """Car position on track (x, y, z) has car_data's volume: one file per driver too."""
+    for driver_number in _driver_numbers(context):
+        yield ExtractionUnit(
+            parameters={**context.partition, "driver_number": driver_number},
+            file_name=f"driver_{driver_number}.json",
+            fetch=partial(
+                context.client.get_location,
+                session_key=context.session_key,
+                driver_number=driver_number,
+            ),
+        )
+
+
+def _plan_starting_grid(context: SessionContext) -> Iterator[ExtractionUnit]:
+    """The grid is keyed by meeting: a race ``session_key`` returns 404.
+
+    The file is stored with the race session it belongs to, so a reader of one
+    race finds everything about it under a single prefix. On sprint weekends
+    the meeting returns two grids; readers keep the ``Qualifying`` session's.
+    """
+    yield ExtractionUnit(
+        parameters=context.partition,
+        file_name=f"session_{context.session_key}.json",
+        fetch=partial(context.client.get_starting_grid, meeting_key=context.meeting_key),
+    )
+
+
 # The single source of truth for which endpoint names are valid in config.
 ENDPOINT_PLANNERS: Dict[str, EndpointPlanner] = {
     "drivers": _session_scoped("get_drivers"),
     "laps": _session_scoped("get_laps"),
     "car_data": _plan_car_data,
+    "location": _plan_location,
     "position": _session_scoped("get_positions"),
     "intervals": _session_scoped("get_intervals"),
     "stints": _session_scoped("get_stints"),
     "pit": _session_scoped("get_pit"),
     "weather": _session_scoped("get_weather"),
     "race_control": _session_scoped("get_race_control"),
+    "session_result": _session_scoped("get_session_result"),
+    "starting_grid": _plan_starting_grid,
 }
 
 
