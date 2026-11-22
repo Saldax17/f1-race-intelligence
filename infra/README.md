@@ -495,8 +495,11 @@ y CloudWatch Logs. Se descartó NAT Gateway y VPC endpoints de interfaz porque
 facturan por hora aunque no se ejecute nada. La VPC, subredes, tabla de rutas,
 gateway y cluster no tienen coste propio; sí lo tienen la **IPv4 pública** de
 cada tarea mientras corre, el cómputo Fargate (0,5 vCPU / 1 GB, mínimo de un
-minuto por tarea), los logs y la transferencia de datos. La conectividad real
-no se ha probado: se verifica en la primera ejecución controlada.
+minuto por tarea), los logs y la transferencia de datos. El smoke del
+2026-11-21 (ver «Validación de runtime AWS») comprobó que las tareas obtienen la
+imagen de ECR, escriben en CloudWatch Logs y leen y escriben en S3. La
+conectividad con OpenF1 no se ha probado; se verifica en la primera ejecución
+controlada.
 
 **Publicar y activar (fase posterior, con aprobación)**
 
@@ -515,6 +518,107 @@ no se ha probado: se verifica en la primera ejecución controlada.
    `DescribeTasks`/`StopTask` basta.
 4. Solo después, `PipelineEnabled=true`; el calendario sigue siendo una
    decisión aparte.
+
+## Validación de runtime AWS (smoke del 2026-11-21)
+
+Smoke sintético de las tareas Fargate en `dev` (`us-east-1`), ejecutado el
+2026-11-21 con autorización explícita, operación por operación. **Procedencia:**
+resultados medidos durante esa sesión con la AWS CLI y los logs de las tareas;
+no se pueden comprobar desde el repositorio (AGENTS.md §6). Los ARN completos
+contienen el ID de cuenta y no se versionan: las tareas se identifican por su ID.
+
+Alcance: una tarea por prueba, lanzadas fuera de la state machine, con datos
+**sintéticos** y un prefijo S3 aislado. No hubo llamadas a OpenF1, ni M2, ni
+ejecuciones de Step Functions.
+
+### A. Runtime de Fargate
+
+| Elemento | Resultado |
+|---|---|
+| Task definition | revisión 1 |
+| Imagen | por digest, `sha256:b4c0f5012acd02062d0bb236e99b4cd55ecc4545fe4054a35618ca0a80cd5fdf` |
+| Prueba | una tarea con el comando `--help` |
+| Resultado | exit code 0; la tarea terminó correctamente |
+| Logs | 64 eventos recibidos en CloudWatch Logs |
+| Endurecimiento observado | UID 10001, sistema de ficheros raíz de solo lectura y capacidades eliminadas |
+
+### B. S3 y procesamiento sintético
+
+| Tarea (ID) | Etapa | Resultado |
+|---|---|---|
+| `e11a42719ed045efac53cc14a1b5ce0a` | `copy-raw` | 12 archivos, 10.208 bytes, cero fallos; exit code 0 |
+| `c71137e1ebea484ba8baec2e9b72eacd` | M3, M4 y M5 en una sola tarea | exit code 0 en las tres etapas |
+
+- **M3:** 81 reglas, 78 superadas, 3 advertencias, cero errores. Conservó su
+  estado `PARTIAL` (`WARNING`).
+- **M4:** 6 filas de entrada y 6 de salida, cero pérdidas, 2 pilotos; 32.910 bytes.
+- **M5:** 6 filas, 4 con objetivo (target), 51 features; 35.608 bytes.
+
+### C. Evidencia en S3
+
+- Prefijo: `smoke-tests/fargate-synthetic/20261121-856868e1/` del bucket de datos.
+- 29 objetos, 127.361 bytes: 12 de entrada, 12 copias `raw` y 5 resultados derivados.
+- Ningún objeto fuera de ese prefijo.
+- El tamaño del resultado de M5 (35.608 bytes) coincide con el de la línea base
+  local. **No se compararon hashes ni el contenido binario de los Parquet**: la
+  coincidencia de tamaño no prueba que el contenido sea idéntico.
+- Los 29 objetos se conservan; no se borró nada.
+
+### D. Advertencias y limitaciones
+
+- `incremental_stage_provenance_not_recorded`: esperada, porque no había un
+  reporte histórico de M2 verificable.
+- `consolidating_without_validation_pass`: M4 recibió una M3 con estado `WARNING`.
+- Advertencia de NumPy por desviación cero en los datos sintéticos; no afectó a
+  los resultados.
+- No se ejecutó M2 ni hubo llamadas a OpenF1.
+- No se probó la state machine real.
+
+### E. Retirada del permiso temporal
+
+Para el smoke se añadió al rol de tarea `…-data-processing` una declaración
+`TemporarySyntheticFargateSmokeTest`: `s3:GetObject` y `s3:PutObject` solo sobre
+el prefijo temporal. Se desplegó y después se retiró mediante un change set de
+CloudFormation. Esa declaración nunca estuvo en `master` (vivió en una rama
+temporal, ya eliminada).
+
+- El change set se ejecutó tras aceptar expresamente tres cambios dependientes
+  que CloudFormation marcó como dinámicos (`PipelineStateMachineRole`,
+  `PipelineStateMachine` y `PipelineTaskDefinition`, que referencian el ARN del
+  rol). Como el rol tiene `RoleName` fijo, su ARN no cambió y solo se actualizó
+  `DataProcessingTaskRole`.
+- El simulador de políticas de identidad confirmó `implicitDeny` para
+  `GetObject` y `PutObject` en el prefijo temporal tras la retirada, y que las
+  declaraciones originales no cambiaron: `GetObject`/`PutObject` siguen
+  permitidos en las raíces operativas y `DeleteObject` sigue denegado.
+- La task definition (revisión 1) y el digest de imagen no cambiaron. La
+  definición de la state machine es idéntica byte a byte.
+- **Límites de esta verificación:** se usó el simulador de políticas de
+  identidad; no se hizo una prueba real de acceso tras la retirada ni se volvió a
+  consultar la política del bucket.
+
+### F. Estado final de AWS
+
+| Elemento | Estado |
+|---|---|
+| Stack `f1-race-intelligence-dev` | `UPDATE_COMPLETE` |
+| Task definition | revisión 1, `ACTIVE` |
+| Alarmas | 6 de 6 en `OK` |
+| Tareas ECS activas | 0 |
+| Ejecuciones de Step Functions nuevas | ninguna |
+| `PipelineEnabled` | `false` |
+| `AvailabilityScheduleState` | `DISABLED` |
+| Regla de calendario de EventBridge | `DISABLED` |
+
+### Probado en AWS y solo validado en local
+
+| Probado en AWS (con datos sintéticos) | Solo validado en local, no probado en AWS |
+|---|---|
+| Arranque de la imagen y task definition revisión 1 en Fargate | M2 y cualquier llamada a OpenF1 |
+| Usuario 10001, raíz de solo lectura y capacidades eliminadas | `plan` y M6 (no se ejecutaron en Fargate) |
+| `copy-raw`, M3, M4 y M5 leyendo y escribiendo S3 | La state machine real: exit codes vía `runTask.sync`, `listExecutions` y el ámbito IAM de `DescribeTasks`/`StopTask` |
+| Logs en CloudWatch | Escrituras reales en las raíces operativas del rol de datos (solo se simularon con el simulador de IAM) |
+| Retirada del permiso temporal (simulador de IAM) | Activación del pipeline y del calendario |
 
 ## Validar (sin tocar AWS)
 
