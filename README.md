@@ -34,15 +34,24 @@ paso puede repetirse sin duplicar ni corromper resultados.
   demostración salen de seis carreras artificiales y no son resultados
   académicos de rendimiento.
 - La infraestructura AWS (SAM/Step Functions/ECS/Lambda/alarmas) está definida
-  en código y validada estáticamente (`sam validate --lint`) y por simulación;
-  **no está desplegada ni se ha validado en AWS real**
-  ([infra/aws_status.json](infra/aws_status.json)). M7 y M8 no existen en AWS:
-  MLflow usa SQLite local y el serving es un prototipo local.
+  en código y validada con las pruebas de plantilla y de la state machine
+  (`tests/infra`) y por simulación. `sam validate --lint` sobre la plantilla de
+  `master` **no pasa limpio**: termina con código 1 por el aviso `W3005` en
+  `ForecastFunctionLogGroup` (`DependsOn` redundante con el `Ref` de
+  `LoggingConfig.LogGroup`; sin efecto funcional y aún sin corregir, ver
+  [infra/README.md](infra/README.md), «Pendientes abiertos», punto 1);
+  el despliegue en `dev` (plantilla anterior a M7; `PipelineEnabled=false`, calendario
+  `DISABLED`; imagen `800931b` en la task definition revisión 2) está **reportado y no es
+  reproducible desde el repositorio**, y **M2–M6 no se han ejecutado en AWS real con esa imagen**
+  ([infra/aws_status.json](infra/aws_status.json), [infra/README.md](infra/README.md)).
+  M7 y M8 no están desplegados en AWS (la plantilla de `master` define recursos de M7
+  que no forman parte del stack reportado): MLflow usa SQLite local y el serving es un
+  prototipo local.
 - Auditorías independientes (Antigravity): la planificación incremental y la
   admisión (R1, R1.1 y R1.2) obtuvieron *APPROVED WITH MINOR FINDINGS* (su único
   hallazgo menor, `pythonpath = ["src"]` en `pyproject.toml`, está corregido);
   el backfill por temporadas y la protección de M6 (R2) y la robustez ante el
-  resultado de ECS (R3) obtuvieron *APPROVED*. La validación en AWS real sigue
+  resultado de ECS (R3) obtuvieron *APPROVED*. La validación funcional en AWS real sigue
   pendiente.
 
 ### Componentes y responsabilidades
@@ -158,8 +167,9 @@ desde M8 se describe en [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md).
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
 > job batch independiente y existe una imagen Docker. El estado de diseño,
 > código, validación local y despliegue se mantiene en
-> [infra/aws_status.json](infra/aws_status.json); los estados de despliegue y
-> pruebas reales son **NO VERIFICABLES** sin evidencia humana. Ver
+> [infra/aws_status.json](infra/aws_status.json): el despliegue en `dev` figura como
+> desplegado parcialmente (reportado, no reproducible desde el repositorio) y las
+> pruebas funcionales en AWS real, como **NO VERIFICABLES**. Ver
 > [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
 
 ## 2. Arquitectura
@@ -1006,8 +1016,10 @@ volver a calcularlo y comprobarlo:
 
 > El estado de AWS se registra únicamente en
 > [infra/aws_status.json](infra/aws_status.json). El diseño, el código y la
-> validación local se distinguen del despliegue y de las pruebas reales; estos
-> últimos permanecen **NO VERIFICABLES** sin comprobación humana.
+> validación local se distinguen del despliegue y de las pruebas reales. El
+> despliegue en `dev` (sin M7) está reportado y no es reproducible desde el
+> repositorio; las pruebas funcionales en AWS real de M2–M6 con la imagen vigente
+> siguen **NO VERIFICABLES** hasta que se ejecuten.
 
 La lógica funcional, estadística y anti-leakage de M4/M5/M6 **no cambió**.
 Se verificó ejecutando el pipeline nuevo sobre los datos locales y
@@ -1221,8 +1233,8 @@ docker run --rm -v "$PWD/data:/app/data" \
 > Imagen construida y probada en local con Docker Engine (WSL, `linux/amd64`):
 > `--help`, `pip check`, uid 10001, rutas de configuración inexistentes
 > (código 2), configuración AWS/S3 sin red, y `copy-raw` + M3→M5 de una sesión
-> sin red con `--memory 512m --cpus 0.5`. La publicación en ECR es
-> **NO VERIFICABLE** desde el repositorio (ver
+> sin red con `--memory 512m --cpus 0.5`. La publicación en ECR (imagen `800931b`) está
+> **reportada y no es reproducible** desde el repositorio (ver
 > [infra/aws_status.json](infra/aws_status.json)).
 
 ### 14.8 Infraestructura como código
@@ -1230,8 +1242,9 @@ docker run --rm -v "$PWD/data:/app/data" \
 La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
 Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
 [infra/](infra/README.md). `infra/aws_status.json` es la fuente de verdad
-versionada: el estado de despliegue y de pruebas en AWS real permanece
-**NO VERIFICABLE** sin comprobación humana. La Fase 1B define M2–M6 como
+versionada: el despliegue en `dev` figura como desplegado parcialmente (reportado,
+sin M7, no reproducible desde el repositorio) y las pruebas en AWS real permanecen
+**NO VERIFICABLES** hasta ejecutar M2–M6 con la imagen vigente. La Fase 1B define M2–M6 como
 tareas Fargate endurecidas (raíz de solo lectura, sin capacidades Linux,
 usuario 10001, imagen fijada por digest) orquestadas por Step Functions.
 
@@ -1324,8 +1337,9 @@ parte de la suite por defecto.
 - La extracción respeta el límite de OpenF1 por cliente: varios jobs M2 en
   paralelo comparten ese límite, así que M2 no escala con más contenedores.
 - `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
-- **El despliegue AWS es NO VERIFICABLE** según
-  [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
+- **El despliegue AWS está reportado y no es reproducible desde el repositorio**
+  (desplegado parcialmente, sin M7), según [infra/aws_status.json](infra/aws_status.json);
+  las pruebas funcionales en AWS real son **NO VERIFICABLES**. El backend S3 se ha probado
   contra un cliente simulado.
 - CI con GitHub Actions (`.github/workflows/ci.yml`): en pull requests y
   pushes a `master`, revisa espacios en blanco y ejecuta
@@ -1353,9 +1367,12 @@ temporadas y protección de M6. Queda pendiente:
   evaluación académica de los resultados; modelos más complejos que la
   regresión lineal.
 - Validación de la infraestructura AWS en una cuenta real (despliegue
-  controlado, IAM y S3 reales, Step Functions, alarmas y SNS); hoy solo está
-  validada estáticamente y por simulación.
-- Construir y publicar la imagen Docker en ECR y registrar su digest.
+  controlado, IAM y S3 reales, Step Functions, alarmas y SNS). Hay un despliegue
+  en `dev` reportado (con un smoke sintético de M3–M5 del 2026-11-21, no
+  reproducible desde el repositorio), pero faltan M2–M6 y la state machine
+  ejecutadas con la imagen vigente (`800931b`).
+- Imagen Docker en ECR: la `800931b` está reportada como publicada y desplegada
+  (su digest consta en `infra/README.md`); falta ejecutarla con M2–M6.
 - Una arquitectura AWS para M7 (MLflow remoto en lugar de SQLite local) y para
   servir M8 desplegado.
 - Integración de R1–R3 en `master`, ya con auditoría independiente aprobada
