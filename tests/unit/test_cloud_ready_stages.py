@@ -284,7 +284,10 @@ def test_m4_session_job_on_s3_produces_exactly_the_local_dataset(build_raw, raw_
     assert report.summary()["sessions_processed"] == 1
     assert report.sessions[0].output_path == f"s3://{BUCKET}/{PREFIX}/{key}"
     pd.testing.assert_frame_equal(lake.backend.read_parquet(key), expected)
-    assert len(objects(s3, "manifests/consolidation/consolidation_report_")) == 1
+    # A session-scoped report lives under its session (where incremental provenance looks), not at the stage root.
+    session_reports = f"manifests/consolidation/year={YEAR}/session={SESSION_KEY}/consolidation_report_"
+    assert len(objects(s3, session_reports)) == 1
+    assert len(objects(s3, "manifests/consolidation/consolidation_report_")) == 0
 
 
 def test_m4_session_job_is_idempotent_and_lists_only_its_session(build_raw, raw_root, lake, s3) -> None:

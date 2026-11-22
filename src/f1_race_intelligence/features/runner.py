@@ -127,9 +127,13 @@ class FeatureRunner:
             report.missing_values = self._missing_value_summary(pd.concat(frames, ignore_index=True))
 
         report.finished_at = datetime.now(timezone.utc)
+        report_root = self._output_store.root(Layer.FEATURE_REPORTS, self._config.report_path)
+        # Filed under the session when the run is scoped to one (see the consolidation runner).
         report_path = save_report(
             report,
-            self._output_store.root(Layer.FEATURE_REPORTS, self._config.report_path),
+            self._output_store.layout.records_prefix(
+                report_root, year=self._scope.year, session_key=self._scope.session_key
+            ),
             backend=self._output_store.backend,
         )
 

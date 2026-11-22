@@ -32,6 +32,12 @@ given piece of data gets. Two layouts exist:
         forecasts/m7/year=<y>/session=<s>/lap=<k>.json   in-race forecasts
         logs/     (reserved)
 
+    Reports of a run scoped to one session (the M2 manifest and the M3, M4 and M5
+    reports) go under ``year=<y>/session=<s>/`` (:meth:`records_prefix`): that is
+    where the incremental provenance lookup lists. A run without a single session
+    keeps its report at the stage root, and such a report proves nothing about any
+    one session.
+
     The lake layout ignores the per-stage paths: its layer names are the
     contract, and the bucket and prefix the only things that vary.
 

@@ -137,7 +137,13 @@ class ConsolidationRunner:
 
     def _save_report(self, report: ConsolidationReport):
         root = self._output_store.root(Layer.CONSOLIDATION_REPORTS, self._config.report_path)
-        return save_report(report, root, backend=self._output_store.backend)
+        # A session-scoped run files its report under that session, like the extraction
+        # manifest and the validation report: the incremental provenance lookup lists exactly
+        # this prefix. Runs broader than one session (and the legacy layout) keep the root.
+        directory = self._output_store.layout.records_prefix(
+            root, year=self._scope.year, session_key=self._scope.session_key
+        )
+        return save_report(report, directory, backend=self._output_store.backend)
 
     def _consolidate_session(self, session_key: int, report: ConsolidationReport) -> None:
         backend = self._output_store.backend
