@@ -1414,7 +1414,7 @@ temporadas y protección de M6. Queda pendiente:
   [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#protocolo-de-cierre-con-datos-reales-para-la-sustentación));
   explorar arquitecturas adicionales solo si el análisis con datos reales lo
   justifica (LSTM/GRU y métodos secuenciales siguen fuera de alcance).
-  
+
 - Validación de la infraestructura AWS en una cuenta real (despliegue
   controlado, IAM y S3 reales, Step Functions, alarmas y SNS). Existe un
   despliegue en `dev` reportado, con el runtime `800931b` en la Task
