@@ -7,11 +7,14 @@ pilotos de Fórmula 1 a partir de datos históricos de la API pública
 
 La unidad de análisis objetivo es **Piloto × Carrera × Vuelta**, con la meta
 de predecir `next_lap_time` (tiempo de la siguiente vuelta). M7 incorpora un
-pipeline reproducible de regresión lineal y evaluación sobre los splits M6; el
-entrenamiento con datos reales sigue pendiente de autorización. La cadena
-completa M1–M8 está demostrada **localmente con datos sintéticos**
-([DEMO_LOCAL.md](DEMO_LOCAL.md)); ver la
-[visión general MLOps](#visión-general-mlops-m1m8) y su índice de documentación.
+pipeline reproducible de entrenamiento y evaluación sobre los splits M6 con
+soporte tanto para regresión lineal (`linear_regression`, baseline por defecto)
+como para Deep Learning tabular (`mlp`, PyTorch CPU-only; ver
+[M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md)); el entrenamiento con datos
+reales sigue pendiente de autorización. La cadena completa M1–M8 está
+demostrada **localmente con datos sintéticos** ([DEMO_LOCAL.md](DEMO_LOCAL.md));
+ver la [visión general MLOps](#visión-general-mlops-m1m8) y su índice de
+documentación.
 
 ## Visión general MLOps (M1–M8)
 
@@ -25,19 +28,25 @@ paso puede repetirse sin duplicar ni corromper resultados.
 **Estado, con exactitud.**
 
 - Implementado y probado **localmente** con datos sintéticos y un cliente
-  OpenF1 simulado: M1–M8, la planificación incremental, el backfill por
-  temporadas, la protección de M6, la publicación del modelo y el serving.
-  La última validación integral: **979 pruebas pasadas y 2 excluidas** (las
-  dos de `tests/integration`, que llaman a OpenF1 real) y la demostración
-  [DEMO_LOCAL.md](DEMO_LOCAL.md).
-- **No** se ha entrenado con datos reales de OpenF1. Las métricas de la
-  demostración salen de seis carreras artificiales y no son resultados
-  académicos de rendimiento.
+  OpenF1 simulado: M1–M8 (incluyendo M7 con `linear_regression` y MLP tabular
+  en PyTorch CPU-only), la planificación incremental, el backfill por
+  temporadas, la protección de M6, la publicación inmutable del modelo y el
+  serving. En la validación integral previa de `master` (antes de la extensión
+  DL) se registraron **979 pruebas pasadas y 2 excluidas** (las dos de
+  `tests/integration`, que llaman a OpenF1 real); esta rama suma las pruebas
+  del MLP tabular (`tests/unit/test_dl.py`, `tests/unit/test_dl_m7_m8_integration.py`
+  y casos DL en `test_training.py`, `test_cli.py` y `test_settings.py`) y el
+  flujo DL en [DEMO_LOCAL.md](DEMO_LOCAL.md) (verificar el conteo actualizado
+  con `python -m pytest -m "not integration"`).
+- **No** se ha entrenado con datos reales de OpenF1. Las métricas de las pruebas
+  y de la demostración (tanto lineales como del MLP) salen de datos sintéticos
+  y **no** son resultados académicos de rendimiento.
 - La infraestructura AWS (SAM/Step Functions/ECS/Lambda/alarmas) está definida
   en código y validada estáticamente (`sam validate --lint`) y por simulación;
   **no está desplegada ni se ha validado en AWS real**
   ([infra/aws_status.json](infra/aws_status.json)). M7 y M8 no existen en AWS:
-  MLflow usa SQLite local y el serving es un prototipo local.
+  MLflow usa SQLite local, PyTorch entrena en CPU local (sin SageMaker) y el
+  serving es un prototipo local.
 - Auditorías independientes (Antigravity): la planificación incremental y la
   admisión (R1, R1.1 y R1.2) obtuvieron *APPROVED WITH MINOR FINDINGS* (su único
   hallazgo menor, `pythonpath = ["src"]` en `pyproject.toml`, está corregido);
@@ -55,7 +64,7 @@ paso puede repetirse sin duplicar ni corromper resultados.
 | M4 | Consolidación a Piloto × Carrera × Vuelta | `raw/` + informe M3 → dataset por sesión | §11 |
 | M5 | Features y target `next_lap_time`, con guardas anti-leakage | dataset M4 → features por sesión | §12 |
 | M6 | Dataset de modelado: split cronológico por carrera y preprocesado ajustado solo con train | features de **todo** el histórico → splits, preprocesador y esquema con hashes | §13 |
-| M7 | Entrenamiento (regresión lineal y referencia), métricas, MLflow y registro | informe M6 verificado → modelo registrado | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| M7 | Entrenamiento (`linear_regression`, MLP tabular PyTorch con `ReduceLROnPlateau`, PFI en `validation` y diagnóstico de generalización), comparación experimental (`m7-compare`), MLflow y registro | informe M6 verificado → modelo registrado y reportes | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md), [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md) |
 | Publicación | Paquete inmutable y verificable de una versión registrada | modelo + artefactos M6 → `published-models/…` con manifiesto y `PUBLISHED` | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
 | M8 | Serving FastAPI (`/live`, `/health`, `/model-info`, `/predict`) | paquete publicado (o URIs de MLflow) → predicciones | §19 |
 
@@ -121,6 +130,7 @@ terminan en `NotifyPipelineFailure`. Ver
 | M5: features y target | §12 |
 | M6: dataset de modelado y guardas anti-leakage | §13 |
 | M7: entrenamiento y MLflow | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| M7: Deep Learning (PyTorch Tabular MLP) | [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md) |
 | Publicación de modelos | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
 | M8: serving | §19 de este README |
 | Preparación para la nube y Docker | §14 |
@@ -150,9 +160,11 @@ No se implementan LSTM/GRU, métodos estadísticos avanzados, FastAPI,
 Kubernetes, ni entrenamiento real sin autorización.
 
 La arquitectura, configuración, comandos, validación sintética y pendientes
-de M7.1 están documentados en [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md).
-La publicación inmutable de versiones registradas de M7 y su carga verificada
-desde M8 se describe en [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md).
+de M7 están documentados en [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md),
+y la extensión de Deep Learning tabular (PyTorch CPU-only MLP) en
+[M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md). La publicación inmutable de
+versiones registradas de M7 y su carga verificada desde M8 se describe en
+[M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md).
 
 > **Actualización (preparación cloud):** M1–M6 son *cloud-ready*: el
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
@@ -269,7 +281,9 @@ f1-race-intelligence/
 │
 ├── requirements/
 │   ├── runtime-lock.txt       # runtime M1-M6 e imagen Docker
-│   └── training-lock.txt      # cierre exacto para el extra M7
+│   ├── training-lock.txt      # cierre exacto para el extra M7 (MLflow)
+│   ├── dl-lock.txt            # cierre exacto para el extra M7 DL (PyTorch CPU-only)
+│   └── dev-lock.txt           # herramientas de pruebas locales/CI
 │
 ├── data/
 │   ├── raw/
@@ -287,7 +301,7 @@ f1-race-intelligence/
 │   └── f1_race_intelligence/
 │       ├── __init__.py
 │       ├── __main__.py            # python -m f1_race_intelligence (CLI batch)
-│       ├── cli.py                 # --stage plan|m2|m3|m4|m5|m6|copy-raw
+│       ├── cli.py                 # --stage plan|m2|m3|m4|m5|m6|verify-m6|m7|m7-compare|copy-raw
 │       ├── scope.py               # SessionScope: unidad de trabajo (sesión)
 │       │
 │       ├── config/
@@ -328,7 +342,7 @@ f1-race-intelligence/
 │       │   ├── report.py                  # persistencia del reporte
 │       │   └── runner.py                  # ValidationRunner
 │       │
-│       ├── consolidation/ features/ modeling/   # M4, M5, M6
+│       ├── consolidation/ features/ modeling/   # M4, M5, M6 y M7 (lineal, MLP PyTorch, publicación)
 │       │
 │       ├── serving/                   # prototipo local de inferencia (M8, sección 19)
 │       │
@@ -357,11 +371,16 @@ pip install -e ".[dev]"
 ```
 
 M7 es opcional: para entrenamiento local instala el lock específico y activa
-el extra, sin añadir MLflow al runtime batch M1-M6:
+el extra, sin añadir MLflow ni PyTorch al runtime batch M1-M6:
 
 ```bash
+# Baseline lineal (MLflow local)
 python -m pip install -r requirements/training-lock.txt
 python -m pip install -e ".[training]" --no-deps
+
+# Extensión Deep Learning (PyTorch CPU-only; ver M07_DEEP_LEARNING.md)
+python -m pip install -r requirements/dl-lock.txt
+python -m pip install -e ".[training,dl]" --no-deps
 ```
 
 Dependencias principales: `httpx` (HTTP), `tenacity` (retries con backoff),
@@ -1310,10 +1329,21 @@ layouts `legacy`/`lake`; configuración local/AWS; M2–M6 sobre S3 comparados
 contra su ejecución local; idempotencia; jobs por sesión; CLI y códigos de
 salida; contexto de logging.
 
+M7 y Deep Learning: `tests/unit/test_dl.py`, `tests/unit/test_training.py`,
+`tests/unit/test_dl_m7_m8_integration.py` y `tests/unit/test_m7_m8_integration.py`
+(junto con las pruebas CLI y de comparación experimental) cubren el
+entrenamiento reproducible (`linear_regression` y `mlp` en PyTorch CPU-only),
+anti-leakage del target, `ReduceLROnPlateau`, *early stopping*, *Permutation
+Feature Importance* (PFI) sobre `validation`, diagnóstico de generalización,
+comparación controlada `--stage m7-compare`, importación perezosa sin
+`torch`/`mlflow`, publicación inmutable y serving M8 sin reajuste.
+
 La cadena M1–M8 se puede recorrer de extremo a extremo, sin red y con datos
 sintéticos, con la demostración descrita en [DEMO_LOCAL.md](DEMO_LOCAL.md)
-(`python -m pytest scripts/demo_local_mlops.py -s`). Esa demostración no forma
-parte de la suite por defecto.
+(`python -m pytest scripts/demo_local_mlops.py -s`), que incluye tanto el flujo
+lineal (`test_integral_flow`) como el flujo Deep Learning
+(`test_integral_dl_flow` con `--model-type mlp` cuando está instalado el extra
+`dl`). Esa demostración no forma parte de la suite por defecto.
 
 ## 17. Limitaciones actuales
 
@@ -1328,10 +1358,12 @@ parte de la suite por defecto.
   [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
   contra un cliente simulado.
 - CI con GitHub Actions (`.github/workflows/ci.yml`): en pull requests y
-  pushes a `master`, revisa espacios en blanco y ejecuta
-  `pytest -m "not integration"` (incluye `tests/infra`) en Ubuntu y Windows,
-  y compara los hashes de M6 entre ambos. No ejecuta `cfn-lint` ni
-  `sam validate`, no construye la imagen y no despliega (sin CD).
+  pushes a `master`, revisa espacios en blanco, ejecuta
+  `pytest -m "not integration"` (incluye `tests/infra` y las pruebas DL con
+  `requirements/dl-lock.txt`) en Ubuntu y Windows, comprueba el aislamiento del
+  runtime base sin `mlflow` ni `torch` (`base-runtime`) y compara los hashes de
+  M6 entre ambos. No ejecuta `cfn-lint` ni `sam validate`, no construye la
+  imagen y no despliega (sin CD).
 
 ## 18. Licencia y uso de datos
 
@@ -1345,19 +1377,27 @@ bajo `data/raw/` están excluidos de control de versiones (ver `.gitignore`).
 ## 19. Próximos pasos (fuera del alcance de esta etapa)
 
 Ya implementado y demostrado **localmente** (con datos sintéticos): features
-(M5), dataset de modelado (M6), entrenamiento con MLflow (M7), publicación del
+(M5), dataset de modelado (M6), entrenamiento con MLflow en M7
+(`linear_regression` y MLP tabular en PyTorch CPU-only; ver
+[M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) y
+[M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md)), publicación inmutable del
 modelo, serving FastAPI (M8), planificación incremental, backfill por
 temporadas y protección de M6. Queda pendiente:
 
-- Entrenamiento con datos reales de OpenF1 (requiere autorización) y
-  evaluación académica de los resultados; modelos más complejos que la
-  regresión lineal.
+- Entrenamiento con datos reales de OpenF1 (requiere autorización) y evaluación
+  académica comparativa de los resultados (`DummyRegressor`, `LinearRegression`
+  y configuraciones `TabularMLP` mediante `--stage m7-compare --register-best`;
+  ver
+  [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#protocolo-de-cierre-con-datos-reales-para-la-sustentación));
+  explorar arquitecturas adicionales solo si el análisis con datos reales lo
+  justifica (LSTM/GRU y métodos secuenciales siguen fuera de alcance).
 - Validación de la infraestructura AWS en una cuenta real (despliegue
   controlado, IAM y S3 reales, Step Functions, alarmas y SNS); hoy solo está
   validada estáticamente y por simulación.
 - Construir y publicar la imagen Docker en ECR y registrar su digest.
-- Una arquitectura AWS para M7 (MLflow remoto en lugar de SQLite local) y para
-  servir M8 desplegado.
+- Una arquitectura AWS para M7 (MLflow remoto en lugar de SQLite local;
+  eventual ejecución batch en ECS Fargate CPU o SageMaker si la escala lo
+  requiere) y para servir M8 desplegado.
 - Integración de R1–R3 en `master`, ya con auditoría independiente aprobada
   (ver la visión general); la validación en AWS real sigue pendiente.
 - Medir la duración real de una temporada y del plan sobre el histórico
@@ -1370,11 +1410,12 @@ temporadas y protección de M6. Queda pendiente:
 ## 20. Prototipo de serving (M8)
 
 > Prototipo **local**. No entrena modelos ni despliega en AWS/SageMaker. M7
-> ya registra modelos localmente y la publicación los empaqueta (ver
-> [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md)); la cadena completa se
-> demuestra con datos sintéticos en [DEMO_LOCAL.md](DEMO_LOCAL.md). Los valores
-> de los ejemplos de esta sección son **ilustrativos**: no hay un modelo
-> entrenado con datos reales.
+> ya registra modelos localmente (`linear_regression` y MLP tabular PyTorch en
+> [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md)) y la publicación los empaqueta
+> (ver [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md)); la cadena completa
+> se demuestra con datos sintéticos en [DEMO_LOCAL.md](DEMO_LOCAL.md). Los
+> valores de los ejemplos de esta sección son **ilustrativos**: no hay un
+> modelo entrenado con datos reales.
 
 ### Arquitectura
 
@@ -1447,6 +1488,9 @@ pasan en `F1_SERVING_MODEL_URI` cuando M7 los defina.
 ```bash
 python -m pip install -r requirements/runtime-lock.txt
 python -m pip install -r requirements/training-lock.txt
+# Opcional: añadir las dos líneas siguientes si se sirve un modelo MLP (PyTorch)
+# python -m pip install -r requirements/dl-lock.txt
+# python -m pip install -e ".[training,serve,dl]" --no-deps
 python -m pip install -e ".[training,serve]" --no-deps
 export MLFLOW_TRACKING_URI=<tracking URI de M7>
 export F1_SERVING_PREPROCESSING_URI=runs:/<run_id de M7>/m6
@@ -1500,8 +1544,8 @@ pytest tests/unit/test_serving_api.py    # capa HTTP; requiere el extra serve
 ```
 
 Los tests generan artefactos auténticos de M6 ejecutando su runner sobre
-carreras sintéticas. La integración M7–M8 también entrena con esos fixtures,
-recupera el modelo por su versión exacta mediante pyfunc y verifica que los
-artefactos y el modelo pertenecen al mismo run M7. No consulta OpenF1 ni usa
-datos reales. CI instala los extras `training` y `serve` para ejecutar la
-integración y la capa HTTP.
+carreras sintéticas. La integración M7–M8 también entrena con esos fixtures
+(lineal y MLP PyTorch), recupera el modelo por su versión exacta mediante
+pyfunc y verifica que los artefactos y el modelo pertenecen al mismo run M7.
+No consulta OpenF1 ni usa datos reales. CI instala los extras `training`,
+`serve` y `dl` para ejecutar la integración y la capa HTTP.
