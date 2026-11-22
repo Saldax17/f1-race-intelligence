@@ -14,7 +14,7 @@ from f1_race_intelligence.race_model.racedata import RaceRef
 from f1_race_intelligence.race_model.runner import TEST, RaceModelRunner
 from f1_race_intelligence.storage.store import DataStore
 
-from tests.unit.test_race_model import synthetic_race
+from tests.unit.test_race_model import _wreck, synthetic_race
 
 OFFSETS8 = [-0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8]
 TEAMS8 = ["A", "A", "B", "B", "C", "C", "D", "D"]
@@ -52,10 +52,12 @@ class PoisonedCatalog:
             pytest.fail(f"test race {ref.tag} was read while the test set is sealed")
         self.reads.append(ref.session_key)
         altered = self.altered_validation and ref.session_key in VALIDATION_KEYS
-        return synthetic_race(seed=ref.session_key + (1000 if altered else 0), session_key=ref.session_key,
+        race = synthetic_race(seed=ref.session_key + (1000 if altered else 0), session_key=ref.session_key,
                               year=ref.year, location=ref.location,
                               offsets=OFFSETS8[::-1] if altered else OFFSETS8, teams=TEAMS8,
                               date_start=ref.date_start)
+        # as in the review's dynamic check: wildly noisy validation lap times
+        return _wreck(race, seed=ref.session_key) if altered else race
 
 
 @pytest.fixture

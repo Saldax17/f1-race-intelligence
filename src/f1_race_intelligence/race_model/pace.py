@@ -369,12 +369,22 @@ def fit_level1(
 ) -> Level1Result:
     """Full-race θ̂ and SE for every driver-race (flat prior: laps only, no double counting).
 
-    Every pooled quantity is learned only from the session keys it is given:
-    ``tyre_races`` for the tyre model and ``noise_races`` for φ and σ_ε (the
-    training races). ``phi`` / ``sigma_eps`` freeze them instead, as an update
-    or the final test replay must. Per-race θ̂ are computed for every race.
+    Every **pooled** quantity (tyre model, φ, σ_ε) is learned only from the
+    training races; per-race θ̂ are computed for every race given.
+
+    * ``tyre_races`` names the training races. When it is given and
+      ``noise_races`` is not, φ and σ_ε are pooled over the same races:
+      restricting the training set restricts *every* pooled estimate.
+    * ``noise_races`` overrides the set used for φ and σ_ε.
+    * ``phi`` / ``sigma_eps`` freeze them instead, as an update or the final
+      test replay must.
+    * With neither set given, everything is pooled over ``races`` (callers
+      that pass only training races).
     """
     from f1_race_intelligence.race_model.racedata import final_order
+
+    if noise_races is None:
+        noise_races = tyre_races
 
     fits: List[Tuple[RaceData, CleanLaps, Optional[RacePace]]] = []
     pairs = []

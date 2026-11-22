@@ -159,6 +159,30 @@ def test_evaluation_and_hazard_fit_count_the_same_retirements():
 # -- pooled level-1 noise comes from training races only (review of PR #22) -----------------
 
 
+def _wreck(race, scale=0.2, seed=0):
+    """The reviewers' dynamic check: validation lap times made wildly noisy (sigma_eps ~10 if pooled)."""
+    rng = np.random.default_rng(seed)
+    race.laps["lap_duration"] = race.laps["lap_duration"] * (1 + rng.normal(0, scale, len(race.laps))).clip(0.5)
+    return race
+
+
+def test_restricting_tyre_races_alone_restricts_phi_and_sigma_too():
+    """Regression for the second review of PR #22: passing only tyre_races=train_keys must already
+    keep validation data out of phi and sigma_eps (no separate noise_races needed)."""
+    # One training and one validation race, as in the review: sigma_eps is a median over races, and
+    # the median of two is their mean, so pooling a wrecked validation race moves it ~50x.
+    train = [synthetic_race(seed=1, session_key=400)]
+    keys = {r.ref.session_key for r in train}
+    clean_val = [synthetic_race(seed=60, session_key=500)]
+    wrecked_val = [_wreck(synthetic_race(seed=60, session_key=500))]
+    a = fit_level1(train + clean_val, LEVEL1, tyre_races=keys)
+    b = fit_level1(train + wrecked_val, LEVEL1, tyre_races=keys)
+    assert (a.phi, a.sigma_eps, a.tyres.to_dict()) == (b.phi, b.sigma_eps, b.tyres.to_dict())
+    assert a.sigma_eps == fit_level1(train, LEVEL1).sigma_eps  # exactly the training-only estimate
+    pooled = fit_level1(train + wrecked_val, LEVEL1).sigma_eps  # the old behaviour
+    assert pooled > 10 * a.sigma_eps
+
+
 def test_level1_noise_is_fitted_on_the_given_races_only():
     train = [synthetic_race(seed=s, session_key=200 + s) for s in range(3)]
     other = [synthetic_race(seed=50, session_key=300)]
