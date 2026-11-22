@@ -23,10 +23,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.stats import norm
+
+if TYPE_CHECKING:
+    from f1_race_intelligence.race_model.baselines import TransitionBaseline
 
 from f1_race_intelligence.race_model.events import EventModel, next_compound, optimal_stop_lap
 from f1_race_intelligence.race_model.pace import (
@@ -54,6 +57,12 @@ class ForecastConfig:
     noise_scale_by_fraction: Optional[Dict[str, float]] = None
     """Per race phase: ``{"0.1": s, "0.5": s, ...}`` keyed by the k/L fraction it was
     chosen at; a forecast uses the nearest one. ``None`` uses ``noise_scale``."""
+    pass_cost_seconds: float = 0.0
+    """Overtaking friction (seconds per on-track place gained × circuit difficulty); 0 disables."""
+    transition_shrinkage_by_fraction: Optional[Dict[str, float]] = None
+    """Per race phase convex shrinkage weights ``w_k`` in ``[0, 1]`` towards the
+    empirical transition baseline: ``P_blend = (1 - w_k) P_model + w_k P_transition``.
+    Fitted strictly on training races with leave-one-race-out transition counts."""
 
     def noise_for(self, k: int, total_laps: int) -> float:
         if not self.noise_scale_by_fraction:
@@ -61,6 +70,15 @@ class ForecastConfig:
         here = k / max(total_laps, 1)
         nearest = min(self.noise_scale_by_fraction, key=lambda f: abs(float(f) - here))
         return float(self.noise_scale_by_fraction[nearest])
+
+    def shrinkage_for(self, k: int, total_laps: int) -> Tuple[Optional[str], float]:
+        if not self.transition_shrinkage_by_fraction:
+            return None, 0.0
+        here = k / max(total_laps, 1)
+        nearest = min(self.transition_shrinkage_by_fraction, key=lambda f: abs(float(f) - here))
+        bucket = f"{int(round(float(nearest) * 100))}%"
+        weight = float(np.clip(float(self.transition_shrinkage_by_fraction[nearest]), 0.0, 1.0))
+        return bucket, weight
     events: bool = True
     """False switches off SC/VSC/red, DNFs, extra stops and stop-loss noise (the Gaussian core)."""
     pooled_sigma_laps: float = 40.0
@@ -246,9 +264,10 @@ def plan_stops(
         return tyres.slope.get(c, 0.0) if c in DRY_COMPOUNDS else 0.0
 
     M = len(running)
-    out = {name: np.zeros(M) for name in ("o1", "d1", "o2", "d2", "stop_lap")}
+    out = {name: np.zeros(M) for name in ("o1", "d1", "o2", "d2", "o3", "d3", "stop_lap", "stop_lap2")}
     out["owed"] = np.zeros(M, bool)
     out["stops"] = np.zeros(M, bool)
+    out["stops2"] = np.zeros(M, bool)
     out["compound"] = np.array([None] * M, dtype=object)
     L = total_laps
     for j, car in enumerate(running):
@@ -256,23 +275,53 @@ def plan_stops(
         n = L - k
         out["o1"][j], out["d1"][j] = offset(c1), slope(c1)
         out["stop_lap"][j] = np.inf
+        out["stop_lap2"][j] = np.inf
         if wet or c1 not in DRY_COMPOUNDS or n <= 1:
             continue
         owed = len(set(car.used)) < 2
-        stay = _tyre_cost(offset(c1), slope(c1), age, n)
-        best = None
+        stay = _tyre_cost(offset(c1), slope(c1), age, n) * sec
+        best1 = None
         candidates = [c for c in DRY_COMPOUNDS if not owed or c not in car.used and c != c1] or [next_compound(c1, car.used)]
         for c2 in candidates:
             s = optimal_stop_lap(slope(c1), slope(c2), L, age, k) + bias
             s = float(np.clip(np.round(s), k + 1, L - 1))
-            cost = _tyre_cost(offset(c1), slope(c1), age, s - k) + _tyre_cost(offset(c2), slope(c2), 0.0, L - s)
-            if best is None or cost < best[0]:
-                best = (cost, c2, s)
-        cost, c2, s = best
-        out["o2"][j], out["d2"][j], out["compound"][j] = offset(c2), slope(c2), c2
+            cost = (_tyre_cost(offset(c1), slope(c1), age, s - k) + _tyre_cost(offset(c2), slope(c2), 0.0, L - s)) * sec + pit_loss
+            if best1 is None or cost < best1[0]:
+                best1 = (cost, c2, s)
+        cost1, c2, s1 = best1
+        best2 = None
+        if n >= 3:
+            d1_eff = max(slope(c1), 1e-3)
+            for ca in DRY_COMPOUNDS:
+                da_eff = max(slope(ca), 1e-3)
+                for cb in DRY_COMPOUNDS:
+                    if owed and (ca in car.used or ca == c1) and (cb in car.used or cb == c1):
+                        continue
+                    db_eff = max(slope(cb), 1e-3)
+                    w = (n + age) / (1.0 / d1_eff + 1.0 / da_eff + 1.0 / db_eff)
+                    t1 = float(np.clip(np.round(k + w / d1_eff - age + bias), k + 1, L - 2))
+                    t2 = float(np.clip(np.round(L - w / db_eff + bias), t1 + 1, L - 1))
+                    c_tyre = (
+                        _tyre_cost(offset(c1), slope(c1), age, t1 - k)
+                        + _tyre_cost(offset(ca), slope(ca), 0.0, t2 - t1)
+                        + _tyre_cost(offset(cb), slope(cb), 0.0, L - t2)
+                    )
+                    cost2 = c_tyre * sec + 2.0 * pit_loss
+                    if best2 is None or cost2 < best2[0]:
+                        best2 = (cost2, ca, cb, t1, t2)
         out["owed"][j] = owed
-        out["stops"][j] = owed or (stay - cost) * sec > pit_loss
-        out["stop_lap"][j] = s
+        if best2 is not None and best2[0] < cost1 and (owed or best2[0] < stay):
+            _, ca, cb, t1, t2 = best2
+            out["o2"][j], out["d2"][j], out["compound"][j] = offset(ca), slope(ca), ca
+            out["o3"][j], out["d3"][j] = offset(cb), slope(cb)
+            out["stops"][j] = True
+            out["stops2"][j] = True
+            out["stop_lap"][j] = t1
+            out["stop_lap2"][j] = t2
+        else:
+            out["o2"][j], out["d2"][j], out["compound"][j] = offset(c2), slope(c2), c2
+            out["stops"][j] = owed or cost1 < stay
+            out["stop_lap"][j] = s1
     return out
 
 
@@ -290,6 +339,7 @@ def forecast(
     rng: Optional[np.random.Generator] = None,
     model_version: Optional[str] = None,
     fallback_prior_variance: float = 0.5,
+    transition: Optional["TransitionBaseline"] = None,
 ) -> ForecastResult:
     """The N×N finishing-position matrix of ``race`` as known at its truncation lap."""
     rng = rng or np.random.default_rng(0)
@@ -322,7 +372,7 @@ def forecast(
     remaining = np.maximum(0.0, L - laps_done)
 
     plan = plan_stops(running, L, tyres, events.pit(loc), sec, race.wet, events.stop_lap_bias)
-    o1, d1, o2, d2 = plan["o1"], plan["d1"], plan["o2"], plan["d2"]
+    o1, d1, o2, d2, o3, d3 = plan["o1"], plan["d1"], plan["o2"], plan["d2"], plan["o3"], plan["d3"]
     age1 = np.array([c.tyre_age for c in running], float)
     owed = plan["owed"]
 
@@ -331,16 +381,20 @@ def forecast(
     # The spread of real stops around s* is mostly error of the s* model, not
     # strategy that costs tyre time, so it must not enter the tyre term.
     planned = np.where(plan["stops"], plan["stop_lap"], np.inf) * np.ones((S, 1))
+    planned2 = np.where(plan["stops2"], plan["stop_lap2"], np.inf) * np.ones((S, 1))
     noise_sd = events.stop_lap_sd if config.events else 0.0
     stop = np.round(plan["stop_lap"] + noise_sd * rng.standard_normal((S, M)))
     stop = np.clip(stop, laps_done + 1, np.maximum(laps_done + 1, L - 1))
     stop = np.where(plan["stops"], stop, np.inf)
     loss = events.pit(loc) + (events.pit_loss_sd * rng.standard_normal((S, M)) if config.events else 0.0)
     stop_cost = np.where(np.isfinite(stop), loss, 0.0)
-    # v1 plans at most one more stop per car; a further one is not modelled.
-    has_extra = np.zeros((S, M), bool)
-    extra_lap = np.full((S, M), np.inf)
-    extra_cost = np.zeros((S, M))
+    has_extra = np.broadcast_to(plan["stops2"][None, :], (S, M)).copy()
+    extra_lap = np.round(plan["stop_lap2"] + noise_sd * rng.standard_normal((S, M)))
+    extra_min = np.where(np.isfinite(stop), stop + 1, laps_done + 1)
+    extra_lap = np.clip(extra_lap, extra_min, np.maximum(extra_min, L - 1))
+    extra_lap = np.where(has_extra, extra_lap, np.inf)
+    loss2 = events.pit(loc) + (events.pit_loss_sd * rng.standard_normal((S, M)) if config.events else 0.0)
+    extra_cost = np.where(np.isfinite(extra_lap), loss2, 0.0)
 
     # neutralisations
     regime_now = current_regime(race.race_control)
@@ -377,22 +431,40 @@ def forecast(
     # so subtracting k - laps_done would put them a lap early. A car that is
     # genuinely lapped reaches lap e later, and so ranks behind, which is right.
     own_vsc = np.maximum(vsc[:, None], laps_done)
+    u_vsc = rng.random((S, M))
     take_vsc = (
         np.isfinite(own_vsc) & np.isfinite(stop) & (stop > own_vsc)
-        & (rng.random((S, M)) < config.pit_under_vsc_probability)
+        & (u_vsc < config.pit_under_vsc_probability)
+    )
+    take_vsc2 = (
+        np.isfinite(own_vsc) & ~take_vsc & has_extra & np.isfinite(extra_lap) & (extra_lap > own_vsc)
+        & (~np.isfinite(stop) | (stop <= own_vsc))
+        & (u_vsc < config.pit_under_vsc_probability)
     )
     stop = np.where(take_vsc, own_vsc, stop)
     planned = np.where(take_vsc, own_vsc, planned)
     stop_cost = np.where(take_vsc, stop_cost * events.vsc_pit_factor, stop_cost)
+    extra_lap = np.where(take_vsc2, own_vsc, extra_lap)
+    planned2 = np.where(take_vsc2, own_vsc, planned2)
+    extra_cost = np.where(take_vsc2, extra_cost * events.vsc_pit_factor, extra_cost)
 
-    sigma_lap = config.noise_for(k, L) * sec * sigma_eps * np.sqrt((1 + phi) / (1 - phi))
+    wet_mult = events.wet_noise_multiplier if (race.wet and config.events) else 1.0
+    sigma_lap = config.noise_for(k, L) * wet_mult * sec * sigma_eps * np.sqrt((1 + phi) / (1 - phi))
 
-    def tyre_upto(lap: np.ndarray, stop_lap: np.ndarray) -> np.ndarray:
-        """Tyre cost (seconds) from the car's lap at k to its own lap ``lap``, changing at ``stop_lap``."""
+    def tyre_upto(lap: np.ndarray, stop_lap: np.ndarray, stop_lap2: np.ndarray) -> np.ndarray:
+        """Tyre cost (seconds) from the car's lap at k to its own lap ``lap``, changing at ``stop_lap`` and ``stop_lap2``."""
         lap = np.maximum(lap, laps_done)
-        before = np.minimum(lap, stop_lap) - laps_done
-        after = np.where(lap > stop_lap, lap - stop_lap, 0.0)
-        return sec * (_tyre_cost(o1, d1, age1, before) + _tyre_cost(o2, d2, np.zeros_like(age1), after))
+        s1 = np.minimum(stop_lap, stop_lap2)
+        s2 = np.maximum(stop_lap, stop_lap2)
+        before = np.minimum(lap, s1) - laps_done
+        mid = np.maximum(0.0, np.minimum(lap, s2) - s1)
+        after = np.maximum(0.0, lap - s2)
+        zeros = np.zeros_like(age1)
+        return sec * (
+            _tyre_cost(o1, d1, age1, before)
+            + _tyre_cost(o2, d2, zeros, mid)
+            + _tyre_cost(o3, d3, zeros, after)
+        )
 
     finish = np.full((S, M), float(L))
     neutral = np.isfinite(first)
@@ -402,14 +474,23 @@ def forecast(
     eps_post = rng.standard_normal((S, M))
     u_take = rng.random((S, M))
 
-    def assemble(pace_arr: np.ndarray, noise: float) -> np.ndarray:
+    def assemble(
+        pace_arr: np.ndarray,
+        noise: float,
+        stop_arr: np.ndarray = stop,
+        stop_cost_arr: np.ndarray = stop_cost,
+        include_tyres: bool = True,
+    ) -> np.ndarray:
         """Total time to the flag per scenario and car (green, or around one neutralisation)."""
+        use_extra = has_extra if include_tyres else np.zeros((S, M), bool)
+        e_cost = extra_cost if include_tyres else 0.0
+        tyre_green = tyre_upto(finish, planned, planned2) if include_tyres else 0.0
         Z = (
             banked
             + remaining * pace_arr
-            + tyre_upto(finish, planned)
-            + stop_cost
-            + extra_cost
+            + tyre_green
+            + stop_cost_arr
+            + e_cost
             + noise * sigma_lap * np.sqrt(remaining) * eps_green
         )
         if not neutral.any():
@@ -417,17 +498,24 @@ def forecast(
         # each car's own lap when the neutralisation starts (lapped cars are behind)
         e_own = np.where(neutral[:, None], np.maximum(first[:, None], laps_done), laps_done)
         n1 = e_own - laps_done
+        tyre_pre = tyre_upto(e_own, planned, planned2) if include_tyres else 0.0
         pre = (
             banked
             + n1 * pace_arr
-            + tyre_upto(e_own, planned)
-            + np.where(stop <= e_own, stop_cost, 0.0)
-            + np.where(has_extra & (extra_lap <= e_own), extra_cost, 0.0)
+            + tyre_pre
+            + np.where(stop_arr <= e_own, stop_cost_arr, 0.0)
+            + np.where(use_extra & (extra_lap <= e_own), e_cost, 0.0)
             + noise * sigma_lap * np.sqrt(n1) * eps_pre
         )
-        pending = np.isfinite(stop) & (stop > e_own)
+        pending = np.isfinite(stop_arr) & (stop_arr > e_own)
+        pending2 = ~pending & use_extra & np.isfinite(extra_lap) & (extra_lap > e_own)
         take = pending & (is_red[:, None] | (u_take < config.pit_under_sc_probability))
-        queue_cost = np.where(take, np.where(is_red[:, None], 0.0, stop_cost * events.sc_pit_factor), 0.0)
+        take2 = pending2 & (is_red[:, None] | (u_take < config.pit_under_sc_probability))
+        queue_cost = np.where(
+            take,
+            np.where(is_red[:, None], 0.0, stop_cost_arr * events.sc_pit_factor),
+            np.where(take2, np.where(is_red[:, None], 0.0, e_cost * events.sc_pit_factor), 0.0),
+        )
         alive = ~(retire_lap <= first[:, None])
         queue = np.where(alive, pre + queue_cost, np.inf)
         rank = np.argsort(np.argsort(queue, axis=1), axis=1).astype(float)
@@ -437,17 +525,35 @@ def forecast(
         n2 = np.broadcast_to((L - restart)[:, None], (S, M))
         restart_own = np.maximum(restart[:, None], laps_done) * np.ones((1, M))
         stop_now = np.where(take, e_own, planned)
+        stop2_now = np.where(take2, e_own, planned2)
+        tyre_post = (
+            tyre_upto(finish, stop_now, stop2_now) - tyre_upto(restart_own, stop_now, stop2_now)
+            if include_tyres
+            else 0.0
+        )
         post = (
             config.restart_gap_seconds * rank
             + n2 * pace_arr
-            + tyre_upto(finish, stop_now) - tyre_upto(restart_own, stop_now)
-            + np.where(pending & ~take, stop_cost, 0.0)
-            + np.where(has_extra & (extra_lap > e_own), extra_cost, 0.0)
+            + tyre_post
+            + np.where(pending & ~take, stop_cost_arr, 0.0)
+            + np.where(use_extra & (extra_lap > e_own) & ~take2, e_cost, 0.0)
             + noise * sigma_lap * np.sqrt(n2) * eps_post
         )
         return np.where(neutral[:, None], post, Z)
 
     Z = assemble(pace, 1.0)
+    if config.events and config.pass_cost_seconds > 0.0 and M > 1:
+        # Equal-pace reference keeping mandatory (owed) stops and SC queues only:
+        # pit-cycle swaps from owed stops stay free, while on-track passes (from pace,
+        # tyres or lap noise) pay circuit-scaled overtaking friction.
+        equal_pace = np.full((S, M), ref)
+        owed_stop = np.where(owed[None, :], stop, np.inf)
+        owed_cost = np.where(owed[None, :], stop_cost, 0.0)
+        Z_ref = assemble(equal_pace, 0.0, stop_arr=owed_stop, stop_cost_arr=owed_cost, include_tyres=False)
+        rank_ref = np.argsort(np.argsort(Z_ref, axis=1), axis=1).astype(float)
+        rank_raw = np.argsort(np.argsort(Z, axis=1), axis=1).astype(float)
+        gained = np.maximum(0.0, rank_ref - rank_raw)
+        Z = Z + (config.pass_cost_seconds * events.pass_difficulty(loc)) * gained
     # --- classification
     finished = ~np.isfinite(retire_lap)
     laps_completed = np.where(finished, L, retire_lap - 1 - down)
@@ -465,6 +571,15 @@ def forecast(
     np.add.at(P, (np.tile(np.arange(N), S), positions.ravel()), 1.0)
     P /= S
     ahead = (positions[:, :, None] < positions[:, None, :]).mean(axis=0)
+
+    if config.events and transition is not None:
+        shrink_bucket, w = config.shrinkage_for(k, L)
+        if w > 0.0 and shrink_bucket is not None and shrink_bucket in transition.counts:
+            from f1_race_intelligence.race_model.baselines import pairwise_ahead_conditional
+
+            P_trans = transition.predict_running(shrink_bucket, cars)
+            P = (1.0 - w) * P + w * P_trans
+            ahead = (1.0 - w) * ahead + w * pairwise_ahead_conditional(P_trans)
 
     p_dnf = np.ones(N)
     for j, i in enumerate(run_idx):

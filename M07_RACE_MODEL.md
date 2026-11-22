@@ -94,7 +94,9 @@ Datos raw hasta vuelta k (racedata.truncate_at_lap: corta > k y elimina resultad
 | `restart_gap_seconds` | `0.8` | Flotante $> 0$ | Compresión de brecha por posición en relanzamiento tras SC/roja |
 | `pit_under_sc_probability` / `pit_under_vsc_probability` | `0.7` / `0.4` | Probabilidades $[0, 1]$ | Probabilidad de tomar parada pendiente bajo neutralización |
 | `noise_scales` / `noise_scale_per_phase` | `[1.0, 1.5, 2.0, 3.0]` / `true` | Grilla / booleano | Multiplicador de ruido de vuelta elegido en train (uno por fase *k*) |
-| `calibration_races` | `16` | Entero $\ge 1$ | Últimas carreras secas de `train` usadas para elegir el multiplicador |
+| `pass_costs` | `[0.0, 1.0, 1.5, 2.0, 2.5, 3.0]` | Grilla (s/puesto) | Fricción de adelantamiento ($\text{s/puesto} \times \text{dificultad de circuito}$) elegida en `train` (sin telemetría) |
+| `transition_shrinkage` | `true` | Booleano | Contracción convexa por fase $w_k \in [0, 1]$ hacia `TransitionBaseline.predict_running` con conteos LOO en `train` |
+| `calibration_races` | `16` | Entero $\ge 1$ | Últimas carreras secas de `train` usadas para elegir multiplicador de ruido y fricción |
 | `random_seed` | `42` | Entero | Semilla determinista compartida con el resto del proyecto |
 | `promote_requires_beating` | `"persist"` | `"persist"` \| `"transition"` | Baseline que debe superarse en RPS medio de validación para promover |
 | `log_mlflow` / `registered_model_name` | `false` / `"f1-race-position-model"` | Booleano / cadena | Registro opcional en MLflow local sin afectar la imagen batch AWS |
@@ -111,10 +113,16 @@ Datos raw hasta vuelta k (racedata.truncate_at_lap: corta > k y elimina resultad
   la log-verosimilitud de error de predicción solo sobre `train` tras el `burn_in_races`
   inicial. Después reproduce el filtro cronológicamente carrera a carrera con
   hiperparámetros congelados para producir el prior pre-carrera de cada Gran Premio.
-- **Eventos y calibración por fase (`events.py`, `runner.py`):** los riesgos de SC/VSC/roja
-  y retiro (convención (a): `racedata.is_retirement`), las pérdidas en boxes, la matriz de
-  transición baseline y los multiplicadores de ruido por fase (`noise_scale_by_fraction`)
-  se ajustan exclusivamente con `train`.
+- **Eventos, fricción de adelantamiento y calibración por fase (`events.py`, `forecast.py`, `runner.py`):**
+  los riesgos de SC/VSC/roja y retiro (convención (a): `racedata.is_retirement`), el
+  multiplicador de ruido en lluvia (`wet_noise_multiplier = 1.3915×`), las pérdidas en
+  boxes, el índice de dificultad de adelantamiento en línea de meta por circuito
+  (`pass_difficulty_by_location`, `8 529` ataques / `1 088` adelantamientos a $\le 1.0\text{ s}$
+  sin telemetría `car_data`, tasa global `12.76%`, $\kappa = 200$), el costo por puesto
+  ganado en pista (`pass_cost_seconds = 2.5 s` frente a la referencia de ritmo igual con
+  solo paradas obligatorias `owed`), el plan analítico opcional de 2 paradas, la matriz de
+  transición baseline y los pesos de contracción convexa LOO por fase
+  (`transition_shrinkage_by_fraction`) se ajustan **exclusivamente con `train`**.
 - **Reproducibilidad determinista:** el muestreador usa `np.random.default_rng(random_seed)`
   y cada artefacto registra `source_commit`, `source_dirty`, `dependency_lock_sha256`,
   `config_fingerprint` e `input_fingerprint` sobre las carreras de entrenamiento.
@@ -138,8 +146,10 @@ cuando se usa `--log-mlflow`):
   evolución de piloto ($q_\delta^2$), ajuste equipo × circuito ($s_c^2$) y ruido transitorio
   de día de carrera ($s_w^2$), junto con el salto invernal ($q_{\gamma,\text{season}}$) y el
   peso/ruido de clasificación ($\lambda, \sigma_q$).
-- **Eventos y multiplicadores por fase (`events`, `phase_noise_multipliers`):** tasas
-  globales de neutralización/retiro, pérdidas en boxes y circuitos con mayor tasa de SC.
+- **Eventos, fricción y contracción por fase (`events`, `phase_noise_multipliers`, `overtaking_friction`, `phase_transition_shrinkage`):**
+  tasas globales de neutralización/retiro, pérdidas en boxes, circuitos con mayor tasa de
+  SC, dificultad de adelantamiento en línea de meta (`pass_cost_seconds`, `pooled_pass_rate`,
+  `wet_noise_multiplier`) y pesos de contracción LOO por fase hacia la transición.
 
 ### Diagnóstico de overfitting y underfitting (`diagnose_race_model_generalization`)
 
@@ -157,9 +167,10 @@ split `test` sellado jamás interviene):
 
 ## Comparación experimental y evaluación real (validación 2023–2025)
 
-El historial completo de ablaciones e iteraciones (experimentos 0–5, exploración de
-`location` y decisión del propietario del proyecto de conservar el **Experimento 1**) está
-registrado en [docs/m7-experiments.md](docs/m7-experiments.md).
+El historial completo de ablaciones e iteraciones (experimentos 0–9 en Tracks A, B, C e integración final:
+calibración/contracción LOO, fricción de adelantamiento sin telemetría contra referencia de
+paradas obligatorias y régimen de lluvia / 2 paradas) está registrado en
+[docs/m7-experiments.md](docs/m7-experiments.md).
 
 ### Resultados medidos sobre datos reales de OpenF1 (validación: 12 carreras de 2025 hasta Spa)
 
@@ -169,27 +180,58 @@ de validación de la primera mitad de 2025 (con `2025 Miami Gardens` excluida po
 
 - **Parámetros estructurales ajustados en `train`:** $\phi = 0.4145$,
   $\sigma_\varepsilon = 0.4134\%$, $q_\gamma = 0.0736$, $q_{\gamma,\text{season}} = 0.2080$,
-  $q_\delta = 0.0162$, $s_c = 0.2336$, $s_w = 0.2196$, $\sigma_q = 0.8775$, $\lambda = 0.9727$.
+  $q_\delta = 0.0162$, $s_c = 0.2336$, $s_w = 0.2196$, $\sigma_q = 0.8775$, $\lambda = 0.9727$,
+  tasa de adelantamiento en línea de meta `pass_rate = 0.1276` ($\kappa = 200$, Mónaco `2.827×`
+  .. Barcelona `0.598×`), `pass_cost_seconds = 2.5 s`, `wet_noise_multiplier = 1.3915×`,
+  multiplicadores de ruido por fase `{0.1: 1.0, 0.25: 2.0, 0.5: 3.0, 0.75: 3.0, 0.9: 3.0}` y
+  pesos de contracción convexa LOO `{0.1: 0.1401, 0.25: 0.2194, 0.5: 0.3052, 0.75: 0.0958, 0.9: 0.3626}`.
 - **Prior pre-carrera (`prior_check`):** `train` ($n = 754$) RMSE `0.4165`, $z^2 = 1.074$;
   `validation` ($n = 171$) RMSE `0.4131`, $z^2 = 0.981$ (relación val/train `0.99×`, calibración
   cercana a 1.0).
-- **Diagnóstico de generalización:** `balanced` (promovido a `latest.json`).
+- **Diagnóstico de generalización y registro:** `balanced`, versión promovida a `latest.json`
+  `20261122T205928432773Z` (`manifest_sha256 = 93b9edeb723cc94c62091cc194d8e95a74f88981f678c17d25dc34b415a11a43`,
+  `verify-m7: OK`), registrada en MLflow como `models:/f1-race-position-model/2`
+  (`run_id = bc507f6458dd44f1b27569d2a4374f3d`).
+
+#### Evolución por track e integración final (Experimento 1b → 6c, 7b, 8d → 9a–9d)
+
+| Configuración / Track | RPS Global | 10% | 25% | 50% | 75% | 90% | Pairwise LL | Δ vs `transition` [IC 95%] | Brier (`win` / `podium` / `points` / `dnf`) |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| Referencia previa (Exp 1b) | 0.0796 | 0.1018 | 0.0980 | 0.0859 | 0.0662 | 0.0461 | 0.3667 | −0.0024 [−0.0095, +0.0049] | 0.0272 / 0.0464 / 0.1131 / 0.0390 |
+| Track C — Estrategia (`8d`: lluvia + 2 paradas) | 0.0791 | 0.1030 | 0.0971 | 0.0835 | 0.0651 | 0.0466 | 0.3656 | −0.0029 [−0.0099, +0.0040] | 0.0235 / 0.0464 / 0.1129 / 0.0391 |
+| Track A — Contracción LOO (`6c`) | 0.0740 | 0.0945 | 0.0924 | 0.0827 | 0.0616 | 0.0386 | 0.3458 | −0.0080 [−0.0129, −0.0031] | 0.0230 / 0.0422 / 0.1044 / 0.0390 |
+| Track B — Fricción `owed-only` (`7b`) | 0.0730 | 0.0942 | 0.0907 | 0.0838 | 0.0593 | 0.0369 | 0.3389 | −0.0090 [−0.0153, −0.0022] | 0.0236 / 0.0372 / 0.1072 / 0.0390 |
+| Combinado A + B (`9a`, sin Track C) | 0.0710 | 0.0925 | 0.0876 | 0.0810 | 0.0581 | 0.0357 | 0.3313 | −0.0110 [−0.0159, −0.0056] | 0.0215 / 0.0368 / 0.1028 / 0.0391 |
+| Combinado A + B + C completo (`9c`, con `8a`) | 0.0709 | 0.0934 | 0.0874 | 0.0804 | 0.0574 | 0.0358 | 0.3316 | −0.0110 [−0.0161, −0.0057] | 0.0190 / 0.0368 / 0.1031 / 0.0391 |
+| **Integración final A + B + C(`8b+8c`) (`9d`, `20261122T205928432773Z`)** | **0.0708** | **0.0924** | **0.0867** | **0.0810** | **0.0580** | **0.0358** | **0.3307** | **−0.0112 [−0.0161, −0.0059]** | **0.0212 / 0.0368 / 0.1025 / 0.0391** |
+| Baselines: `persist` / `transition` | 0.1160 / 0.0819 | 0.1597 / 0.0996 | 0.1565 / 0.1055 | 0.1365 / 0.0965 | 0.0812 / 0.0649 | 0.0462 / 0.0432 | — / 0.4308 | — | — |
+
+#### Desglose por fase (*k*) del modelo integrado final (`20261122T205928432773Z`)
 
 | Fase (*k*) | `race_model` RPS | `persist` RPS | `transition` RPS | `race_model` Pairwise LL | `transition` Pairwise LL | Δ vs `persist` [IC 95%] | Δ vs `transition` [IC 95%] |
 |---|---:|---:|---:|---:|---:|---|---|
-| 10% | 0.1018 | 0.1597 | 0.0996 | 0.4466 | 0.4963 | −0.0579 [−0.0863, −0.0306] | +0.0022 [−0.0070, +0.0115] |
-| 25% | 0.0980 | 0.1565 | 0.1055 | 0.4475 | 0.5258 | −0.0585 [−0.0877, −0.0306] | −0.0075 [−0.0267, +0.0100] |
-| 50% | 0.0859 | 0.1365 | 0.0965 | 0.4080 | 0.4804 | −0.0506 [−0.0739, −0.0254] | −0.0106 [−0.0292, +0.0084] |
-| 75% | 0.0662 | 0.0812 | 0.0649 | 0.3227 | 0.3686 | −0.0150 [−0.0318, +0.0002] | +0.0012 [−0.0086, +0.0100] |
-| 90% | 0.0461 | 0.0462 | 0.0432 | 0.2088 | 0.2830 | −0.0001 [−0.0084, +0.0074] | +0.0029 [−0.0012, +0.0073] |
-| **Global (`all`)** | **0.0796** | **0.1160** | **0.0819** | **0.3667** | **0.4308** | **−0.0364 [−0.0515, −0.0216]** | **−0.0024 [−0.0095, +0.0049]** |
+| 10% | **0.0924** | 0.1597 | 0.0996 | **0.4186** | 0.4963 | −0.0673 [−0.0926, −0.0415] | **−0.0072 [−0.0137, −0.0003]** |
+| 25% | **0.0867** | 0.1565 | 0.1055 | **0.4011** | 0.5258 | −0.0698 [−0.0943, −0.0445] | **−0.0188 [−0.0344, −0.0040]** |
+| 50% | **0.0810** | 0.1365 | 0.0965 | **0.3784** | 0.4804 | −0.0555 [−0.0718, −0.0375] | **−0.0155 [−0.0295, −0.0031]** |
+| 75% | **0.0580** | 0.0812 | 0.0649 | **0.2794** | 0.3686 | −0.0232 [−0.0346, −0.0116] | −0.0069 [−0.0144, +0.0004] |
+| 90% | **0.0358** | 0.0462 | 0.0432 | **0.1760** | 0.2830 | −0.0105 [−0.0181, −0.0033] | **−0.0074 [−0.0114, −0.0044]** |
+| **Global (`all`)** | **0.0708** | **0.1160** | **0.0819** | **0.3307** | **0.4308** | **−0.0452 [−0.0580, −0.0315]** | **−0.0112 [−0.0161, −0.0059]** |
 
-- **Calibración de eventos (Brier en validación):** `win = 0.0272`, `podium = 0.0464`,
-  `points = 0.1131`.
-- **Lectura académica honesta:** `race_model` supera de forma estadísticamente clara al
-  baseline `persist` en validación (IC 95% estrictamente negativo) y mejora tanto el RPS
-  global como el log-loss por pares (`0.3667` vs `0.4308`) frente a la matriz `transition`,
-  aunque el IC 95% de $\Delta\text{RPS}$ frente a `transition` incluye 0 con 12 carreras.
+- **Calibración de eventos (Brier en validación):** `win = 0.0212`, `podium = 0.0368`,
+  `points = 0.1025`, `dnf = 0.0391` (`pronóstico medio 0.047 vs observado 0.041`).
+- **Lectura académica honesta:** la integración final combina la fricción de adelantamiento
+  escalada por dificultad de circuito frente a la referencia de solo paradas obligatorias
+  (`owed-only`, Track B), la contracción convexa LOO por fase hacia `TransitionBaseline.predict_running`
+  (Track A), el multiplicador de ruido en lluvia ajustado en `train` (`1.3915×`, Track C `8b`)
+  y el plan analítico opcional de 2 paradas (Track C `8c`), descartando `8a` porque degradaba
+  los buckets `10%` (`+0.0010`) y `25%` (`+0.0007`) al integrarse. Con ello, `race_model`
+  alcanza **`0.0708` RPS global** (`−0.0088` frente a la referencia Exp 1b) y supera de forma
+  **estadísticamente significativa** tanto a `persist` (`ΔRPS = −0.0452 [−0.0580, −0.0315]`)
+  como a `transition` (`ΔRPS = −0.0112 [−0.0161, −0.0059]`), ganando a ambos baselines en **los 5
+  buckets de distancia (10% a 90%, con IC 95% estrictamente negativo en 4/5 buckets individuales)**
+  y en **11 de las 12 carreras de validación** (incluyendo Mónaco `0.0896 → 0.0701`,
+  Montréal `0.1075 → 0.0908`, Silverstone `0.0904 → 0.0750`, Spa `0.0733 → 0.0577`,
+  Melbourne `0.1015 → 0.0971` y Barcelona `0.1212 → 0.1111`).
 
 ## Anti-leakage y contrato unificado M7 → Registro / MLflow → Publicación → Serving
 

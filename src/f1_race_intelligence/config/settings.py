@@ -404,6 +404,10 @@ class RaceModelSettings(BaseModel):
     """Candidates for the lap-noise multiplier, chosen on training races by RPS."""
     noise_scale_per_phase: bool = False
     """Choose one multiplier per k-bucket instead of one for the whole race."""
+    pass_costs: List[float] = Field(default_factory=lambda: [0.0, 1.0, 1.5, 2.0, 2.5, 3.0])
+    """Candidates for overtaking friction (seconds/place × circuit difficulty), chosen on training races."""
+    transition_shrinkage: bool = True
+    """Fit phase-wise convex shrinkage weights toward the training transition baseline."""
     calibration_races: int = 16
     """Training races (the latest ones) used to pick the noise multiplier."""
     random_seed: int = 42

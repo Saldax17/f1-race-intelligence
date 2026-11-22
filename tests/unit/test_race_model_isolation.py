@@ -110,12 +110,15 @@ def test_changing_validation_data_does_not_change_any_fitted_parameter(tmp_path)
             "tyres_by_location": a.level1["tyres_by_location"],
             "season_params": a.season["state"]["params"], "events": a.events, "transition": a.transition,
             "noise": (a.forecast["noise_scale"], a.forecast.get("noise_scale_by_fraction")),
+            "pass_cost_seconds": a.forecast.get("pass_cost_seconds"),
+            "shrinkage": a.forecast.get("transition_shrinkage_by_fraction"),
         }, a
 
     original, art_o = fitted(False, "original")
     altered, art_a = fitted(True, "altered")
     for name in original:
         assert original[name] == altered[name], f"{name} changed when only validation data changed"
+    assert original["shrinkage"] and all(0.0 <= w <= 1.0 for w in original["shrinkage"].values())
     # the online replay does see validation results, so their pre-race priors may differ: that is allowed
     assert set(art_o.season["priors"]) == set(art_a.season["priors"])
 

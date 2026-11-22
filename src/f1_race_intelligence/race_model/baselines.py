@@ -79,6 +79,29 @@ class TransitionBaseline:
             P[i] = Q[place]
         return P
 
+    def predict_running(self, bucket: str, cars: Sequence[CarState]) -> np.ndarray:
+        """Doubly stochastic transition matrix locking already-retired cars at the back.
+
+        Under DNF convention (a), a car already retired at lap k is guaranteed to
+        finish behind every running car in its deterministic retirement slot.
+        Applying Sinkhorn strictly on the M running cars (positions 1..M) and
+        placing an identity block on the N - M retired cars preserves exact
+        double stochasticity without giving retired cars nonzero win probability.
+        """
+        order = order_at_k(cars)
+        n = len(cars)
+        running_order = [i for i in order if not cars[i].retired]
+        retired_order = [i for i in order if cars[i].retired]
+        m = len(running_order)
+        P = np.zeros((n, n))
+        if m > 0:
+            Q = self.matrix(bucket, m)
+            for place, i in enumerate(running_order):
+                P[i, :m] = Q[place]
+        for offset, i in enumerate(retired_order):
+            P[i, m + offset] = 1.0
+        return P
+
     def to_dict(self) -> Dict[str, object]:
         return {"size": self.size, "alpha": self.alpha, "counts": {k: v.tolist() for k, v in self.counts.items()}}
 
@@ -99,4 +122,20 @@ def ahead_from_matrix(P: np.ndarray) -> np.ndarray:
             if i != j:
                 # Pr(pos_i < pos_j) = Σ_a P[i,a] Pr(pos_j > a)
                 ahead[i, j] = float(np.sum(P[i] * (1 - F[j])))
+    return ahead
+
+
+def pairwise_ahead_conditional(P: np.ndarray) -> np.ndarray:
+    """Pairwise Pr(pos_i < pos_j | pos_i != pos_j) from marginal position rows.
+
+    Conditioning out ties restores exact complementarity ``ahead[i, j] + ahead[j, i] == 1``
+    for all ``i != j`` (matching permutation-averaged Monte Carlo ``ahead`` matrices).
+    """
+    F = np.cumsum(P, axis=1)
+    raw = P @ (1.0 - F).T
+    np.fill_diagonal(raw, 0.0)
+    denom = raw + raw.T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ahead = np.where(denom > 0.0, raw / denom, 0.5)
+    np.fill_diagonal(ahead, 0.0)
     return ahead

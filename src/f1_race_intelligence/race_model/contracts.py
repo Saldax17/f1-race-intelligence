@@ -549,6 +549,12 @@ def extract_interpretability(artifact: Any) -> Dict[str, Any]:
             "default_noise_scale": fc.get("noise_scale"),
             "by_fraction": fc.get("noise_scale_by_fraction"),
         },
+        "overtaking_friction": {
+            "pass_cost_seconds": fc.get("pass_cost_seconds", 0.0),
+            "pooled_pass_rate": events.get("pass_rate"),
+            "wet_noise_multiplier": events.get("wet_noise_multiplier", 1.0),
+        },
+        "phase_transition_shrinkage": fc.get("transition_shrinkage_by_fraction"),
         "note": STRUCTURAL_INTERPRETABILITY_NOTE,
     }
 

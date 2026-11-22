@@ -29,6 +29,10 @@ HAZARD_POOLING_LAPS = 60.0
 """κ for the SC/VSC/red hazards: a circuit needs about one race of laps to move halfway."""
 DNF_POOLING_DRIVER_LAPS = 2000.0
 """κ for retirements: about 1.5 races of driver-laps."""
+PASSING_POOLING_ATTACKS = 200.0
+"""κ for timing-line overtaking rates: shrinks low-count circuits toward the field rate."""
+PASSING_ATTACK_GAP_SECONDS = 1.0
+"""Maximum timing-line gap (s) between adjacent cars to count as an overtaking attack."""
 
 
 @dataclass
@@ -44,6 +48,7 @@ class EventModel:
     dnf_hazard: float = 0.0015
     dnf_by_location: Dict[str, float] = field(default_factory=dict)
     wet_dnf_multiplier: float = 1.5
+    wet_noise_multiplier: float = 1.0
     pit_loss: float = 22.0
     pit_loss_by_location: Dict[str, float] = field(default_factory=dict)
     pit_loss_sd: float = 2.0
@@ -53,6 +58,8 @@ class EventModel:
     stop_lap_sd: float = 5.0
     extra_stop_rate: float = 0.3
     extra_stop_by_location: Dict[str, float] = field(default_factory=dict)
+    pass_rate: float = 0.13
+    pass_difficulty_by_location: Dict[str, float] = field(default_factory=dict)
     circuit_laps: Dict[str, int] = field(default_factory=dict)
     counts: Dict[str, Any] = field(default_factory=dict)
 
@@ -70,6 +77,10 @@ class EventModel:
 
     def extra_stop(self, location: str) -> float:
         return float(self.extra_stop_by_location.get(location, self.extra_stop_rate))
+
+    def pass_difficulty(self, location: str) -> float:
+        """Relative overtaking difficulty (pooled_rate / circuit_rate); 1.0 for unseen circuits."""
+        return float(self.pass_difficulty_by_location.get(location, 1.0))
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -110,10 +121,14 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
     sc_len, vsc_len = [], []
     dnf_events, dnf_exposure = defaultdict(float), defaultdict(float)
     wet_events = wet_exposure = dry_events = dry_exposure = 0.0
+    wet_mads: List[float] = []
+    dry_mads: List[float] = []
     losses: Dict[str, List[float]] = defaultdict(list)
     sc_ratio, vsc_ratio = [], []
     stop_resid: List[float] = []
     extra = defaultdict(lambda: [0.0, 0.0])
+    pass_attacks: Dict[str, float] = defaultdict(float)
+    pass_events: Dict[str, float] = defaultdict(float)
 
     for race in races:
         loc = race.ref.location
@@ -146,8 +161,29 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
             else:
                 dry_events, dry_exposure = dry_events + hit, dry_exposure + exposure
 
-        # pit loss vs the field median of the same laps
+        # lap-time residual spread on green non-pit laps (wet vs dry noise ratio)
         laps = race.laps.dropna(subset=["lap_duration"])
+        ts_race = tyre_state(race)
+        if not laps.empty:
+            green_clean = np.array(
+                [
+                    (int(d), int(l)) not in ts_race.inout and regimes.get(int(l), "GREEN") == "GREEN"
+                    for d, l in zip(laps["driver_number"], laps["lap_number"])
+                ],
+                dtype=bool,
+            )
+            ok_laps = laps[(laps["lap_number"] > 1) & ~laps["is_pit_out_lap"] & green_clean]
+            if len(ok_laps) >= 30:
+                ref_lap = float(ok_laps["lap_duration"].median())
+                if ref_lap > 0:
+                    y = 100.0 * (ok_laps["lap_duration"] / ref_lap - 1.0)
+                    r1 = y - y.groupby(ok_laps["lap_number"]).transform("median")
+                    r2 = r1 - r1.groupby(ok_laps["driver_number"]).transform("median")
+                    mad = float(1.4826 * np.median(np.abs(r2.to_numpy(float))))
+                    if np.isfinite(mad) and mad > 0:
+                        (wet_mads if race.wet else dry_mads).append(mad)
+
+        # pit loss vs the field median of the same laps
         if not laps.empty:
             table = laps.pivot_table(index="lap_number", columns="driver_number", values="lap_duration")
             pitting = defaultdict(set)
@@ -177,9 +213,43 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
                 elif kind == VSC:
                     vsc_ratio.append(loss)
 
+        # timing-line overtaking attacks (adjacent cars within 1.0 s on green, non-pit laps; zero telemetry)
+        timed = race.laps.dropna(subset=["t_end"])
+        if not timed.empty:
+            neut = neutralised_laps(race.race_control, total)
+            by_lap = {
+                int(lap_num): list(zip(g["driver_number"].tolist(), g["t_end"].tolist()))
+                for lap_num, g in timed.sort_values("t_end").groupby("lap_number")
+            }
+            for lap_num in range(2, total):
+                if lap_num in neut or (lap_num + 1) in neut:
+                    continue
+                cur = by_lap.get(lap_num)
+                nxt = by_lap.get(lap_num + 1)
+                if not cur or not nxt:
+                    continue
+                nxt_pos = {d: idx for idx, (d, _) in enumerate(nxt)}
+                for idx in range(len(cur) - 1):
+                    d_ahead, t_ahead = cur[idx]
+                    d_behind, t_behind = cur[idx + 1]
+                    if (
+                        (d_ahead, lap_num) in ts_race.inout
+                        or (d_ahead, lap_num + 1) in ts_race.inout
+                        or (d_behind, lap_num) in ts_race.inout
+                        or (d_behind, lap_num + 1) in ts_race.inout
+                    ):
+                        continue
+                    if d_ahead not in nxt_pos or d_behind not in nxt_pos:
+                        continue
+                    gap = (t_behind - t_ahead).total_seconds()
+                    if 0.0 <= gap <= PASSING_ATTACK_GAP_SECONDS:
+                        pass_attacks[loc] += 1.0
+                        if nxt_pos[d_behind] < nxt_pos[d_ahead]:
+                            pass_events[loc] += 1.0
+
         # stop timing of one-stop dry races, and how often cars stop more than they must
         if not race.wet:
-            ts = tyre_state(race)
+            ts = ts_race
             for d, stops in ts.stops.items():
                 if order.position.get(d) is None or d in order.retired or d in order.classified_dnf:
                     continue
@@ -213,6 +283,8 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
         if dry_exposure > 0 and wet_exposure > 0:
             dry_rate = dry_events / dry_exposure
             model.wet_dnf_multiplier = float((wet_events + 2) / (wet_exposure * dry_rate + 2))
+    if wet_mads and dry_mads and float(np.median(dry_mads)) > 0:
+        model.wet_noise_multiplier = float(np.clip(np.median(wet_mads) / np.median(dry_mads), 1.0, 3.0))
     green_losses = [x for xs in losses.values() for x in xs]
     if green_losses:
         model.pit_loss = float(np.median(green_losses))
@@ -234,6 +306,15 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
         model.extra_stop_by_location = {
             loc: float((v[1] + 20 * model.extra_stop_rate) / (v[0] + 20)) for loc, v in extra.items() if v[0]
         }
+    total_attacks = sum(pass_attacks.values())
+    total_passes = sum(pass_events.values())
+    if total_attacks > 0 and total_passes > 0:
+        pooled_pass = total_passes / total_attacks
+        model.pass_rate = float(pooled_pass)
+        shrunk_rates = _shrunk(pass_events, pass_attacks, pooled_pass, PASSING_POOLING_ATTACKS)
+        model.pass_difficulty_by_location = {
+            loc: float(pooled_pass / max(rate, 1e-6)) for loc, rate in shrunk_rates.items()
+        }
     for race in races:
         winner = [r.get("number_of_laps") for r in race.result if r.get("position") == 1]
         if winner and winner[0]:
@@ -248,5 +329,7 @@ def fit_events(races: Sequence[RaceData], tyres: TyreModel) -> EventModel:
         "green_pit_stops": len(green_losses),
         "sc_pit_stops": len(sc_ratio),
         "one_stop_drivers": len(stop_resid),
+        "passing_attacks": int(total_attacks),
+        "passing_passes": int(sum(pass_events.values())),
     }
     return model

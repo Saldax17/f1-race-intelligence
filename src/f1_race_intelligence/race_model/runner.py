@@ -185,6 +185,7 @@ class LoadedModel:
             rng=np.random.default_rng(seed),
             model_version=self.artifact.version,
             fallback_prior_variance=float(self.season.params.p0_gamma + self.season.params.p0_delta),
+            transition=self.transition if events else None,
         )
 
 
@@ -392,6 +393,7 @@ class RaceModelRunner:
                 "pit_under_sc_probability": cfg.pit_under_sc_probability,
                 "pit_under_vsc_probability": cfg.pit_under_vsc_probability,
                 "noise_scale": cfg.noise_scales[0] if cfg.noise_scales else 1.0,
+                "pass_cost_seconds": 0.0,
             },
             transition=(transition or TransitionBaseline()).to_dict(),
             races=[{**r.ref.to_dict(), "split": splits.get(r.ref.session_key)} for r in races],
@@ -449,11 +451,16 @@ class RaceModelRunner:
             }
         return out
 
-    def _transition_counts(self, races: Sequence[RaceData]) -> TransitionBaseline:
+    def _transition_counts_by_race(
+        self, races: Sequence[RaceData]
+    ) -> Tuple[TransitionBaseline, Dict[int, Dict[str, np.ndarray]]]:
+        """Count position transitions on training races, keeping per-race counts for LOO shrinkage."""
         base = TransitionBaseline()
+        by_race: Dict[int, Dict[str, np.ndarray]] = {}
         for race in races:
             order = final_order(race.result)
             total = scheduled_laps(race)
+            race_counts: Dict[str, np.ndarray] = {}
             for bucket, k in k_laps(total, self.cfg.k_fractions):
                 try:
                     race_k = truncate_at_lap(race, k)
@@ -461,8 +468,19 @@ class RaceModelRunner:
                 except ValueError:
                     continue
                 running = order_at_k(cars)
-                base.add(bucket, [running.index(i) + 1 for i in range(len(cars))],
-                         [order.position.get(c.driver_number) for c in cars])
+                pos_k = [running.index(i) + 1 for i in range(len(cars))]
+                final_pos = [order.position.get(c.driver_number) for c in cars]
+                base.add(bucket, pos_k, final_pos)
+                C = np.zeros((base.size, base.size))
+                for a, b in zip(pos_k, final_pos):
+                    if b is not None and 1 <= a <= base.size and 1 <= b <= base.size:
+                        C[a - 1, b - 1] += 1
+                race_counts[bucket] = C
+            by_race[race.ref.session_key] = race_counts
+        return base, by_race
+
+    def _transition_counts(self, races: Sequence[RaceData]) -> TransitionBaseline:
+        base, _ = self._transition_counts_by_race(races)
         return base
 
     def _choose_noise(self, model: LoadedModel, races: Sequence[RaceData]) -> Tuple[float, Dict[str, Any]]:
@@ -478,6 +496,7 @@ class RaceModelRunner:
         fractions = {f"{int(round(f * 100))}%": f for f in cfg.k_fractions}
         by_bucket: Dict[str, Dict[str, List[float]]] = {}
         model.config.noise_scale_by_fraction = None
+        model.config.transition_shrinkage_by_fraction = None
         model.config.scenarios = min(cfg.scenarios, 1000)
         for scale in cfg.noise_scales:
             model.config.noise_scale = scale
@@ -498,6 +517,139 @@ class RaceModelRunner:
                 str(fractions[b]): float(min(scores, key=scores.get)) for b, scores in detail["by_bucket"].items()}
         return best, detail
 
+    def _choose_pass_cost(self, model: LoadedModel, races: Sequence[RaceData]) -> Tuple[float, Dict[str, Any]]:
+        """Pick the overtaking friction (seconds/place × circuit difficulty) by RPS on training races."""
+        cfg = self.cfg
+        candidates = list(cfg.pass_costs) if cfg.pass_costs else [0.0]
+        if len(candidates) <= 1:
+            return float(candidates[0]), {}
+        sample = [r for r in races if not r.wet][-cfg.calibration_races:]
+        if not sample:
+            return float(candidates[0]), {}
+        saved_scenarios = model.config.scenarios
+        saved_cost = model.config.pass_cost_seconds
+        saved_shrink = model.config.transition_shrinkage_by_fraction
+        model.config.scenarios = min(cfg.scenarios, 1000)
+        model.config.transition_shrinkage_by_fraction = None
+        scores: Dict[str, List[float]] = {str(c): [] for c in candidates}
+        try:
+            for cost in candidates:
+                model.config.pass_cost_seconds = float(cost)
+                for race in sample:
+                    for bucket, k in k_laps(model.total_laps(race), cfg.k_fractions):
+                        try:
+                            result = model.run(truncate_at_lap(race, k), model.prior_for(race), model.total_laps(race), seed=cfg.random_seed)
+                        except ValueError:
+                            continue
+                        scores[str(cost)].append(score_forecast(result, race, model, bucket)["model"]["rps"])
+        finally:
+            model.config.scenarios = saved_scenarios
+            model.config.pass_cost_seconds = saved_cost
+            model.config.transition_shrinkage_by_fraction = saved_shrink
+        overall = {s: float(np.nanmean(v)) for s, v in scores.items() if v}
+        if not overall:
+            return float(candidates[0]), {}
+        best = float(min(overall, key=overall.get))
+        return best, {"overall": overall, "chosen": best}
+
+    def _fit_transition_shrinkage(
+        self,
+        model: LoadedModel,
+        train_races: Sequence[RaceData],
+        full_transition: TransitionBaseline,
+        per_race_counts: Mapping[int, Mapping[str, np.ndarray]],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """Fit phase-wise convex shrinkage weights ``w_k`` in ``[0, 1]`` on training races.
+
+        Minimises training RPS of ``(1 - w_k) P_model + w_k P_transition`` in exact closed form
+        using leave-one-race-out transition counts so ``P_transition`` carries zero in-sample bias.
+        """
+        cfg = self.cfg
+        sample = list(train_races[cfg.burn_in_races:])
+        fractions = {f"{int(round(f * 100))}%": f for f in cfg.k_fractions}
+        orig_scenarios = model.config.scenarios
+        orig_shrink = model.config.transition_shrinkage_by_fraction
+        model.config.scenarios = min(cfg.scenarios, 1000)
+        model.config.transition_shrinkage_by_fraction = None
+        num: Dict[str, float] = {}
+        den: Dict[str, float] = {}
+        model_rps_by_b: Dict[str, List[float]] = {}
+        trans_rps_by_b: Dict[str, List[float]] = {}
+        try:
+            for race in sample:
+                order = final_order(race.result)
+                total = model.total_laps(race)
+                race_c = per_race_counts.get(race.ref.session_key, {})
+                loo_trans = TransitionBaseline(size=full_transition.size, alpha=full_transition.alpha)
+                for b, C in full_transition.counts.items():
+                    loo_trans.counts[b] = C - race_c.get(b, 0.0)
+                for bucket, k in k_laps(total, cfg.k_fractions):
+                    try:
+                        race_k = truncate_at_lap(race, k)
+                        res = model.run(race_k, model.prior_for(race), total, seed=cfg.random_seed)
+                    except ValueError:
+                        continue
+                    numbers = [d["driver_number"] for d in res.drivers]
+                    actual = [order.position.get(n) for n in numbers]
+                    scored = [
+                        a if (not d["retired_at_k"] and a is not None) else None
+                        for d, a in zip(res.drivers, actual)
+                    ]
+                    cars = car_states(race_k, reference_lap(race_k))
+                    by_number = {c.driver_number: c for c in cars}
+                    cars = [by_number[n] for n in numbers]
+                    for car, d in zip(cars, res.drivers):
+                        car.retired = bool(d["retired_at_k"])
+                    P_m = res.matrix
+                    P_t = loo_trans.predict_running(bucket, cars)
+                    N = P_m.shape[1]
+                    if N <= 1:
+                        continue
+                    valid_idx = [i for i, a in enumerate(scored) if a is not None and 1 <= a <= N]
+                    if not valid_idx:
+                        continue
+                    F_m = np.cumsum(P_m, axis=1)[:, : N - 1]
+                    F_t = np.cumsum(P_t, axis=1)[:, : N - 1]
+                    weight = 1.0 / (len(valid_idx) * (N - 1))
+                    b_num = 0.0
+                    b_den = 0.0
+                    r_m = 0.0
+                    r_t = 0.0
+                    positions = np.arange(1, N)
+                    for i in valid_idx:
+                        O = (positions >= scored[i]).astype(float)
+                        diff_m = F_m[i] - O
+                        diff_t = F_t[i] - O
+                        delta = F_t[i] - F_m[i]
+                        b_num += float(np.dot(diff_m, -delta)) * weight
+                        b_den += float(np.dot(delta, delta)) * weight
+                        r_m += float(np.dot(diff_m, diff_m)) * weight
+                        r_t += float(np.dot(diff_t, diff_t)) * weight
+                    num[bucket] = num.get(bucket, 0.0) + b_num
+                    den[bucket] = den.get(bucket, 0.0) + b_den
+                    model_rps_by_b.setdefault(bucket, []).append(r_m)
+                    trans_rps_by_b.setdefault(bucket, []).append(r_t)
+        finally:
+            model.config.scenarios = orig_scenarios
+            model.config.transition_shrinkage_by_fraction = orig_shrink
+
+        chosen_by_fraction: Dict[str, float] = {}
+        by_bucket: Dict[str, Dict[str, float]] = {}
+        for bucket in sorted(num, key=lambda b: fractions[b]):
+            w_raw = num[bucket] / den[bucket] if den[bucket] > 1e-12 else 0.0
+            w = float(np.clip(w_raw, 0.0, 1.0))
+            chosen_by_fraction[str(fractions[bucket])] = w
+            by_bucket[bucket] = {
+                "weight": w,
+                "train_model_rps": float(np.mean(model_rps_by_b[bucket])),
+                "train_loo_transition_rps": float(np.mean(trans_rps_by_b[bucket])),
+            }
+        return chosen_by_fraction, {
+            "fit_races": len(sample),
+            "chosen_by_fraction": chosen_by_fraction,
+            "by_bucket": by_bucket,
+        }
+
     # -- stages -------------------------------------------------------------------
 
     def train(self) -> StageResult:
@@ -509,13 +661,30 @@ class RaceModelRunner:
         train_races = [r for r in races if splits[r.ref.session_key] == TRAIN and r.result]
         if len(train_races) <= self.cfg.burn_in_races:
             return StageResult(False, reason=f"only {len(train_races)} training races; need more than the burn-in")
-        transition = self._transition_counts(train_races)
+        transition, per_race_counts = self._transition_counts_by_race(train_races)
         artifact, metrics = self._fit_all(races, splits, transition=transition)
         model = LoadedModel.from_artifact(artifact)
         scale, scores = self._choose_noise(model, train_races)
+        model.config.noise_scale = scale
+        model.config.noise_scale_by_fraction = scores.get("chosen_by_fraction")
+        pass_cost, pass_scores = self._choose_pass_cost(model, train_races)
+        model.config.pass_cost_seconds = pass_cost
+        if pass_cost > 0.0 and len(self.cfg.noise_scales) > 1:
+            scale, scores = self._choose_noise(model, train_races)
+            model.config.noise_scale = scale
+            model.config.noise_scale_by_fraction = scores.get("chosen_by_fraction")
         artifact.forecast["noise_scale"] = scale
         artifact.forecast["noise_scale_by_fraction"] = scores.get("chosen_by_fraction")
+        artifact.forecast["pass_cost_seconds"] = pass_cost
         artifact.metrics["noise_scale_rps"] = scores
+        if pass_scores:
+            artifact.metrics["pass_cost_rps"] = pass_scores
+        if self.cfg.transition_shrinkage:
+            shrink_by_fraction, shrink_detail = self._fit_transition_shrinkage(
+                model, train_races, transition, per_race_counts
+            )
+            artifact.forecast["transition_shrinkage_by_fraction"] = shrink_by_fraction
+            artifact.metrics["transition_shrinkage"] = shrink_detail
         interpretability = extract_interpretability(artifact)
         uri = self.registry.save(artifact)
         verification = self.registry.verify(artifact.version)

@@ -9,13 +9,16 @@ import pandas as pd
 import pytest
 
 from f1_race_intelligence.race_model.artifact import ModelArtifact, ModelRegistry, new_version
+from f1_race_intelligence.race_model.baselines import TransitionBaseline, pairwise_ahead_conditional
 from f1_race_intelligence.race_model.events import EventModel, optimal_stop_lap
 from f1_race_intelligence.race_model.forecast import (
+    CarState,
     ForecastConfig,
     car_states,
     forecast,
     pace_posterior,
     pairwise_closed_form,
+    plan_stops,
 )
 from f1_race_intelligence.race_model.pace import Level1Config, TyreModel, clean_laps, fit_level1
 from f1_race_intelligence.race_model.racedata import RaceRef, build_race, final_order, truncate_at_lap
@@ -258,6 +261,142 @@ def test_a_safety_car_queues_cars_by_track_position_not_lap_count():
 
 def test_stop_lap_formula():
     assert optimal_stop_lap(0.05, 0.05, 50, 0, 0) == pytest.approx(25)
+
+
+def test_transition_shrinkage_preserves_double_stochasticity_retired_lock_and_ahead():
+    cars = [
+        CarState(1, "D1", "A", 10, 0.0, False, "HARD", 5, ["MEDIUM", "HARD"], 1),
+        CarState(2, "D2", "A", 10, -2.0, False, "HARD", 5, ["MEDIUM", "HARD"], 1),
+        CarState(3, "D3", "B", 10, -5.0, False, "HARD", 5, ["MEDIUM", "HARD"], 1),
+        CarState(4, "D4", "B", 4, -600.0, True, "MEDIUM", 4, ["MEDIUM"], 0),
+    ]
+    trans = TransitionBaseline(size=6)
+    for _ in range(10):
+        trans.add("50%", [1, 2, 3, 4], [1, 2, 3, 4])
+        trans.add("50%", [1, 2, 3, 4], [2, 1, 3, 4])
+
+    P_run = trans.predict_running("50%", cars)
+    assert np.allclose(P_run.sum(axis=1), 1.0) and np.allclose(P_run.sum(axis=0), 1.0)
+    assert P_run[3, 3] == pytest.approx(1.0) and P_run[3, 0] == pytest.approx(0.0)
+    assert np.allclose(P_run[:3, 3], 0.0)
+
+    ahead = pairwise_ahead_conditional(P_run)
+    assert np.allclose(np.diag(ahead), 0.0)
+    assert np.allclose(ahead + ahead.T, 1.0 - np.eye(4))
+    assert np.allclose(ahead[:3, 3], 1.0) and np.allclose(ahead[3, :3], 0.0)
+
+    # End-to-end inside forecast(): exact interpolation, double stochasticity, and ahead complementarity
+    race = synthetic_race()
+    cut = truncate_at_lap(race, 10)
+    prior = Prior([f"D{i + 1}" for i in range(6)], np.zeros(6), np.eye(6) * 0.25)
+    trans6 = TransitionBaseline(size=6)
+    for _ in range(10):
+        trans6.add("50%", [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6])
+    common = dict(level1=LEVEL1, phi=0.4, sigma_eps=0.3, tyres=TyreModel(), events=EventModel())
+    r0 = forecast(cut, prior, 20, **common, config=ForecastConfig(scenarios=1000, events=True),
+                  rng=np.random.default_rng(11), transition=trans6)
+    r_half = forecast(cut, prior, 20, **common,
+                      config=ForecastConfig(scenarios=1000, events=True,
+                                            transition_shrinkage_by_fraction={"0.5": 0.4}),
+                      rng=np.random.default_rng(11), transition=trans6)
+    r1 = forecast(cut, prior, 20, **common,
+                  config=ForecastConfig(scenarios=1000, events=True,
+                                        transition_shrinkage_by_fraction={"0.5": 1.0}),
+                  rng=np.random.default_rng(11), transition=trans6)
+
+    assert np.allclose(r_half.matrix.sum(axis=1), 1.0) and np.allclose(r_half.matrix.sum(axis=0), 1.0)
+    assert np.allclose(r_half.matrix, 0.6 * r0.matrix + 0.4 * r1.matrix)
+    assert np.allclose(r_half.ahead, 0.6 * r0.ahead + 0.4 * r1.ahead)
+    assert np.allclose(r_half.ahead + r_half.ahead.T, 1.0 - np.eye(6))
+    assert np.allclose(r_half.p_dnf, r0.p_dnf)
+
+
+def test_passing_difficulty_fitted_from_timing_line_without_telemetry():
+    """Circuit passing difficulty uses timing-line gaps only, shrinks low counts toward 1.0."""
+    from f1_race_intelligence.race_model.events import fit_events
+
+    def attack_race(location: str, pass_on_even: bool) -> object:
+        laps, stints, result = [], [], []
+        t1, t2 = T0, T0 + timedelta(seconds=0.4)
+        for lap in range(1, 21):
+            d1, d2 = 90.0, 90.0
+            if pass_on_even and lap >= 3 and lap % 2 == 1:
+                d2 = 89.2
+            elif pass_on_even and lap >= 4 and lap % 2 == 0:
+                d1 = 89.2
+            laps.append({"driver_number": 1, "lap_number": lap, "lap_duration": d1, "date_start": iso(t1), "is_pit_out_lap": False})
+            laps.append({"driver_number": 2, "lap_number": lap, "lap_duration": d2, "date_start": iso(t2), "is_pit_out_lap": False})
+            t1 += timedelta(seconds=d1)
+            t2 += timedelta(seconds=d2)
+        for d in (1, 2):
+            stints.append({"driver_number": d, "stint_number": 1, "compound": "HARD", "lap_start": 1, "lap_end": 20, "tyre_age_at_start": 0})
+            result.append({"driver_number": d, "position": d, "number_of_laps": 20, "dnf": False, "dns": False, "dsq": False})
+        drivers = [{"driver_number": 1, "name_acronym": "D1", "team_name": "A"}, {"driver_number": 2, "name_acronym": "D2", "team_name": "B"}]
+        ref = RaceRef(year=2024, meeting_key=1, session_key=10 if pass_on_even else 11, location=location, date_start=iso(T0))
+        return build_race(ref, {"drivers": drivers, "laps": laps, "stints": stints, "pit": [], "race_control": [],
+                                "intervals": [], "session_result": result, "starting_grid": []})
+
+    events = fit_events([attack_race("EasyTrack", True), attack_race("HardTrack", False)], TyreModel())
+    assert events.counts["passing_attacks"] > 0 and events.counts["passing_passes"] > 0
+    assert events.pass_difficulty("HardTrack") > events.pass_difficulty("EasyTrack")
+    assert events.pass_difficulty("UnseenCircuit") == 1.0
+
+
+def test_overtaking_friction_penalises_on_track_passes_and_preserves_contracts():
+    """Friction increases track-position stickiness, preserves double stochasticity, and is off when events=False."""
+    race = synthetic_race(total=20, offsets=OFFSETS)
+    cut = truncate_at_lap(race, 10)
+    prior = Prior([f"D{i + 1}" for i in range(6)], np.array([0.0, -0.7, 0.2, 0.4, 0.6, 0.8]), np.eye(6) * 0.005)
+    ev = EventModel(sc_hazard=0.0, vsc_hazard=0.0, red_hazard=0.0, dnf_hazard=0.0,
+                    pass_difficulty_by_location={"Testville": 2.5})
+    r_free = forecast(cut, prior, 20, level1=LEVEL1, phi=0.4, sigma_eps=0.3, tyres=TyreModel(), events=ev,
+                      config=ForecastConfig(scenarios=2000, events=True, noise_scale=1.0, pass_cost_seconds=0.0),
+                      rng=np.random.default_rng(11))
+    r_fric = forecast(cut, prior, 20, level1=LEVEL1, phi=0.4, sigma_eps=0.3, tyres=TyreModel(), events=ev,
+                      config=ForecastConfig(scenarios=2000, events=True, noise_scale=1.0, pass_cost_seconds=3.0),
+                      rng=np.random.default_rng(11))
+    assert np.allclose(r_fric.matrix.sum(axis=1), 1.0) and np.allclose(r_fric.matrix.sum(axis=0), 1.0)
+    assert r_fric.matrix[0, 0] > r_free.matrix[0, 0]
+    r_core0 = forecast(cut, prior, 20, level1=LEVEL1, phi=0.4, sigma_eps=0.3, tyres=TyreModel(), events=ev,
+                       config=ForecastConfig(scenarios=1000, events=False, noise_scale=1.0, pass_cost_seconds=0.0),
+                       rng=np.random.default_rng(11))
+    r_core3 = forecast(cut, prior, 20, level1=LEVEL1, phi=0.4, sigma_eps=0.3, tyres=TyreModel(), events=ev,
+                       config=ForecastConfig(scenarios=1000, events=False, noise_scale=1.0, pass_cost_seconds=3.0),
+                       rng=np.random.default_rng(11))
+    assert np.allclose(r_core0.matrix, r_core3.matrix)
+
+
+def test_plan_stops_wet_waives_stops_and_dry_two_stop():
+    tyres = TyreModel(
+        offset={"HARD": 0.0, "MEDIUM": -0.1, "SOFT": -0.2},
+        slope={"HARD": 0.08, "MEDIUM": 0.09, "SOFT": 0.11},
+    )
+    dry_car = CarState(1, "D1", "A", laps_done=10, banked=0.0, retired=False,
+                       compound="MEDIUM", tyre_age=10, used=["MEDIUM"], stops=1)
+    inter_car = CarState(2, "D2", "A", laps_done=10, banked=-1.0, retired=False,
+                         compound="INTERMEDIATE", tyre_age=10, used=[], stops=0)
+    wet_plan = plan_stops([dry_car, inter_car], total_laps=66, tyres=tyres, pit_loss=22.0, sec=0.85, wet=True)
+    assert not wet_plan["owed"].any() and not wet_plan["stops"].any() and not np.isfinite(wet_plan["stop_lap"]).any()
+
+    long_dry = CarState(3, "D3", "B", laps_done=6, banked=0.0, retired=False,
+                        compound="MEDIUM", tyre_age=6, used=["MEDIUM"], stops=0)
+    plan2 = plan_stops([long_dry], total_laps=66, tyres=tyres, pit_loss=21.0, sec=0.90, wet=False)
+    assert plan2["owed"][0] and plan2["stops"][0] and plan2["stops2"][0]
+    assert 6 < plan2["stop_lap"][0] < plan2["stop_lap2"][0] < 66
+
+
+def test_wet_noise_multiplier_fitted_from_training_races():
+    from f1_race_intelligence.race_model.events import fit_events
+
+    dry = synthetic_race(total=20, seed=1, session_key=8001)
+    wet = synthetic_race(total=20, seed=2, session_key=8002)
+    for stint in wet.stints:
+        stint["compound"] = "INTERMEDIATE"
+    rng = np.random.default_rng(123)
+    wet.laps["lap_duration"] = wet.laps["lap_duration"] * (1.0 + rng.normal(0.0, 0.015, len(wet.laps)))
+    fitted = fit_events([dry, wet], TyreModel())
+    assert 1.0 < fitted.wet_noise_multiplier <= 3.0
+    assert EventModel.from_dict({"pit_loss": 21.0}).wet_noise_multiplier == 1.0
 
 
 # -- level 1 / level 2 ---------------------------------------------------------------------------

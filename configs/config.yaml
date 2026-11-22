@@ -249,6 +249,10 @@ race_model:
   noise_scales: [1.0, 1.5, 2.0, 3.0]
   # One multiplier per k-bucket (experiment 1 in docs/m7-experiments.md).
   noise_scale_per_phase: true
+  # Overtaking friction candidates (s/place × circuit difficulty), chosen on training races.
+  pass_costs: [0.0, 1.0, 1.5, 2.0, 2.5, 3.0]
+  # Phase-wise convex shrinkage toward the training transition baseline.
+  transition_shrinkage: true
   calibration_races: 16
   random_seed: 42
 
