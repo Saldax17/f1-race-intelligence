@@ -84,7 +84,10 @@ def handler(event: Optional[Mapping[str, Any]], context: Any = None) -> Dict[str
         )
         if runner.output_store.backend.exists(key):
             return {"status": "up_to_date", "session_key": session["session_key"], "lap": lap}
-        result = runner.forecast(int(session["session_key"]), lap=lap, source="live")
+        live_kwargs: Dict[str, Any] = {"lap": lap, "source": "live"}
+        if event.get("model_version") is not None:
+            live_kwargs["version"] = event["model_version"]
+        result = runner.forecast(int(session["session_key"]), **live_kwargs)
     else:
         if "session_key" not in event:
             raise ValueError("event needs 'session_key' (and optionally 'lap', 'source') or 'mode': 'live'")

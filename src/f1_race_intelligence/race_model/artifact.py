@@ -27,8 +27,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
 from f1_race_intelligence.race_model.contracts import (
+    MANIFEST_FILENAME,
+    MODEL_FILENAME,
+    PUBLISHED_MARKER,
+    ModelPackageIntegrityError,
+    canonical_json_bytes,
+    publish_version_package,
     verify_version_package,
-    write_version_manifest,
 )
 from f1_race_intelligence.storage.backends.base import join_key
 from f1_race_intelligence.storage.layout import Layer
@@ -103,18 +108,36 @@ class ModelRegistry:
         return join_key(self.prefix, f"version={version}")
 
     def version_key(self, version: str) -> str:
-        return join_key(self.version_prefix(version), "model.json")
+        return join_key(self.version_prefix(version), MODEL_FILENAME)
 
     @property
     def latest_key(self) -> str:
         return join_key(self.prefix, "latest.json")
 
+    def _version_has_any_object(self, version: str) -> bool:
+        prefix = self.version_prefix(version)
+        backend = self.store.backend
+        return (
+            backend.exists(self.version_key(version))
+            or backend.exists(join_key(prefix, MANIFEST_FILENAME))
+            or backend.exists(join_key(prefix, PUBLISHED_MARKER))
+            or bool(backend.list(prefix))
+        )
+
+    def _require_verified(self, version: str) -> Dict[str, Any]:
+        if not self._version_has_any_object(version):
+            raise LookupError(f"model version {version} does not exist")
+        verification = self.verify(version)
+        if not verification["ok"]:
+            raise ModelPackageIntegrityError(
+                f"model version {version} failed package integrity verification: "
+                f"{'; '.join(verification['errors'])}"
+            )
+        return verification
+
     def save(self, artifact: ModelArtifact) -> str:
-        key = self.version_key(artifact.version)
-        data = json.dumps(artifact.to_dict(), separators=(",", ":"), default=float).encode("utf-8")
-        if not self.store.backend.write_bytes_if_absent(key, data, content_type="application/json"):
-            raise FileExistsError(f"model version {artifact.version} already exists at {self.store.backend.uri(key)}")
-        write_version_manifest(
+        data = canonical_json_bytes(artifact.to_dict())
+        published = publish_version_package(
             self.store.backend,
             self.version_prefix(artifact.version),
             version=artifact.version,
@@ -124,12 +147,13 @@ class ModelRegistry:
             provenance=artifact.provenance,
             parent_version=artifact.parent_version,
         )
-        return self.store.backend.uri(key)
+        return published["model_uri"]
 
     def read_model_bytes(self, version: Optional[str] = None) -> bytes:
         version = version or self.latest_version()
         if version is None:
             raise LookupError(f"no promoted model at {self.store.backend.uri(self.latest_key)}; run m7-train and m7-evaluate --promote")
+        self._require_verified(version)
         return self.store.backend.read_bytes(self.version_key(version))
 
     def verify(self, version: Optional[str] = None) -> Dict[str, Any]:
@@ -152,6 +176,7 @@ class ModelRegistry:
         version = version or self.latest_version()
         if version is None:
             raise LookupError(f"no promoted model at {self.store.backend.uri(self.latest_key)}; run m7-train and m7-evaluate --promote")
+        self._require_verified(version)
         return ModelArtifact.from_dict(json.loads(self.store.backend.read_bytes(self.version_key(version))))
 
     def latest_version(self) -> Optional[str]:
@@ -160,15 +185,20 @@ class ModelRegistry:
         return json.loads(self.store.backend.read_bytes(self.latest_key)).get("version")
 
     def promote(self, version: str, reason: Mapping[str, Any]) -> str:
-        if not self.store.backend.exists(self.version_key(version)):
-            raise LookupError(f"model version {version} does not exist")
-        pointer = {"version": version, "promoted_at": datetime.now(timezone.utc).isoformat(), **reason}
+        verification = self._require_verified(version)
+        pointer = {
+            "version": version,
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "manifest_sha256": verification["manifest_sha256"],
+            **reason,
+        }
         return self.store.backend.write_json(self.latest_key, pointer)
 
     def versions(self) -> List[str]:
+        """Published model versions (requires ``PUBLISHED`` marker so partial saves stay invisible)."""
         out = []
         for key in self.store.backend.list(self.prefix):
-            for part in key.split("/"):
-                if part.startswith("version="):
-                    out.append(part[len("version="):])
+            parts = key.split("/")
+            if len(parts) >= 2 and parts[-1] == PUBLISHED_MARKER and parts[-2].startswith("version="):
+                out.append(parts[-2][len("version="):])
         return sorted(set(out))

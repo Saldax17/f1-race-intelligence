@@ -1,9 +1,9 @@
 # M7 — Hoja de Comparación de Modelos: Modelo 1 (`race_model`) vs Ganador del Modelo 2 (`mlp_deeper_reg`)
 
-## 1. Resumen ejecutivo
+## 1. Resumen ejecutivo y alcance metodológico
 
-Esta hoja compara de manera directa y trazable los dos modelos desarrollados bajo la
-especificación unificada de la etapa **M7** sobre datos reales de OpenF1 (temporadas
+Esta hoja compara conceptual y operacionalmente los dos modelos desarrollados bajo la
+especificación unificada de la etapa **M7** sobre el histórico de OpenF1 (temporadas
 **2023–2025**):
 
 - **Modelo 1 — Tradicional (`race_model`):** espacio de estados jerárquico
@@ -12,22 +12,38 @@ especificación unificada de la etapa **M7** sobre datos reales de OpenF1 (tempo
   plan analítico de 2 paradas / régimen de lluvia y contracción convexa LOO por fase) +
   simulación Monte Carlo vectorizada ($S = 4{,}000$).
   Especificación: [M07_RACE_MODEL.md](M07_RACE_MODEL.md).
-  Artefacto integrado verificado y promovido: versión `20261122T205928432773Z`
-  (integración combinada A + B + C(`8b+8c`): **`0.0708` RPS**, `verify-m7: OK`, promovida a
-  `latest.json` y registrada en MLflow como `models:/f1-race-position-model/2`).
 - **Ganador del Modelo 2 — Deep Learning (`mlp_deeper_reg`, rama `Sajimenezgo/DL`):**
   perceptrón multicapa tabular PyTorch CPU-only (`[128, 64, 32]`, 26 881 parámetros,
   dropout `0.20`, weight decay `5e-4`, pérdida Huber, `ReduceLROnPlateau` y *early stopping*),
-  seleccionado estrictamente por `validation.mlp.mae` en `m7-compare` (`cmp-5089b42f`) frente
-  a `mlp_default`, `mlp_small`, `mlp_mse`, `LinearRegression` (M7.1) y `DummyRegressor`.
-  Registrado en MLflow como `models:/f1-next-lap-mlp/1` (junto al baseline lineal
-  `models:/f1-next-lap-linear-regression/1`).
+  seleccionado en su barrido controlado estrictamente por `validation.mlp.mae` frente a
+  `mlp_default`, `mlp_small`, `mlp_mse`, `LinearRegression` (M7.1) y `DummyRegressor`.
 
-Ambos modelos cumplen hoy el **mismo contrato de ingeniería M7** (procedencia verificable,
-`input_fingerprint`, empaquetado inmutable con `manifest.json` + marcador `PUBLISHED` SHA-256,
-diagnóstico de generalización en 4 estados estrictamente sobre `train`/`validation`,
-interpretabilidad estructurada, reporte académico en Markdown de 5 secciones, registro en el
-mismo MLflow SQLite local y validación estricta de contratos de serving).
+> **Principio de comparación (sin ganador global entre familias):** Modelo 1 (`race_model`)
+> y Modelo 2 (`mlp_deeper_reg`) resuelven **problemas y horizontes distintos** con **métricas
+> no conmensurables** (distribución probabilística de posición final de carrera completa medida
+> con **RPS / Pairwise LL / Brier** frente a predicción escalar de tiempo de la siguiente vuelta
+> medida con **MAE / RMSE / MAPE / $R^2$**). Por rigor metodológico, **no se declara un ganador
+> global** comparando RPS contra MAE/RMSE; ambos modelos son complementarios.
+
+Ambos modelos comparten el **mismo contrato de ingeniería M7** (procedencia verificable,
+`input_fingerprint` determinista sobre datos de entrenamiento, empaquetado inmutable con
+`model.json` canónico + `manifest.json` + marcador `PUBLISHED` SHA-256 verificado antes de
+cargar o promover, diagnóstico de generalización en 4 estados estrictamente sobre
+`train`/`validation`, interpretabilidad estructurada, reporte académico en Markdown de 5
+secciones, registro opcional/perezoso en MLflow con wrapper Pyfunc predictivo efectivo y
+validación estricta de contratos de serving).
+
+### Clasificación explícita de la evidencia (verificada vs reportada)
+
+Dado que los datos raw de OpenF1 (`data/raw/`), los artefactos de modelos (`data/models/`,
+`data/modeling/`) y la base local de MLflow (`data/mlflow/`) están excluidos del repositorio
+mediante [`.gitignore`](.gitignore), este documento distingue explícitamente entre:
+
+| Categoría de evidencia | Alcance | Verificable desde un clon limpio del repositorio |
+|---|---|---|
+| **A. Evidencia verificada en este commit** | Contratos de procedencia y `input_fingerprint` `v2` (todas las observaciones de `train`), publicación atómica/idempotente y verificación SHA-256 en `load()`/`promote()`, paridad exacta MLflow Pyfunc vs `RaceModelRunner.forecast`, aislamiento estricto de importaciones de MLflow, guardas anti-leakage / test sellado y contratos de serving | **Sí** — reproducible en CI o local con `python -m pytest` (Sección 5) |
+| **B. Resultados reportados — Modelo 1 (`race_model`, datos reales 2023–2025)** | Métricas de validación real (12 carreras 2025 hasta Spa) de la integración A + B + C(`8b+8c`) ejecutada localmente contra el histórico OpenF1 2023–2025 | **Solo al aportar el histórico raw 2023–2025** y re-ejecutar el protocolo de la Sección 5; los hashes `v1` históricos citados abajo corresponden a la corrida local previa y no se verifican desde git |
+| **C. Resultados reportados — Modelo 2 (`mlp_deeper_reg`, rama `Sajimenezgo/DL`)** | Métricas del barrido `cmp-5089b42f` sobre los artefactos M6 locales de la rama DL | **Solo en la rama `Sajimenezgo/DL` con el dataset M4–M6 local**; se citan como referencia reportada |
 
 ## 2. Comparación de especificación, contratos y arquitectura
 
@@ -40,20 +56,31 @@ mismo MLflow SQLite local y validación estricta de contratos de serving).
 | **Splits y disciplina anti-snooping** | Fechas fijas: 46 train (2023–24), 12 val (2025 hasta Spa), **11 test (Budapest–Abu Dabi) selladas** (`test_sealed: true`, ledger de un solo uso) | Split cronológico M6: 54 407 train (2023–24), 13 449 val (2025 H1), 14 306 test (2025 H2, evaluado post-hoc; selección solo en val) |
 | **Métrica principal** | RPS medio por piloto en pista (más log-loss por pares y Brier win/podium/points/DNF) | MAE y RMSE en segundos (más MAPE y $R^2$) |
 | **Baselines** | `persist` (orden actual + parada pendiente) y `transition` (matriz empírica por fase) | `DummyRegressor(strategy="mean")` y `LinearRegression` (M7.1) |
-| **Diagnóstico de generalización** | `balanced` (ratio RMSE prior val/train `0.99×`, calibración $z^2 = 0.98$, supera `persist`) | `balanced` (ratio MAE val/train `0.72×`, supera `DummyRegressor` por `−8.28 s`; *early stopped* en época 11/100, `best_epoch = 1`) |
+| **Diagnóstico de generalización** | `balanced` (reportado en val real: ratio RMSE prior val/train `0.99×`, $z^2 = 0.98$, supera `persist`) | `balanced` (reportado en rama DL: ratio MAE val/train `0.72×`, supera `DummyRegressor` por `−8.28 s`; *early stopped* época 11/100, `best_epoch = 1`) |
 | **Interpretabilidad** | **Estructural intrínseca** (`train`): $\phi$, $\sigma_\varepsilon$, pendientes de compuestos, descomposición de varianza Kalman, tasas de SC/retiro | **Post-hoc por permutación (PFI)** sobre `validation` (`n_rows=13 449`, 5 repeticiones) |
-| **Integridad e inmutabilidad** | `version=<v>/{model.json, manifest.json, PUBLISHED}` + CLI `--stage verify-m7` | `published-models/.../{manifest.json, PUBLISHED}` + `--stage verify-m6` (8 artefactos SHA-256) |
-| **Registro MLflow** | `models:/f1-race-position-model/2` (opcional/perezoso vía `--log-mlflow`, mismo SQLite) | `models:/f1-next-lap-mlp/1` (junto a `models:/f1-next-lap-linear-regression/1`) |
-| **Tiempo local extremo a extremo** | **~103 s** directos desde raw (86 s train + 17 s evaluación) | **~20 min** M4–M6 (18,5 min consolidación `car_data`) + ~35 s por configuración MLP |
+| **Integridad e inmutabilidad** | `version=<v>/{model.json, manifest.json, PUBLISHED}` (JSON canónico, publicación atómica/idempotente, verificación SHA-256 obligatoria en `load()` y `promote()`, CLI `--stage verify-m7`) | `published-models/.../{manifest.json, PUBLISHED}` + `--stage verify-m6` (8 artefactos SHA-256) |
+| **Registro MLflow** | Opcional y estrictamente perezoso (`--log-mlflow`, módulo dedicado `race_model/mlflow_pyfunc.py`, `predict()` ejecuta pronóstico real con paridad contra `RaceModelRunner.forecast`) | `models:/f1-next-lap-mlp/1` (junto a `models:/f1-next-lap-linear-regression/1`) |
+| **Tiempo local extremo a extremo** | **~103 s** directos desde raw (reportado: 86 s train + 17 s evaluación) | **~20 min** M4–M6 (reportado: 18,5 min consolidación `car_data`) + ~35 s por configuración MLP |
 | **Dependencias y preparación AWS** | Solo `runtime-lock.txt` (`scipy`); **ECS Fargate + Step Functions + Lambda (`Dockerfile.forecast`) ya definidos en SAM** | Requiere extras `training` (MLflow) + `dl` (`torch==2.12.1+cpu`); prototipo local FastAPI M8 y MLflow SQLite |
 
-## 3. Resultados medidos sobre datos reales (2023–2025)
+## 3. Resultados reportados sobre ejecuciones locales reales (2023–2025)
 
-### 3.1 Modelo 1 — `race_model` (validación: 12 carreras reales 2025 hasta Spa; `test` sellado)
+> **Nota de trazabilidad:** Todas las métricas de esta sección son **resultados reportados** de
+> ejecuciones locales sobre datos reales OpenF1 2023–2025 no versionados en git. Los artefactos
+> locales no residen en el repositorio; para regenerar y verificar métricas y hashes actuales
+> bajo `m7-race-model-input-fingerprint/v2` y `model.json` canónico, ejecute el protocolo de la
+> Sección 5.
 
-- **Procedencia:** `version = 20261122T205928432773Z` (integración final A + B + C(`8b+8c`), `manifest_sha256 = 93b9edeb723cc94c62091cc194d8e95a74f88981f678c17d25dc34b415a11a43`),
-  `input_fingerprint = sha256:f6230d8e0425c63d5bc25b092769fef506598f1dfbd3ae3cf7bd8a0490ecf4be`, `verify-m7: OK`, MLflow `models:/f1-race-position-model/2` (`run_id = bc507f6458dd44f1b27569d2a4374f3d`).
-- **Prior pre-carrera (`prior_check`):** `train` ($n = 754$) RMSE `0.4165`, $z^2 = 1.074$;
+### 3.1 Modelo 1 — `race_model` (resultados reportados en validación real: 12 carreras 2025 hasta Spa; `test` sellado)
+
+- **Referencia histórica de la corrida local reportada (previa al endurecimiento de contratos):**
+  versión local `20261122T205928432773Z` ejecutada sobre commit `0e39b0b` (`source_dirty: true`)
+  con esquema de huella anterior `m7-race-model-input-fingerprint/v1`. Sus hashes locales
+  (`input_fingerprint` `v1` y `manifest_sha256`) **no se versionan en git** y quedan
+  reemplazados al re-ejecutar con `m7-race-model-input-fingerprint/v2` y `model.json` canónico.
+  Las ecuaciones del modelo y el conjunto de hiperparámetros no se modificaron al endurecer los
+  contratos.
+- **Prior pre-carrera reportado (`prior_check`):** `train` ($n = 754$) RMSE `0.4165`, $z^2 = 1.074$;
   `validation` ($n = 171$) RMSE `0.4131`, $z^2 = 0.981$.
 
 | Fase (*k*) | `race_model` RPS (Antes) | `race_model` RPS (Track B) | `race_model` RPS (Final Combinado) | `persist` RPS | `transition` RPS | `race_model` Pairwise LL (Final) | `transition` Pairwise LL | Δ vs `persist` [IC 95%] (Final) | Δ vs `transition` [IC 95%] (Final) |
@@ -65,17 +92,16 @@ mismo MLflow SQLite local y validación estricta de contratos de serving).
 | 90% | 0.0461 | 0.0369 | **0.0358** | 0.0462 | 0.0432 | **0.1760** | 0.2830 | −0.0105 [−0.0181, −0.0033] | **−0.0074 [−0.0114, −0.0044]** |
 | **Global (`all`)** | 0.0796 | 0.0730 | **0.0708** | **0.1160** | **0.0819** | **0.3307** | **0.4308** | **−0.0452 [−0.0580, −0.0315]** | **−0.0112 [−0.0161, −0.0059]** |
 
-- **Calibración de eventos (Brier en validación, modelo integrado final):** `win = 0.0212` (antes `0.0272`), `podium = 0.0368` (antes `0.0464`), `points = 0.1025` (antes `0.1131`), `dnf = 0.0391` (`pronóstico medio 0.047 vs observado 0.041`).
-- **Interpretabilidad estructural (Nivel 1, Nivel 2 y Eventos en `train`):**
+- **Calibración de eventos reportada (Brier en validación, modelo integrado final):** `win = 0.0212` (antes `0.0272`), `podium = 0.0368` (antes `0.0464`), `points = 0.1025` (antes `0.1131`), `dnf = 0.0391` (`pronóstico medio 0.047 vs observado 0.041`).
+- **Interpretabilidad estructural reportada (Nivel 1, Nivel 2 y Eventos en `train`):**
   - Nivel 1: $\phi = 0.4145$, $\sigma_\varepsilon = 0.4134\%$ (multiplicador AR(1) de largo plazo `1.554×`); degradación por compuesto: `MEDIUM` `0.0662%/vuelta`, `SOFT` `0.0603%/vuelta` (offset `−0.1419%`), `HARD` `0.0573%/vuelta`.
   - Descomposición de varianza Nivel 2: ajuste equipo × circuito (`s_c`) **50.3%**, ruido transitorio del día de carrera (`s_w`) **44.5%**, evolución del equipo en temporada (`q_gamma`) **5.0%**, evolución de piloto (`q_delta`) **0.2%**. Peso de clasificación $\lambda = 0.9727$ ($\sigma_q = 0.8775\%$).
   - Fricción, lluvia y contracción LOO: tasa global de adelantamiento en línea de meta `12.76%` (`8 529` ataques, `1 088` pases, $\kappa = 200$; dificultad `2.827×` en Mónaco a `0.598×` en Barcelona), `pass_cost_seconds = 2.5 s`, `wet_noise_multiplier = 1.3915×`, plan analítico de 2 paradas, pesos de contracción LOO `w = {0.1: 0.140, 0.25: 0.219, 0.5: 0.305, 0.75: 0.096, 0.9: 0.363}`.
 
-### 3.2 Ganador del Modelo 2 — `mlp_deeper_reg` vs candidatos y baselines M7 (`cmp-5089b42f`)
+### 3.2 Ganador del Modelo 2 — `mlp_deeper_reg` vs candidatos y baselines M7 (resultados reportados de rama `Sajimenezgo/DL`)
 
-- **Procedencia M6:** `run_id = 327d9e73aa5042ac861733d89249253a`,
-  `input_fingerprint = sha256:4c0ab2515e5d6a58488884305d5c8ee5754c8ef675636d5c8cc3f23f239ddcf0`,
-  `verify-m6: OK` (8/8 artefactos SHA-256).
+- **Origen reportado:** barrido local `cmp-5089b42f` en la rama `Sajimenezgo/DL` sobre artefactos
+  locales M6 (no versionados en este PR; reproducibles ejecutando `m6` → `m7-compare` en dicha rama).
 
 | Modelo / Configuración | Train MAE (s) | Train RMSE (s) | Val MAE (s) | Val RMSE (s) | Val MAPE (%) | Val $R^2$ | Test MAE (s) | Test RMSE (s) | Test MAPE (%) | Test $R^2$ | Diagnóstico |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -86,7 +112,7 @@ mismo MLflow SQLite local y validación estricta de contratos de serving).
 | MLP: `mlp_small` (`[32]`, Huber) | 6.44 | 67.88 | 5.03 | 11.62 | — | 0.5480 | 6.19 | 45.32 | — | 0.1683 | `balanced` |
 | MLP: `mlp_mse` (`[64, 32]`, MSE) | 8.00 | 51.05 | 11.19 | 43.23 | — | −5.2569 | 9.05 | 63.49 | — | −0.6327 | `overfitting_risk` |
 
-- **Interpretabilidad (Top 6 PFI en `validation` para `mlp_deeper_reg`, incremento medio de MAE ± std):**
+- **Interpretabilidad reportada (Top 6 PFI en `validation` para `mlp_deeper_reg`, incremento medio de MAE ± std):**
   1. `duration_sector_3`: `+2.743 ± 0.014 s`
   2. `duration_sector_2`: `+2.039 ± 0.028 s`
   3. `lap_time_roll_min_3`: `+1.781 ± 0.023 s`
@@ -96,25 +122,66 @@ mismo MLflow SQLite local y validación estricta de contratos de serving).
 
 ## 4. Análisis crítico: fortalezas, brechas y complementariedad
 
-1. **Dos horizontes complementarios (no intercambiables):**
+1. **Dos horizontes complementarios (no intercambiables ni comparables en una sola métrica):**
    - `mlp_deeper_reg` sobresale en predicción táctica **vuelta a vuelta** (`t → t+1`): la pérdida Huber fue decisiva frente a MSE (`4.46 s` vs `11.19 s` en validación), reduciendo el MAE un **65%** respecto a `DummyRegressor` y un **75%** respecto a `LinearRegression`.
    - Sin embargo, `mlp_deeper_reg` **no puede simularse hasta la bandera a cuadros** (problema de simulabilidad: depende de sectores y telemetría de la vuelta *t* que no existen para vueltas futuras).
    - `race_model` resuelve la decisión estratégica de **carrera completa** produciendo distribuciones calibradas de posición final y eventos (`win`, `podium`, `points`, `DNF`), con manejo explícito de paradas en boxes, SC/VSC, banderas rojas y retiros.
+   - En consecuencia, **no existe un ganador global entre Modelo 1 y Modelo 2**: cada uno debe evaluarse contra sus propios baselines y métricas (`RPS / Pairwise LL / Brier` para `race_model`; `MAE / RMSE / MAPE / R²` para `mlp_deeper_reg`).
 2. **Sensibilidad a eventos extremos y telemetría:**
    - En `mlp_deeper_reg`, el RMSE salta de `8.87 s` en validación a `45.46 s` en test ($R^2$ cae de `0.7365` a `0.1630`) debido a picos de vueltas bajo bandera roja/SC en la segunda mitad de 2025, aunque Huber mantiene el MAE estable (`4.81 s`). Además, las 4 configuraciones MLP alcanzaron su mejor pérdida en `best_epoch = 1` (se sugiere evaluar menor tasa de aprendizaje inicial y filtrar Sprints fuera de M4–M6 en futuras iteraciones).
    - `race_model` no depende de `car_data` (~3.7 Hz, ausente en vivo en OpenF1 sin autenticación y responsable de ~18.5 min de consolidación local), entrena y evalúa en ~103 s, excluye Sprints y carreras incompletas (`2025 Miami Gardens`), y mantiene el conjunto `test` estrictamente sellado.
 3. **Cierre de brechas en `race_model` (Experimentos 6–9):**
    - En la referencia previa (`0.0796` RPS), los buckets tardíos (`75%`, `90%`) cedían ligeramente frente a `transition` por el supuesto de adelantamiento libre y el IC 95% frente a `transition` (`[−0.0095, +0.0049]`) cruzaba 0.
-   - Con la integración final de **fricción de adelantamiento en línea de meta (`owed-only`, Track B)**, **contracción convexa LOO por fase hacia `TransitionBaseline.predict_running` (Track A)**, **multiplicador de ruido en lluvia (`1.3915×`) y plan analítico de 2 paradas (Track C `8b+8c`, descartando `8a` por degradar 10%/25% al integrarse)**, `race_model` alcanza **`0.0708` RPS global** (`−0.0088` vs Exp 1b) y supera de forma **estadísticamente significativa** tanto a `persist` (`ΔRPS = −0.0452 [−0.0580, −0.0315]`) como a `transition` (`ΔRPS = −0.0112 [−0.0161, −0.0059]`), ganando a ambos baselines en **todos los buckets (10% a 90%, con IC 95% estrictamente < 0 en 4/5 buckets individuales)** y en **11/12 carreras de validación**, reduciendo el log-loss por pares de `0.3667` a **`0.3307`** y mejorando los Brier scores de `win` (`0.0272 → 0.0212`), `podium` (`0.0464 → 0.0368`) y `points` (`0.1131 → 0.1025`) sin usar `car_data` y manteniendo el conjunto `test` estrictamente sellado.
+   - Con la integración final de **fricción de adelantamiento en línea de meta (`owed-only`, Track B)**, **contracción convexa LOO por fase hacia `TransitionBaseline.predict_running` (Track A)**, **multiplicador de ruido en lluvia (`1.3915×`) y plan analítico de 2 paradas (Track C `8b+8c`, descartando `8a` por degradar 10%/25% al integrarse)**, `race_model` alcanza **`0.0708` RPS global** reportado (`−0.0088` vs Exp 1b) y supera de forma **estadísticamente significativa** tanto a `persist` (`ΔRPS = −0.0452 [−0.0580, −0.0315]`) como a `transition` (`ΔRPS = −0.0112 [−0.0161, −0.0059]`), ganando a ambos baselines en **todos los buckets (10% a 90%, con IC 95% estrictamente < 0 en 4/5 buckets individuales)** y en **11/12 carreras de validación**, sin usar `car_data` y manteniendo el conjunto `test` estrictamente sellado.
 
-## 5. Procedencia de datos y destino de carga en AWS S3
+## 5. Protocolo reproducible, verificación y destino de carga en AWS S3
 
-- **Ejecución local actual:** los resultados de la Sección 3 se obtuvieron localmente leyendo el histórico OpenF1 2023–2025 en disco local sin modificarlo.
+### 5.1 Verificación reproducible desde un clon limpio (sin datos raw externos)
+
+Cualquier revisor puede verificar los contratos de procedencia, integridad atómica,
+aislamiento anti-leakage, importaciones perezosas de MLflow, serving y paridad predictiva
+Pyfunc directamente sobre el código versionado:
+
+```bash
+# 1. Pruebas específicas de contratos, aislamiento, publicación, serving y paridad MLflow Pyfunc
+python -m pytest \
+  tests/unit/test_race_model_contracts.py \
+  tests/unit/test_race_model_isolation.py \
+  tests/unit/test_race_model.py \
+  tests/unit/test_race_model_lambda.py \
+  tests/unit/test_race_model_lines.py -v
+
+# 2. Verificación explícita de aislamiento de importación MLflow (aun con MLflow instalado)
+python -c "import sys, f1_race_intelligence.race_model.contracts, f1_race_intelligence.race_model.artifact, f1_race_intelligence.race_model.runner, f1_race_intelligence.race_model.lambda_handler; assert 'mlflow' not in sys.modules; print('OK: mlflow not imported eagerly')"
+
+# 3. Suite unitaria general no integrada
+python -m pytest -m "not integration"
+```
+
+### 5.2 Reproducción completa sobre datos reales OpenF1 (2023–2025)
+
+Al contar con el histórico raw 2023–2025 en disco local o en S3, los comandos siguientes
+regeneran los artefactos, el `input_fingerprint` bajo `m7-race-model-input-fingerprint/v2`,
+el `model.json` canónico, el `manifest.json` + `PUBLISHED`, los reportes (`evaluate_validation.json`
+y `evaluate_validation.md`) y el modelo predictivo MLflow Pyfunc:
+
+```bash
+# 1. Reproducir entrenamiento, evaluación en validación, promoción, verificación y registro MLflow local
+python -m f1_race_intelligence --stage m7-train,m7-evaluate,verify-m7 --promote --log-mlflow
+
+# 2. Verificar integridad de paquete sin modificar archivos (exit code 0 == OK)
+python -m f1_race_intelligence --stage verify-m7
+
+# 3. Pronóstico en carrera desde una vuelta k sobre un GP de validación
+python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key <session_key> --lap 30
+```
+
+### 5.3 Procedencia de datos y destino de carga en AWS S3
+
+- **Ejecución local actual:** los resultados reportados de la Sección 3 se obtuvieron localmente leyendo el histórico OpenF1 2023–2025 en disco local sin modificarlo.
 - **Bucket S3 destino para ejecución en la nube:** los datos del data lake se cargarán desde:
   - **`s3://f1-race-intelligence-dev-793264560810-us-east-1`** (`F1_ENVIRONMENT=aws`, `F1_STORAGE_BACKEND=s3`, `F1_STORAGE_LAYOUT=lake`).
 - **Estado actual del bucket:** **los datos todavía no están cargados en ese bucket.** Siguiendo el contrato de [configs/config.aws.yaml](configs/config.aws.yaml) y `tests/unit/test_settings_environments.py`, el nombre del bucket **no se fija en YAML ni se incluyen credenciales en el repositorio**; se inyecta únicamente por variable de entorno (`F1_STORAGE_BUCKET`) o flag CLI (`--bucket` / `--input-storage`).
-
-### Comandos preparados cuando el bucket esté poblado
 
 ```bash
 # 1. Subir el histórico raw local al bucket en layout lake (sin re-descargar de OpenF1)
@@ -135,6 +202,11 @@ python -m f1_race_intelligence --stage m7-train,m7-evaluate,verify-m7 --promote 
 
 ## 6. Honestidad académica y estado de cierre
 
+- **Diferenciación estricta de evidencia:** la Sección 5.1 documenta lo que se verifica
+  directamente desde este repositorio mediante pruebas automatizadas; la Sección 3 reporta
+  resultados locales obtenidos sobre datos reales 2023–2025 no versionados (y los del Modelo 2
+  en su rama `Sajimenezgo/DL`). Ningún hash local no versionado se presenta como verificable
+  desde git.
 - **Test sellado en Modelo 1 (`race_model`):** las 11 carreras de test (Budapest–Abu Dabi 2025) permanecen **sin abrir** (`test_sealed: true`, `test_ledger.json` vacío). Solo se evaluarán una vez para el cierre final mediante `m7-evaluate --split test --unseal-test`.
 - **Anti-snooping en Modelo 2 (`mlp_deeper_reg`):** el ganador se eligió estrictamente por `validation.mlp.mae`; las métricas de `test` de la tabla 3.2 corresponden a evaluación post-hoc del barrido controlado `cmp-5089b42f`.
 - **Estado AWS:** la carga de datos reales en `f1-race-intelligence-dev-793264560810-us-east-1` y el despliegue productivo de M7 en AWS continúan pendientes (ver [infra/aws_status.json](infra/aws_status.json)).

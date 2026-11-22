@@ -508,10 +508,21 @@ class RaceModelRunner:
                         continue
                     rps = score_forecast(result, race, model, bucket)["model"]["rps"]
                     by_bucket.setdefault(bucket, {}).setdefault(str(scale), []).append(rps)
-        overall = {str(s): float(np.nanmean([x for b in by_bucket.values() for x in b.get(str(s), [])])) for s in cfg.noise_scales}
+        overall = {}
+        for s in cfg.noise_scales:
+            vals = [x for b in by_bucket.values() for x in b.get(str(s), []) if np.isfinite(x)]
+            if vals:
+                overall[str(s)] = float(np.mean(vals))
+        if not overall:
+            return float(cfg.noise_scales[0]), {}
         best = float(min(overall, key=overall.get))
-        detail: Dict[str, Any] = {"overall": overall, "by_bucket": {
-            b: {s: float(np.nanmean(v)) for s, v in scores.items()} for b, scores in by_bucket.items()}}
+        detail: Dict[str, Any] = {
+            "overall": overall,
+            "by_bucket": {
+                b: {s: float(np.nanmean(v)) for s, v in scores.items() if np.isfinite(v).any()}
+                for b, scores in by_bucket.items()
+            },
+        }
         if cfg.noise_scale_per_phase:
             detail["chosen_by_fraction"] = {
                 str(fractions[b]): float(min(scores, key=scores.get)) for b, scores in detail["by_bucket"].items()}
@@ -806,7 +817,7 @@ class RaceModelRunner:
         )
         promoted = False
         if promote:
-            if summary.get(f"beats_{self.cfg.promote_requires_beating}"):
+            if verification.get("ok") and summary.get(f"beats_{self.cfg.promote_requires_beating}"):
                 promoted = True
         report: Dict[str, Any] = {
             "stage": "m7-evaluate",
@@ -832,6 +843,21 @@ class RaceModelRunner:
         )
         mlflow_info = None
         if log_mlflow:
+            example_race = None
+            example_lap = None
+            example_total = None
+            for race in races:
+                total = model.total_laps(race)
+                for _, k in k_laps(total, self.cfg.k_fractions):
+                    try:
+                        example_race = truncate_at_lap(race, k)
+                        example_lap = k
+                        example_total = total
+                        break
+                    except ValueError:
+                        continue
+                if example_race is not None:
+                    break
             mlflow_info = log_race_model_to_mlflow(
                 settings=self.settings,
                 artifact=artifact,
@@ -841,6 +867,9 @@ class RaceModelRunner:
                 promoted=promoted,
                 verification=verification,
                 register_model=(split == VALIDATION),
+                example_race=example_race,
+                example_lap=example_lap,
+                example_total_laps=example_total,
             )
             md_text = render_evaluation_markdown(
                 report=report,
@@ -930,8 +959,11 @@ class RaceModelRunner:
         k = int(lap or race.leader_laps())
         if k < 1:
             return StageResult(False, reason="the race has not completed a lap yet")
+        if total_laps is not None and k > int(total_laps):
+            return StageResult(False, reason=f"lap ({k}) cannot exceed total_laps ({int(total_laps)})")
         race_k = truncate_at_lap(race, k)
-        result = model.run(race_k, model.prior_for(race), model.total_laps(race, total_laps), seed=self.cfg.random_seed)
+        resolved_total = model.total_laps(race, total_laps)
+        result = model.run(race_k, model.prior_for(race), resolved_total, seed=self.cfg.random_seed)
         payload = result.to_dict()
         validate_forecast_response(payload)
         prefix = join_key(forecasts_prefix(self.output_store, self.cfg.output_path),

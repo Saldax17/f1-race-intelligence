@@ -130,11 +130,11 @@ class ForecastResult:
             rows.append(
                 {
                     **d,
-                    "p_position": [round(float(x), 5) for x in self.matrix[i]],
-                    "p_win": round(float(self.matrix[i, 0]), 5),
-                    "p_podium": round(float(self.matrix[i, :3].sum()), 5),
-                    "p_points": round(float(self.matrix[i, :10].sum()), 5),
-                    "p_dnf": round(float(self.p_dnf[i]), 5),
+                    "p_position": [round(float(x), 6) for x in self.matrix[i]],
+                    "p_win": round(float(self.matrix[i, 0]), 6),
+                    "p_podium": round(float(self.matrix[i, :3].sum()), 6),
+                    "p_points": round(float(self.matrix[i, :10].sum()), 6),
+                    "p_dnf": round(float(self.p_dnf[i]), 6),
                     "expected_position": round(float(exp_pos[i]), 3),
                     "expected_points": round(float(self.matrix[i] @ points), 3),
                     "pace_mean_pct": round(float(self.pace_mean[i]), 4),
@@ -151,6 +151,7 @@ class ForecastResult:
             "model_version": self.model_version,
             "generated_at": self.generated_at,
             "drivers": rows,
+            "matrix": [[round(float(x), 6) for x in row] for row in self.matrix],
             "ahead": [[round(float(x), 4) for x in row] for row in self.ahead],
         }
 

@@ -1273,7 +1273,7 @@ la especificación técnica concisa, en `docs/m7-model-spec.md`.
 | `events` | Riesgos de SC/VSC/roja y de abandono por vuelta (pooling por circuito), pérdida en boxes, momento de parada |
 | `forecast` | Posterior del ritmo con las vueltas 1..*k* y Monte Carlo vectorizado → matriz |
 | `scoring`, `baselines` | RPS, log-loss por pares, calibración; baselines "orden persiste + parada" y matriz de transición |
-| `contracts` | Procedencia y `input_fingerprint`, `manifest.json` + `PUBLISHED` (SHA-256), `generalization_diagnosis`, interpretabilidad estructural, reporte `.md`, validación de contrato de serving y MLflow perezoso |
+| `contracts`, `mlflow_pyfunc` | Procedencia e `input_fingerprint` `v2`, publicación atómica/idempotente (`model.json` canónico + `manifest.json` + `PUBLISHED` SHA-256), `generalization_diagnosis`, interpretabilidad estructural, reporte `.md`, contratos estrictos de serving y wrapper MLflow Pyfunc predictivo con carga perezosa |
 | `artifact`, `runner` | Versiones inmutables en `models/m7/`, puntero `latest.json`, etapas `m7-*` y `verify-m7` |
 | `lambda_handler` | Entrada de la Lambda de pronóstico (bajo demanda o en vivo) con validación de contrato |
 

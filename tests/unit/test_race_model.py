@@ -456,9 +456,14 @@ def test_registry_saves_promotes_and_refuses_overwrites(tmp_path):
     registry = ModelRegistry(DataStore.local(str(tmp_path)), "data/models/m7")
     artifact = ModelArtifact(version=new_version(), created_at="now", settings={}, level1={}, season={},
                              events={}, forecast={}, transition={}, races=[])
-    registry.save(artifact)
+    uri = registry.save(artifact)
+    # Identical retry is safe and idempotent.
+    assert registry.save(artifact) == uri
+    # Conflicting content under the same version is refused.
+    conflicting = ModelArtifact(version=artifact.version, created_at="later", settings={}, level1={}, season={},
+                                events={}, forecast={}, transition={}, races=[])
     with pytest.raises(FileExistsError):
-        registry.save(artifact)
+        registry.save(conflicting)
     assert registry.latest_version() is None
     registry.promote(artifact.version, {"reason": "test"})
     assert registry.latest_version() == artifact.version

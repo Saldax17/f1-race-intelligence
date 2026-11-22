@@ -440,3 +440,82 @@ def scheduled_laps(race: RaceData, known: Optional[Mapping[str, int]] = None) ->
 def finite(values: Iterable[float]) -> np.ndarray:
     array = np.asarray(list(values), dtype=float)
     return array[np.isfinite(array)]
+
+
+def race_to_forecast_payload(race: RaceData) -> Dict[str, Any]:
+    """Serialize a ``RaceData`` into a label-free JSON-safe snapshot for inference.
+
+    The official ``session_result`` is intentionally excluded so inference
+    payloads (including MLflow Pyfunc inputs) can never carry post-race labels.
+    """
+    laps_records: List[Dict[str, Any]] = []
+    if race.laps is not None and not race.laps.empty:
+        for row in race.laps.to_dict(orient="records"):
+            dur = row.get("lap_duration")
+            date_start = row.get("date_start")
+            if (date_start is None or pd.isna(date_start)) and row.get("t_start") is not None and not pd.isna(row.get("t_start")):
+                ts = pd.Timestamp(row["t_start"])
+                date_start = (ts.tz_convert("UTC") if ts.tzinfo is not None else ts).isoformat()
+            laps_records.append(
+                {
+                    "driver_number": int(row["driver_number"]),
+                    "lap_number": int(row["lap_number"]),
+                    "lap_duration": None if dur is None or pd.isna(dur) else float(dur),
+                    "date_start": None if date_start is None or pd.isna(date_start) else str(date_start),
+                    "is_pit_out_lap": bool(row.get("is_pit_out_lap", False)),
+                }
+            )
+
+    interval_records: List[Dict[str, Any]] = []
+    if race.intervals is not None and not race.intervals.empty:
+        for row in race.intervals.to_dict(orient="records"):
+            when = row.get("date")
+            if when is None or pd.isna(when):
+                continue
+            ts = pd.Timestamp(when)
+            when_iso = (ts.tz_convert("UTC") if ts.tzinfo is not None else ts).isoformat()
+            iv = row.get("interval")
+            gap = row.get("gap_to_leader")
+            interval_records.append(
+                {
+                    "date": when_iso,
+                    "driver_number": int(row["driver_number"]),
+                    "interval": None if iv is None or pd.isna(iv) else float(iv),
+                    "gap_to_leader": None if gap is None or pd.isna(gap) else float(gap),
+                }
+            )
+
+    return {
+        "ref": race.ref.to_dict(),
+        "drivers": [dict(d) for _, d in sorted(race.drivers.items(), key=lambda kv: int(kv[0]))],
+        "laps": laps_records,
+        "stints": [dict(s) for s in race.stints],
+        "pit": [dict(p) for p in race.pit],
+        "race_control": [dict(m) for m in race.race_control],
+        "intervals": interval_records,
+        "starting_grid": [dict(g) for g in race.grid],
+    }
+
+
+def race_from_forecast_payload(payload: Mapping[str, Any]) -> RaceData:
+    """Reconstruct a label-free ``RaceData`` from a serialized forecast payload."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("race forecast payload must be a JSON object")
+    ref_raw = payload.get("ref")
+    if not isinstance(ref_raw, Mapping):
+        raise ValueError("race forecast payload requires a 'ref' object")
+    for required_ref in ("year", "meeting_key", "session_key", "location", "date_start"):
+        if required_ref not in ref_raw:
+            raise ValueError(f"race forecast payload 'ref' missing required field {required_ref!r}")
+    ref = RaceRef.from_dict(ref_raw)
+    records: Dict[str, List[Any]] = {}
+    for endpoint in ("drivers", "laps", "stints", "pit", "race_control", "intervals", "starting_grid"):
+        raw_list = payload.get(endpoint, [])
+        if raw_list is None:
+            raw_list = []
+        if not isinstance(raw_list, list):
+            raise ValueError(f"race forecast payload field {endpoint!r} must be a list")
+        records[endpoint] = raw_list
+    # Never accept or propagate session_result labels through inference payloads.
+    records["session_result"] = []
+    return build_race(ref, records)

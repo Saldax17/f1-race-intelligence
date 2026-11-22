@@ -172,26 +172,32 @@ calibración/contracción LOO, fricción de adelantamiento sin telemetría contr
 paradas obligatorias y régimen de lluvia / 2 paradas) está registrado en
 [docs/m7-experiments.md](docs/m7-experiments.md).
 
-### Resultados medidos sobre datos reales de OpenF1 (validación: 12 carreras de 2025 hasta Spa)
+### Resultados reportados sobre datos reales de OpenF1 (validación: 12 carreras de 2025 hasta Spa)
+
+> **Nota de trazabilidad:** las métricas de esta subsección son **resultados reportados** de
+> ejecuciones locales sobre el histórico real OpenF1 2023–2025 (excluido de git vía
+> `.gitignore`). Los artefactos de esa corrida local previa (`20261122T205928432773Z`, commit
+> `0e39b0b`, `source_dirty: true`, esquema de fingerprint anterior `v1`) no residen en el
+> repositorio; para regenerar y verificar métricas y hashes actuales bajo
+> `m7-race-model-input-fingerprint/v2` y `model.json` canónico, ejecute el protocolo de la
+> sección «Instalación y comandos de ejecución».
 
 Entrenado sobre las 46 carreras reales de 2023–2024 y evaluado sobre las 12 carreras reales
 de validación de la primera mitad de 2025 (con `2025 Miami Gardens` excluida por vueltas
 2–25 ausentes en origen y el conjunto `test` de 11 carreras **sellado**):
 
-- **Parámetros estructurales ajustados en `train`:** $\phi = 0.4145$,
+- **Parámetros estructurales ajustados en `train` (reportados):** $\phi = 0.4145$,
   $\sigma_\varepsilon = 0.4134\%$, $q_\gamma = 0.0736$, $q_{\gamma,\text{season}} = 0.2080$,
   $q_\delta = 0.0162$, $s_c = 0.2336$, $s_w = 0.2196$, $\sigma_q = 0.8775$, $\lambda = 0.9727$,
   tasa de adelantamiento en línea de meta `pass_rate = 0.1276` ($\kappa = 200$, Mónaco `2.827×`
   .. Barcelona `0.598×`), `pass_cost_seconds = 2.5 s`, `wet_noise_multiplier = 1.3915×`,
   multiplicadores de ruido por fase `{0.1: 1.0, 0.25: 2.0, 0.5: 3.0, 0.75: 3.0, 0.9: 3.0}` y
   pesos de contracción convexa LOO `{0.1: 0.1401, 0.25: 0.2194, 0.5: 0.3052, 0.75: 0.0958, 0.9: 0.3626}`.
-- **Prior pre-carrera (`prior_check`):** `train` ($n = 754$) RMSE `0.4165`, $z^2 = 1.074$;
+- **Prior pre-carrera (`prior_check`, reportado):** `train` ($n = 754$) RMSE `0.4165`, $z^2 = 1.074$;
   `validation` ($n = 171$) RMSE `0.4131`, $z^2 = 0.981$ (relación val/train `0.99×`, calibración
   cercana a 1.0).
-- **Diagnóstico de generalización y registro:** `balanced`, versión promovida a `latest.json`
-  `20261122T205928432773Z` (`manifest_sha256 = 93b9edeb723cc94c62091cc194d8e95a74f88981f678c17d25dc34b415a11a43`,
-  `verify-m7: OK`), registrada en MLflow como `models:/f1-race-position-model/2`
-  (`run_id = bc507f6458dd44f1b27569d2a4374f3d`).
+- **Diagnóstico de generalización (reportado):** `balanced` (`val/train prior RMSE = 0.99×`,
+  `val z² = 0.98`, supera a `persist` y `transition`).
 
 #### Evolución por track e integración final (Experimento 1b → 6c, 7b, 8d → 9a–9d)
 
@@ -253,48 +259,64 @@ de validación de la primera mitad de 2025 (con `2025 Miami Gardens` excluida po
 
 ### Empaquetado inmutable y verificación SHA-256
 
-Al guardar cada versión inmutable mediante `ModelRegistry.save`, el modelo escribe con
-creación condicional (`write_bytes_if_absent`) la misma estructura de contrato verificable
-que [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md):
+Al guardar cada versión inmutable mediante `ModelRegistry.save`, el modelo serializa tanto
+`model.json` como `manifest.json` en **JSON canónico UTF-8** (claves ordenadas, sin espacios
+superfluos, sin `NaN`) y publica mediante `publish_version_package` con escritura condicional
+(`write_bytes_if_absent`), verificación previa al commit y marcador `PUBLISHED` escrito al
+final, en paridad con [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md):
 
 ```text
 data/models/m7/version=<versión>/          (o models/m7/version=<versión>/ en layout lake)
-├── model.json                             artefacto completo (parámetros, estado, priors, procedencia)
+├── model.json                             artefacto completo en JSON canónico UTF-8
 ├── manifest.json                          JSON canónico UTF-8 con SHA-256 y tamaño de cada archivo
 └── PUBLISHED                              sha256:<hash de manifest.json> (escrito al final)
 ```
 
-`--stage verify-m7` (homólogo de `--stage verify-m6`) valida sin modificar archivos que
-exista el marcador `PUBLISHED`, que coincida con el SHA-256 de `manifest.json` y que
-`model.json` coincida byte a byte con su hash y tamaño declarados.
+- **Atomicidad y reintentos idempotentes:** un fallo parcial antes de escribir `PUBLISHED`
+  deja la versión invisible para `versions()`, bloqueada para `load()` y `promote()`, y
+  recuperable al reintentar `save()` con el mismo artefacto. Un reintento idéntico tras la
+  publicación retorna la URI verificada; cualquier intento de sobrescribir una versión con
+  contenido distinto falla con `FileExistsError`.
+- **Verificación obligatoria antes de usar o promover:** tanto `ModelRegistry.load()` como
+  `ModelRegistry.promote()` y `ModelRegistry.read_model_bytes()` ejecutan verificación completa
+  de `PUBLISHED`, `manifest.json` canónico, conjunto exacto de objetos (sin archivos extra) y
+  SHA-256/tamaño de `model.json`, rechazando paquetes incompletos o manipulados con
+  `ModelPackageIntegrityError`.
+- **`--stage verify-m7`:** homólogo de `--stage verify-m6` para verificación de solo lectura.
 
-### Reportes generados y MLflow opcional
+### Reportes generados y MLflow opcional (perezoso y predictivo)
 
 - **Reportes en almacenamiento:** cada `m7-evaluate` genera tanto el respaldo estructurado
-  `evaluate_<split>.json` (con `provenance`, `generalization_diagnosis`, `interpretability`,
+  `evaluate_<split>.json` (con `provenance` e `input_fingerprint` `v2` sobre todas las
+  observaciones de `train`, `generalization_diagnosis`, `interpretability`,
   `package_verification` y métricas) como el informe académico consolidado
   `evaluate_<split>.md` en 5 secciones paralelas a `mlp_comparison_<id>.md`.
 - **MLflow local opcional (`--log-mlflow`):** cuando está instalado el extra `training`,
-  registra la corrida en la misma base SQLite (`data/mlflow/tracking.db`) y experimento
-  (`f1-race-intelligence`) que `LinearRegression` y `TabularMLP`, adjuntando
-  `data_provenance.json`, `training_config.json`, `metrics.json`, `evaluate_<split>.json`,
-  `evaluate_<split>.md`, `interpretability.json`, `package_verification.json` y un wrapper
-  `mlflow.pyfunc` (`RaceModelPyfuncModel`) registrado bajo `models:/f1-race-position-model/<v>`.
+  `log_race_model_to_mlflow` importa perezosamente `mlflow` y el módulo dedicado
+  `race_model/mlflow_pyfunc.py` (`RaceModelPyfuncModel`), sin cargar MLflow al importar los
+  módulos base del modelo. Registra la corrida en la misma base SQLite
+  (`data/mlflow/tracking.db`) y experimento (`f1-race-intelligence`) que `LinearRegression` y
+  `TabularMLP`, y su método `predict()` ejecuta el contrato predictivo real (`LoadedModel.run`
+  + `validate_forecast_response`) con paridad verificable contra `RaceModelRunner.forecast`.
 
 ### Contrato de inferencia / serving (`contracts.py` y `lambda_handler.py`)
 
 En paridad con `serving/contract.py` (M8), toda petición a `lambda_handler.handler` pasa
-por `validate_forecast_request` (rechaza claves desconocidas, tipos inválidos o modos no
-soportados) y toda salida de `RaceModelRunner.forecast` pasa por
-`validate_forecast_response` (exige dimensiones $N \times N$, valores finitos no negativos,
-suma de filas y columnas igual a `1.0` dentro de tolerancia y `p_dnf` en $[0, 1]$).
+por `validate_forecast_request` (rechaza claves desconocidas, tipos inválidos, combinaciones
+inconsistentes en modo `live`, y `lap > total_laps`) y toda salida de `RaceModelRunner.forecast`
+(y de `RaceModelPyfuncModel.predict`) pasa por `validate_forecast_response` (exige campos
+obligatorios y rangos válidos de `lap`/`total_laps`, pilotos únicos y consistentes con la
+matriz, estructura 2D $N \times N$ sin valores fuera de $[0, 1]$, suma de filas y columnas
+igual a `1.0`, `p_dnf` estrictamente en $[0, 1]$ y consistencia con `p_position`/`ahead`).
 
 ## Aislamiento de dependencias y portabilidad a AWS
 
 - **Runtime base limpio:** `race_model` depende únicamente del runtime base
   ([requirements/runtime-lock.txt](requirements/runtime-lock.txt), que ya incluye `scipy`),
-  sin `mlflow` ni `torch`. Toda referencia a MLflow en `race_model/contracts.py` es perezosa
-  y opcional (`log_mlflow: false` por defecto).
+  sin `mlflow` ni `torch`. Toda referencia a MLflow vive en `race_model/mlflow_pyfunc.py` y se
+  importa únicamente de forma perezosa dentro de `log_race_model_to_mlflow()` (`log_mlflow: false`
+  por defecto), garantizando `"mlflow" not in sys.modules` al importar los módulos base incluso
+  cuando MLflow está instalado.
 - **Portabilidad AWS ya definida en IaC:** a diferencia del prototipo local de M8, el modelo
   de carrera ya cuenta con infraestructura SAM en [infra/template.yaml](infra/template.yaml),
   state machine [infra/statemachine/model.asl.json](infra/statemachine/model.asl.json)
