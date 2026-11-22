@@ -42,17 +42,35 @@ paso puede repetirse sin duplicar ni corromper resultados.
   y de la demostración (tanto lineales como del MLP) salen de datos sintéticos
   y **no** son resultados académicos de rendimiento.
 - La infraestructura AWS (SAM/Step Functions/ECS/Lambda/alarmas) está definida
-  en código y validada estáticamente (`sam validate --lint`) y por simulación;
-  **no está desplegada ni se ha validado en AWS real**
-  ([infra/aws_status.json](infra/aws_status.json)). M7 y M8 no existen en AWS:
-  MLflow usa SQLite local, PyTorch entrena en CPU local (sin SageMaker) y el
-  serving es un prototipo local.
-- Auditorías independientes (Antigravity): la planificación incremental y la
-  admisión (R1, R1.1 y R1.2) obtuvieron *APPROVED WITH MINOR FINDINGS* (su único
-  hallazgo menor, `pythonpath = ["src"]` en `pyproject.toml`, está corregido);
-  el backfill por temporadas y la protección de M6 (R2) y la robustez ante el
-  resultado de ECS (R3) obtuvieron *APPROVED*. La validación en AWS real sigue
-  pendiente.
+  en código y cubierta por las pruebas de plantilla y de la state machine
+  (`tests/infra`), además de validaciones por simulación. `sam validate --lint`
+  sobre la plantilla de `master` no pasa limpiamente: termina con código 1
+  por el aviso `W3005` en `ForecastFunctionLogGroup` (`DependsOn` redundante
+  con el `Ref` de `LoggingConfig.LogGroup`; sin efecto funcional y aún sin
+  corregir, ver [infra/README.md](infra/README.md), «Pendientes abiertos»,
+  punto 1).
+
+  El despliegue en `dev` está reportado y no es reproducible desde el
+  repositorio: corresponde a la plantilla anterior a M7, con
+  `PipelineEnabled=false`, calendario `DISABLED` e imagen `800931b` en la
+  Task Definition revisión 2
+  ([infra/aws_status.json](infra/aws_status.json),
+  [infra/README.md](infra/README.md)).
+
+  Se realizaron pruebas manuales en Fargate con la imagen `800931b` para
+  Abu Dabi 2025 (year=2025, meeting_key=1276, session_key=9839):
+  M2 completó la extracción de los 11 endpoints; M3 obtuvo `WARNING`,
+  sin errores, por los valores nulos de `drivers.country_code`; y M4
+  generó correctamente el Parquet de consolidación. Sin embargo, M4 no
+  pudo registrar su procedencia incremental debido a un defecto en la ruta
+  de almacenamiento de su informe. Por ello M5 y M6 no se ejecutaron.
+  La corrección de procedencia M4/M5 está en desarrollo en una rama separada.
+  Estas pruebas fueron manuales y no validan la orquestación de Step Functions.
+
+  M7 y M8 no están desplegados como infraestructura en AWS: la plantilla
+  de `master` contiene recursos de M7 que no forman parte del stack desplegado.
+  MLflow utiliza SQLite local, PyTorch entrena en CPU local (sin SageMaker)
+  y el serving continúa siendo un prototipo local.
 
 ### Componentes y responsabilidades
 
@@ -170,8 +188,9 @@ versiones registradas de M7 y su carga verificada desde M8 se describe en
 > almacenamiento está desacoplado (local o S3), cada stage se ejecuta como
 > job batch independiente y existe una imagen Docker. El estado de diseño,
 > código, validación local y despliegue se mantiene en
-> [infra/aws_status.json](infra/aws_status.json); los estados de despliegue y
-> pruebas reales son **NO VERIFICABLES** sin evidencia humana. Ver
+> [infra/aws_status.json](infra/aws_status.json): el despliegue en `dev` figura como
+> desplegado parcialmente (reportado, no reproducible desde el repositorio) y las
+> pruebas funcionales en AWS real, como **NO VERIFICABLES**. Ver
 > [Preparación para la nube](#14-preparación-para-la-nube-aws-ready).
 
 ## 2. Arquitectura
@@ -1025,8 +1044,10 @@ volver a calcularlo y comprobarlo:
 
 > El estado de AWS se registra únicamente en
 > [infra/aws_status.json](infra/aws_status.json). El diseño, el código y la
-> validación local se distinguen del despliegue y de las pruebas reales; estos
-> últimos permanecen **NO VERIFICABLES** sin comprobación humana.
+> validación local se distinguen del despliegue y de las pruebas reales. El
+> despliegue en `dev` (sin M7) está reportado y no es reproducible desde el
+> repositorio; las pruebas funcionales en AWS real de M2–M6 con la imagen vigente
+> siguen **NO VERIFICABLES** hasta que se ejecuten.
 
 La lógica funcional, estadística y anti-leakage de M4/M5/M6 **no cambió**.
 Se verificó ejecutando el pipeline nuevo sobre los datos locales y
@@ -1240,8 +1261,8 @@ docker run --rm -v "$PWD/data:/app/data" \
 > Imagen construida y probada en local con Docker Engine (WSL, `linux/amd64`):
 > `--help`, `pip check`, uid 10001, rutas de configuración inexistentes
 > (código 2), configuración AWS/S3 sin red, y `copy-raw` + M3→M5 de una sesión
-> sin red con `--memory 512m --cpus 0.5`. La publicación en ECR es
-> **NO VERIFICABLE** desde el repositorio (ver
+> sin red con `--memory 512m --cpus 0.5`. La publicación en ECR (imagen `800931b`) está
+> **reportada y no es reproducible** desde el repositorio (ver
 > [infra/aws_status.json](infra/aws_status.json)).
 
 ### 14.8 Infraestructura como código
@@ -1249,8 +1270,9 @@ docker run --rm -v "$PWD/data:/app/data" \
 La infraestructura base (S3, Lambda de disponibilidad de OpenF1, EventBridge,
 Step Functions, SNS, CloudWatch, ECR, IAM) está definida con AWS SAM en
 [infra/](infra/README.md). `infra/aws_status.json` es la fuente de verdad
-versionada: el estado de despliegue y de pruebas en AWS real permanece
-**NO VERIFICABLE** sin comprobación humana. La Fase 1B define M2–M6 como
+versionada: el despliegue en `dev` figura como desplegado parcialmente (reportado,
+sin M7, no reproducible desde el repositorio) y las pruebas en AWS real permanecen
+**NO VERIFICABLES** hasta ejecutar M2–M6 con la imagen vigente. La Fase 1B define M2–M6 como
 tareas Fargate endurecidas (raíz de solo lectura, sin capacidades Linux,
 usuario 10001, imagen fijada por digest) orquestadas por Step Functions.
 
@@ -1354,8 +1376,9 @@ lineal (`test_integral_flow`) como el flujo Deep Learning
 - La extracción respeta el límite de OpenF1 por cliente: varios jobs M2 en
   paralelo comparten ese límite, así que M2 no escala con más contenedores.
 - `car_data` genera volúmenes grandes (~36k filas por piloto por carrera).
-- **El despliegue AWS es NO VERIFICABLE** según
-  [infra/aws_status.json](infra/aws_status.json); el backend S3 se ha probado
+- **El despliegue AWS está reportado y no es reproducible desde el repositorio**
+  (desplegado parcialmente, sin M7), según [infra/aws_status.json](infra/aws_status.json);
+  las pruebas funcionales en AWS real son **NO VERIFICABLES**. El backend S3 se ha probado
   contra un cliente simulado.
 - CI con GitHub Actions (`.github/workflows/ci.yml`): en pull requests y
   pushes a `master`, revisa espacios en blanco, ejecuta
@@ -1391,17 +1414,42 @@ temporadas y protección de M6. Queda pendiente:
   [M07_DEEP_LEARNING.md](M07_DEEP_LEARNING.md#protocolo-de-cierre-con-datos-reales-para-la-sustentación));
   explorar arquitecturas adicionales solo si el análisis con datos reales lo
   justifica (LSTM/GRU y métodos secuenciales siguen fuera de alcance).
+
 - Validación de la infraestructura AWS en una cuenta real (despliegue
-  controlado, IAM y S3 reales, Step Functions, alarmas y SNS); hoy solo está
-  validada estáticamente y por simulación.
-- Construir y publicar la imagen Docker en ECR y registrar su digest.
-- Una arquitectura AWS para M7 (MLflow remoto en lugar de SQLite local;
-  eventual ejecución batch en ECS Fargate CPU o SageMaker si la escala lo
-  requiere) y para servir M8 desplegado.
-- Integración de R1–R3 en `master`, ya con auditoría independiente aprobada
-  (ver la visión general); la validación en AWS real sigue pendiente.
+  controlado, IAM y S3 reales, Step Functions, alarmas y SNS). Existe un
+  despliegue en `dev` reportado, con el runtime `800931b` en la Task
+  Definition revisión 2. Se realizaron pruebas manuales en Fargate con
+  Abu Dabi 2025 (`2025/1276/9839`): M2 completó la extracción de los
+  11 endpoints, M3 obtuvo `WARNING` sin errores y M4 generó el Parquet
+  de consolidación. Sin embargo, M4 no registró correctamente su
+  procedencia incremental, por lo que M5 y M6 siguen pendientes.
+  La ejecución manual no valida la orquestación de Step Functions.
+  Además, el ASL actual no bloquea M4–M6 ante un M3 `FAIL` y el planner
+  todavía no permite limitar una ejecución a una sesión específica.
+  La corrección de procedencia M4/M5 está desarrollada en una rama
+  separada y pendiente de integración y despliegue.
+
+- Imagen Docker en ECR: `800931b` está construida, publicada y desplegada
+  en `dev`, fijada por digest en la Task Definition revisión 2.
+  Una nueva imagen deberá construirse y publicarse después de integrar
+  la corrección de procedencia incremental M4/M5. Cada publicación
+  debe registrar su digest y resultado del escaneo de vulnerabilidades.
+
+- Una arquitectura AWS para M7 (MLflow remoto en lugar de SQLite local)
+  y para servir M8 desplegado. La plantilla actualmente desplegada no
+  incluye los recursos de infraestructura de M7. MLflow utiliza SQLite
+  local, PyTorch entrena en CPU local (sin SageMaker) y el serving
+  continúa siendo un prototipo local. La futura ejecución batch podrá
+  evaluarse en ECS Fargate CPU o SageMaker si la escala lo requiere.
+
+- Integración de R1–R3 en `master`, ya con auditoría independiente
+  aprobada (ver la visión general). La validación funcional en AWS
+  es parcial: existen pruebas manuales M2–M4 con la imagen vigente,
+  pero faltan M5–M6 y la ejecución end-to-end mediante Step Functions.
+
 - Medir la duración real de una temporada y del plan sobre el histórico
   completo, y definir una política de refresco de datos de OpenF1.
+
 - CI/CD y despliegue automatizado.
 - Dashboard de negocio y monitoreo de drift del modelo.
 

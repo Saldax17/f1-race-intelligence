@@ -29,14 +29,17 @@
       ]
     },
     "deployment": {
-      "status": "NO VERIFICABLE",
-      "evidence": [],
-      "reason": "No se consultó AWS ni se recibió evidencia humana verificable en esta implementación."
+      "status": "DESPLEGADO PARCIALMENTE",
+      "evidence": [
+        "infra/README.md (sección «Despliegue de la imagen 800931b (2026-11-22)»)",
+        "infra/README.md (sección «Despliegue de la corrección de meeting_key (2026-11-21)»)"
+      ],
+      "reason": "Verificado con la AWS CLI y evidencia humana el 2026-11-22: stack f1-race-intelligence-dev en UPDATE_COMPLETE, task definition revisión 2 ACTIVE con la imagen 800931b (digest sha256:8e0f4dfac71aeb1a8a6d9c565395354b2ed9c6b4869b744a7bd7c64eee9fba47), state machine ACTIVE que la referencia, PipelineEnabled=false y calendario DISABLED. Lo desplegado es la plantilla anterior a M7 (44 recursos, 13 parámetros: infraestructura base y Fase 1B). M7 NO está desplegado: los recursos que master añade no forman parte del stack. Las mediciones no se pueden reproducir desde el repositorio."
     },
     "real_environment_test": {
       "status": "NO VERIFICABLE",
       "evidence": [],
-      "reason": "No se ejecutaron pruebas contra un entorno AWS real."
+      "reason": "M2-M6 no se han ejecutado con la imagen vigente (800931b): no hay ninguna tarea ECS ni ejecución de la state machine posterior al despliegue. El smoke sintético del 2026-11-21 (copy-raw y M3-M5 en Fargate, task definition revisión 1, imagen 3d3b4e6) consta en infra/README.md como medido con la AWS CLI y no es reproducible desde el repositorio; no cubre M2, M6, la state machine ni la imagen vigente."
     }
   }
 }

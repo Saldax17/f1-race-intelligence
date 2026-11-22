@@ -14,18 +14,25 @@ configuración existentes.
 
 No se sobrescribió ninguna imagen previa: es una carpeta nueva con nombre fechado.
 
+**Revisión de estado (2026-11-22, posterior a la primera versión).** Se regeneraron el `.drawio`, el
+`.svg` y el `.png` solo para alinear los textos de estado con `infra/aws_status.json` e
+`infra/README.md` (runtime `800931b`, task definition revisión 2, M7 ausente del stack). El
+diseño y la disposición no cambian. Tampoco esta revisión consultó AWS.
+
 ## Cómo leer el diagrama
 
 | Marca | Significado |
 |---|---|
 | **A** borde azul sólido | Definido en IaC (`infra/template.yaml`) |
-| **C** círculo ámbar «?» | Despliegue real en AWS **no verificado**. Lo llevan todos los recursos AWS |
+| **C** círculo ámbar «?» | Despliegue en AWS **reportado, no reproducible desde el repositorio** (stack `dev`, plantilla anterior a M7). Lo llevan los recursos AWS de ese stack |
 | **B** borde verde | Validado en local / simulación, sin AWS |
 | **D** gris punteado | Futuro / pendiente, no implementado |
 | Flechas ámbar discontinuas | Compuerta cerrada: `PipelineEnabled=false` |
 
-Ningún recurso se presenta como desplegado: `infra/aws_status.json` declara
-`deployment` y `real_environment_test` como **NO VERIFICABLE**.
+`infra/aws_status.json` declara `deployment` = **DESPLEGADO PARCIALMENTE** (reportado, sin M7) y
+`real_environment_test` = **NO VERIFICABLE**. El «?» no dice que el recurso falte, sino que el
+repositorio no puede demostrar que existe. Los recursos de M7 se dibujan como definidos en IaC
+(`master`) y ausentes del stack desplegado.
 
 ## Flujo arquitectónico
 
@@ -59,7 +66,7 @@ Ningún recurso se presenta como desplegado: `infra/aws_status.json` declara
 
 ## Trazabilidad: componente → evidencia en el repositorio
 
-Estado: **A** = definido en IaC · **B** = validado localmente · **C** = despliegue real no verificado ·
+Estado: **A** = definido en IaC · **B** = validado localmente · **C** = despliegue en `dev` reportado, no reproducible desde el repositorio ·
 **D** = futuro. «Evidencia de validación» son pruebas/simulaciones locales, no AWS.
 
 | Componente del diagrama | Archivo / recurso que lo demuestra | Estado |
@@ -69,18 +76,18 @@ Estado: **A** = definido en IaC · **B** = validado localmente · **C** = despli
 | Lambda `availability` | `AvailabilityCheckerFunction` + `infra/functions/availability_checker/app.py`; `tests/infra/test_availability_checker.py` | A · B · C |
 | Bus `orquestación` + regla `availability-result` | `OrchestrationEventBus`, `AvailabilityResultRule` en `infra/template.yaml` | A · C |
 | Lambda `pipeline-admission` | `PipelineAdmissionFunction`, `infra/functions/pipeline_admission/handler.py`; `tests/infra/test_pipeline_admission.py` (Fake S3) | A · B · C |
-| Step Functions `…-pipeline` | `PipelineStateMachine`, `infra/statemachine/pipeline.asl.json`; `tests/infra/test_state_machine.py` | A · B · C |
+| Step Functions `…-pipeline` | `PipelineStateMachine`, `infra/statemachine/pipeline.asl.json`; `tests/infra/test_state_machine.py` | A · B · C — definición con `--meeting-key` y referencia a la task definition revisión 2 (reportado); no se ha ejecutado |
 | Compuerta `PipelineEnabled=false` | Parámetro `PipelineEnabled` + estado `IsPipelineEnabled` en `pipeline.asl.json`; `infra/samconfig.toml` | A · B |
 | Tareas plan/M2–M6 (`runTask.sync`, Map `MaxConcurrency=1`) | Estados `PlanSessions`, `PerSessionPipeline`, `M6_ModelingDataset` en `pipeline.asl.json` | A · B · C |
-| Clúster ECS + task definition Fargate | `PipelineCluster`, `PipelineTaskDefinition` en `infra/template.yaml` (condicional a `PipelineImageUri`) | A · C |
+| Clúster ECS + task definition Fargate | `PipelineCluster`, `PipelineTaskDefinition` en `infra/template.yaml` (condicional a `PipelineImageUri`) | A · C — revisión 2 `ACTIVE` con la imagen `800931b` (reportado); el smoke del 2026-11-21 usó la revisión 1 |
 | VPC, subredes, Internet Gateway, security group | `PipelineVpc`, `PipelineSubnetA/B`, `PipelineInternetGateway`, `PipelineTaskSecurityGroup` | A · C |
-| ECR `…-pipeline` | `PipelineImageRepository`; `Dockerfile`; `tests/infra/test_container_image.py` | A · B · C |
+| ECR `…-pipeline` | `PipelineImageRepository`; `Dockerfile`; `tests/infra/test_container_image.py` | A · B · C — imagen `800931b` publicada (reportado) |
 | S3 data lake y sus zonas | `DataBucket`, `DataBucketPolicy`; `src/f1_race_intelligence/storage/layout.py` (`LAKE_ROOTS`); `tests/unit/test_storage_layout.py` | A · B · C |
-| IAM (10 roles) | Roles `*Role` en `infra/template.yaml`; `infra/README.md` § IAM; `tests/infra/test_template.py` | A · B · C |
+| IAM (10 roles en `master`) | Roles `*Role` en `infra/template.yaml`; `infra/README.md` § IAM; `tests/infra/test_template.py` | A · B · C para los 5 roles de la fila superior del diagrama (reportados como desplegados y sin cambios); los 5 de M7 (trazo discontinuo) son A (master), sin desplegar |
 | Log groups, alarmas, dashboard | `*LogGroup`, `*Alarm`, `ObservabilityDashboard` en `infra/template.yaml` | A · C |
 | SNS `critical-alerts` | `AlertTopic`, `AlertTopicPolicy`, `AlertEmailSubscription` | A · C |
-| M7 race-model (SFN + Fargate + schedules) | `RaceModel*` en `infra/template.yaml`, `infra/statemachine/model.asl.json`; `tests/unit/test_race_model*.py` | A (master) · C — no está en el stack desplegado, según `infra/README.md` («Pendientes», punto 2) |
-| Lambda `race-forecast` + ECR forecast | `ForecastFunction`, `ForecastImageRepository`, `Dockerfile.forecast`; `tests/unit/test_race_model_lambda.py` | A (master) · C — requiere `ForecastImageUri` |
+| M7 race-model (SFN + Fargate + schedules) | `RaceModel*` en `infra/template.yaml`, `infra/statemachine/model.asl.json`; `tests/unit/test_race_model*.py` | A (master) — **ausente** del stack desplegado, según `infra/README.md` («Pendientes», punto 2); no se marca C |
+| Lambda `race-forecast` + ECR forecast | `ForecastFunction`, `ForecastImageRepository`, `Dockerfile.forecast`; `tests/unit/test_race_model_lambda.py` | A (master) — ausente del stack desplegado; requiere `ForecastImageUri` |
 | M7 + MLflow (SQLite) local | `M07_TRAINING_MLFLOW.md`; `tests/unit/test_training.py` | B |
 | Publicación del paquete de modelo | `M07_MODEL_PUBLISHING.md` | B |
 | M8 serving FastAPI | `src/f1_race_intelligence/serving/app.py`; `tests/unit/test_serving_api.py`, `test_m7_m8_integration.py`; `DEMO_LOCAL.md` | B |
@@ -88,13 +95,17 @@ Estado: **A** = definido en IaC · **B** = validado localmente · **C** = despli
 
 ## Puntos que no se pueden verificar desde el repositorio
 
-- **Despliegue real.** `infra/aws_status.json` → NO VERIFICABLE. Hay una contradicción documental
-  abierta: `infra/README.md` (secciones «Validación de runtime AWS» y «Despliegue de la corrección de
-  `meeting_key`») describe un stack `dev` en `us-east-1` y un smoke sintético del 2026-11-21 como
-  *medidos con la AWS CLI*, mientras `README.md` §1 afirma que no hay nada desplegado. El diagrama sigue la regla
-  de AGENTS.md §6: no da por demostrado lo que solo está *reportado*.
+- **Despliegue real.** `infra/aws_status.json` → `deployment` = DESPLEGADO PARCIALMENTE, `real_environment_test`
+  = NO VERIFICABLE. `infra/README.md` (secciones «Validación de runtime AWS» del 2026-11-21, «Despliegue
+  de la corrección de `meeting_key`» del 2026-11-21 y «Despliegue de la imagen `800931b`» del 2026-11-22)
+  describe un stack `dev` en `us-east-1` *medido con la AWS CLI*. Eso es un **reporte**: no se verificó
+  de forma independiente desde AWS, no se ejecutó la state machine completa y el smoke sintético
+  (`copy-raw` y M3–M5) usó la task definition revisión 1 y la imagen `3d3b4e6`, no la vigente. El
+  diagrama no da por demostrado lo que solo está *reportado*. No hay evidencia suficiente para
+  afirmar un despliegue productivo; `PipelineEnabled=false` y los calendarios siguen `DISABLED`.
 - **M7 en AWS.** La plantilla de `master` lo define; el stack desplegado (44 recursos, reportado) es
-  anterior y no lo incluye. Cuántos recursos crearía un despliegue sale de leer condiciones, no de un change set.
+  anterior y no lo incluye (aunque la imagen `800931b` ya contiene el código de M7). Cuántos recursos
+  crearía un despliegue sale de leer condiciones, no de un change set.
 - **Región.** `us-east-1` sale de `infra/samconfig.toml` (entorno `dev`); no se comprobó contra AWS.
 - **ROADMAP externo.** `docs/ROADMAP.md` está parcialmente desactualizado (su propio encabezado lo
   indica, revisado sobre `39ee675`); no se usó como fuente.

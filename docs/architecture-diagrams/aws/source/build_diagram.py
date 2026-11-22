@@ -139,17 +139,17 @@ rect(0, 0, W, H, fill=BG, stroke=None, sw=0, rx=0, id="bg")
 label(30, 8, 1180, 32, [L("F1 Race Intelligence · Arquitectura AWS (implementación vigente)", 24, True)], id="title")
 label(30, 42, 1190, 16, [L("Fuente de verdad: infra/template.yaml · infra/statemachine/*.asl.json · HEAD efd0a9c "
                            "(docs/record-meeting-key-deployment) · us-east-1 (samconfig dev)", 11, False, MUTED)], id="sub1")
-label(30, 59, 1190, 16, [L("Estado: infra/aws_status.json → despliegue y pruebas en AWS real NO VERIFICABLES · "
+label(30, 59, 1190, 16, [L("Estado: infra/aws_status.json → despliegue DESPLEGADO PARCIALMENTE (reportado) · pruebas en AWS real NO VERIFICABLES · "
                            "PipelineEnabled=false · calendarios DISABLED", 11, True, AMBER)], id="sub2")
-label(30, 74, 1190, 14, [L("infra/README.md reporta un smoke sintético (2026-11-21) que no se puede comprobar desde el "
-                           "repositorio: por eso todo recurso AWS lleva «?».", 10, False, MUTED)], id="sub3")
+label(30, 74, 1190, 14, [L("Runtime 800931b (task def. rev. 2) reportado el 2026-11-22 · smoke 2026-11-21 = rev. 1 / imagen 3d3b4e6 · M2–M6 sin ejecutar con 800931b · "
+                           "«?» = reportado, no reproducible desde el repositorio.", 10, False, MUTED)], id="sub3")
 
 # legend
 lx, ly = 1230, 10
 rect(lx, ly + 2, 24, 14, fill=CARD, stroke=BLUE, rx=3, id="lg_a")
 label(lx + 32, ly, 300, 18, [L("A · Definido en IaC (SAM/CloudFormation)", 11)], id="lg_a_t")
 badge(lx + 12, ly + 33, 8)
-label(lx + 32, ly + 24, 300, 18, [L("C · Despliegue real en AWS NO verificado", 11)], id="lg_c_t")
+label(lx + 32, ly + 24, 300, 18, [L("C · Reportado en dev (no reproducible aquí)", 11)], id="lg_c_t")
 rect(lx + 335, ly + 2, 24, 14, fill=CARD, stroke=GREEN, rx=3, id="lg_b")
 label(lx + 367, ly, 300, 18, [L("B · Validado en local / simulación (sin AWS)", 11)], id="lg_b_t")
 rect(lx + 335, ly + 26, 24, 14, fill=None, stroke=GREY, dash="1.5 3", rx=3, id="lg_d")
@@ -206,17 +206,18 @@ label(530, 262, 170, 14, [L("invoke (regla availability-result)", 9.5, False, MU
 
 sfn_g = rect(337, 372, 376, 426, fill="#0f1a2e", stroke=BLUE, sw=1.4, rx=8, id="sfn")
 icon(347, 378, 36, "AWSStepFunctions")
-label(391, 378, 300, 38, [L("Step Functions STANDARD · …-dev-pipeline", 11.5, True),
-                          L("timeout global 12 h · logs ALL → CloudWatch", 10, False, MUTED)], id="sfn_t")
+label(391, 376, 300, 44, [L("Step Functions STANDARD · …-dev-pipeline", 11.5, True),
+                          L("timeout global 12 h · logs ALL → CloudWatch", 10, False, MUTED),
+                          L("referencia la task definition rev. 2", 10, False, MUTED)], id="sfn_t")
 badge(713 - 6, 372 + 6)
 edge("adm", "sfn", s=(0.5, 1), t=(0.5, 0), color=C_CTRL)
 label(530, 361, 170, 12, [L("states:StartExecution", 9.5, False, MUTED)], id="l_start")
 
-rect(347, 416, 356, 23, fill=CARD, stroke=PANEL_LINE, rx=5, pl=9, id="g1",
+rect(347, 422, 356, 22, fill=CARD, stroke=PANEL_LINE, rx=5, pl=9, id="g1",
      lines=[L("IsOpenF1Available · false ⇒ Succeed (no ejecuta nada)", 10.5, False)])
-rect(347, 442, 356, 23, fill="#2a2108", stroke=AMBER, rx=5, pl=9, id="g2",
+rect(347, 447, 356, 22, fill="#2a2108", stroke=AMBER, rx=5, pl=9, id="g2",
      lines=[L("IsPipelineEnabled · false ⇒ PipelineDisabled (POR DEFECTO)", 10.5, True, AMBER)])
-rect(347, 468, 356, 23, fill=CARD, stroke=PANEL_LINE, rx=5, pl=9, id="g3",
+rect(347, 472, 356, 22, fill=CARD, stroke=PANEL_LINE, rx=5, pl=9, id="g3",
      lines=[L("CheckForConcurrentRun → ResolveExtractionScope", 10.5, False)])
 
 s_plan = chip(347, Y0, 356, CH, "PlanSessions + LoadPlan", "runTask.sync plan · LoadPlan: s3:getObject manifests/plan/*",
@@ -236,7 +237,7 @@ label(347, Y0 + 6 * PITCH + 38, 356, 24, [L("Resultado Succeed: OpenF1Unavailabl
 
 # ================================================================ COLUMN 3 — procesamiento
 ecr = card(782, 170, 300, 66, "AmazonElasticContainerRegistry",
-           [L("ECR …-dev-pipeline", 11.5, True), L("imagen batch por digest (PipelineImageUri)", 10, False, MUTED),
+           [L("ECR …-dev-pipeline", 11.5, True), L("imagen 800931b · por digest (reportado)", 10, False, MUTED),
             L("tags inmutables · scan on push", 10, False, MUTED)], id="ecr")
 vpc = rect(782, 350, 356, 446, fill="#0f1a2e", stroke=BLUE, sw=1.4, rx=8, id="vpc")
 icon(812, 358, 30, "AmazonVirtualPrivateCloud")
@@ -248,11 +249,12 @@ label(1000, 330, 82, 24, [L("Internet", 9.5, False, MUTED), L("Gateway", 9.5, Fa
 
 clu = rect(794, 396, 332, 394, fill="#101c33", stroke=BLUE, sw=1.2, rx=8, id="clu")
 icon(802, 402, 38, "AWSFargate")
-label(846, 402, 240, 44, [L("ECS cluster …-dev-pipeline · Fargate", 11, True),
+label(846, 400, 240, 58, [L("ECS cluster …-dev-pipeline · Fargate", 11, True),
+                          L("task def. rev. 2 · imagen 800931b", 10, False, MUTED),
                           L("512 CPU / 1 GB · x86_64 · sin volúmenes", 10, False, MUTED),
                           L("usuario 10001 · rootfs RO · cap_drop ALL", 10, False, MUTED)], id="clu_t")
 badge(1126 - 6, 396 + 6)
-gate = rect(806, 456, 276, 22, fill="#2a2108", stroke=AMBER, dash="5 3", sw=1.2, rx=5, id="gate",
+gate = rect(806, 464, 276, 22, fill="#2a2108", stroke=AMBER, dash="5 3", sw=1.2, rx=5, id="gate",
             lines=[L("M2–M6 inactivas mientras PipelineEnabled=false", 10, True, AMBER)], align="center", pl=0, pr=0)
 CHX, CHW = 820, 294
 t_defs = [("plan", "plan · planificación", "sesiones pendientes → manifests/plan/"),
@@ -320,7 +322,7 @@ label(1549, 324, 320, 100, [L("· Serving M8 desplegado en AWS (no existe)", 10.
 rect(1537, 436, 341, 368, fill=PANEL, stroke=BLUE, sw=1.4, rx=8, id="m7")
 label(1547, 440, 322, 46, [L("M7 modelo de carrera · definido en IaC (master)", 11.5, True),
                            L("condicional a ImageUri · calendarios DISABLED", 10, False, MUTED),
-                           L("no está en el stack desplegado (infra/README, reportado)", 10, False, AMBER)], id="m7_t")
+                           L("recursos M7 ausentes del stack desplegado (reportado)", 10, False, AMBER)], id="m7_t")
 
 
 def mini(x, y, name, l1, l2, l3, id):
