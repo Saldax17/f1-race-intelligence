@@ -13,10 +13,12 @@
 Stages: ``plan`` (list the session work units of a season), ``m2`` extraction,
 ``m3`` validation, ``m4`` consolidation, ``m5`` features, ``m6`` modelling
 datasets, ``verify-m6`` (verify a saved M6 report and its artifacts), ``m7``
-training and evaluation from a verified M6 report, ``copy-raw`` (copy
-already-extracted raw data between stores), and the in-race position model:
-``m7-train``, ``m7-evaluate`` (``--split``, ``--promote``), ``m7-update`` and
-``m7-forecast`` (``--session-key``, ``--lap``, ``--source``)::
+training and evaluation from a verified M6 report, ``m7-compare`` (controlled
+experimental comparison of MLP configurations on a verified M6 report),
+``copy-raw`` (copy already-extracted raw data between stores), and the
+in-race position model: ``m7-train``, ``m7-evaluate`` (``--split``,
+``--promote``), ``m7-update`` and ``m7-forecast`` (``--session-key``,
+``--lap``, ``--source``)::
 
     python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote
     python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
@@ -63,7 +65,7 @@ EXIT_USAGE = 2
 EXIT_DEFERRED = 3
 
 STAGES = (
-    "plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "copy-raw",
+    "plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "m7-compare", "copy-raw",
     "m7-train", "m7-evaluate", "m7-update", "m7-forecast",
 )
 
@@ -136,7 +138,23 @@ def build_parser() -> argparse.ArgumentParser:
         "complete; otherwise exit 3 without modelling",
     )
     config.add_argument("--report", help="M6 report path or s3://bucket/key (required by verify-m6)")
-    config.add_argument("--m6-report", help="Verified local M6 report to use as M7 training input")
+    config.add_argument("--m6-report", help="Verified local M6 report to use as M7 or m7-compare input")
+    config.add_argument(
+        "--model-type",
+        choices=["linear_regression", "mlp"],
+        default=None,
+        help="M7 model family to train (default: training.model_type from config)",
+    )
+    config.add_argument(
+        "--registered-model-name",
+        default=None,
+        help="Override the MLflow registered model name for M7 or m7-compare",
+    )
+    config.add_argument(
+        "--register-best",
+        action="store_true",
+        help="m7-compare only: register the validation-selected winning MLP in MLflow Model Registry",
+    )
 
     model = parser.add_argument_group("race model (m7-*)")
     model.add_argument("--lap", type=int, help="m7-forecast: forecast from the end of this lap (default: latest)")
@@ -211,6 +229,14 @@ def settings_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     elif args.overwrite_derived:
         overrides["consolidation"] = {"overwrite": True}
         overrides["features"] = {"overwrite": True}
+    training: Dict[str, Any] = {}
+    if getattr(args, "model_type", None) is not None:
+        training["model_type"] = args.model_type
+    if getattr(args, "registered_model_name", None) is not None:
+        training["registered_model_name"] = args.registered_model_name
+        training["mlp"] = {"registered_model_name": args.registered_model_name}
+    if training:
+        overrides["training"] = training
     return overrides
 
 
@@ -474,7 +500,25 @@ def run_m7(ctx: RunContext) -> StageOutcome:
     report_path = ctx.args.m6_report or ctx.settings.training.m6_report_path
     if not report_path:
         return StageOutcome(ok=False, reason="M7 requires --m6-report or training.m6_report_path")
-    result = TrainingRunner(ctx.settings, m6_report_path=report_path).run()
+    result = TrainingRunner(
+        ctx.settings,
+        m6_report_path=report_path,
+        model_type=getattr(ctx.args, "model_type", None),
+    ).run()
+    return StageOutcome(ok=True, summary=result.summary())
+
+
+def run_m7_compare(ctx: RunContext) -> StageOutcome:
+    from f1_race_intelligence.modeling.experiments import MLPComparisonRunner
+
+    report_path = ctx.args.m6_report or ctx.settings.training.m6_report_path
+    if not report_path:
+        return StageOutcome(ok=False, reason="m7-compare requires --m6-report or training.m6_report_path")
+    result = MLPComparisonRunner(
+        ctx.settings,
+        m6_report_path=report_path,
+        register_best=bool(getattr(ctx.args, "register_best", False)),
+    ).run()
     return StageOutcome(ok=True, summary=result.summary())
 
 
@@ -560,6 +604,7 @@ STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
     "m6": run_m6,
     "verify-m6": run_verify_m6,
     "m7": run_m7,
+    "m7-compare": run_m7_compare,
     "copy-raw": run_copy_raw,
 }
 
@@ -653,21 +698,30 @@ def main(
             raise ValueError("verify-m6 must be run alone and requires --report")
         if "m7" in stages and len(stages) != 1:
             raise ValueError("m7 must run alone against an explicit, already-produced M6 report")
+        if "m7-compare" in stages and len(stages) != 1:
+            raise ValueError("m7-compare must run alone against an explicit, already-produced M6 report")
         if args.report and "verify-m6" not in stages:
             raise ValueError("--report is only valid with --stage verify-m6")
-        if args.m6_report and "m7" not in stages:
-            raise ValueError("--m6-report is only valid with --stage m7")
+        if args.m6_report and not any(stage in stages for stage in ("m7", "m7-compare")):
+            raise ValueError("--m6-report is only valid with --stage m7 or m7-compare")
+        if args.model_type is not None and "m7" not in stages:
+            raise ValueError("--model-type is only valid with --stage m7")
+        if args.registered_model_name is not None and not any(stage in stages for stage in ("m7", "m7-compare")):
+            raise ValueError("--registered-model-name is only valid with --stage m7 or m7-compare")
+        if args.register_best and "m7-compare" not in stages:
+            raise ValueError("--register-best is only valid with --stage m7-compare")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
         if args.plan_output:
             parse_plan_destination(args.plan_output)  # fail before any OpenF1 call
         settings = load_settings(args.config, overrides=settings_overrides(args))
-        if "m7" in stages and not (args.m6_report or settings.training.m6_report_path):
-            raise ValueError("m7 requires --m6-report or training.m6_report_path")
-        if "m7" in stages and settings.storage.backend != "local":
-            raise ValueError("m7 supports local storage only")
-        if "m7" in stages and (args.input_storage or args.output_storage):
-            raise ValueError("m7 does not accept storage URI overrides; use local M6 artifacts")
+        for m7_stage in ("m7", "m7-compare"):
+            if m7_stage in stages and not (args.m6_report or settings.training.m6_report_path):
+                raise ValueError(f"{m7_stage} requires --m6-report or training.m6_report_path")
+            if m7_stage in stages and settings.storage.backend != "local":
+                raise ValueError(f"{m7_stage} supports local storage only")
+            if m7_stage in stages and (args.input_storage or args.output_storage):
+                raise ValueError(f"{m7_stage} does not accept storage URI overrides; use local M6 artifacts")
         check_stage_inputs(stages, settings, args.year)
         input_store = resolve_store(settings, args.input_storage, args.input_layout)
         output_store = resolve_store(settings, args.output_storage, args.output_layout)

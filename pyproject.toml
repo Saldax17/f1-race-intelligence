@@ -45,6 +45,12 @@ training = [
     "SQLAlchemy==2.0.57",
 ]
 
+# Deep learning models (M7 DL — PyTorch CPU-only recommended; install the
+# CPU wheels pinned in requirements/dl-lock.txt).
+dl = [
+    "torch==2.12.1",
+]
+
 # Local serving prototype (M8).
 serve = [
     "fastapi>=0.110",
