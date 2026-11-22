@@ -55,7 +55,8 @@ paso puede repetirse sin duplicar ni corromper resultados.
 | M4 | Consolidación a Piloto × Carrera × Vuelta | `raw/` + informe M3 → dataset por sesión | §11 |
 | M5 | Features y target `next_lap_time`, con guardas anti-leakage | dataset M4 → features por sesión | §12 |
 | M6 | Dataset de modelado: split cronológico por carrera y preprocesado ajustado solo con train | features de **todo** el histórico → splits, preprocesador y esquema con hashes | §13 |
-| M7 | Entrenamiento (regresión lineal y referencia), métricas, MLflow y registro | informe M6 verificado → modelo registrado | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| M7 (tabular) | Entrenamiento `next_lap_time` (regresión lineal y referencia), métricas, MLflow y registro | informe M6 verificado → modelo registrado | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| M7 (carrera) | Modelo tradicional jerárquico + Monte Carlo de posición final $N \times N$ desde vuelta *k*, verificación SHA-256 y MLflow opcional | `raw/` → versión inmutable (`manifest.json` + `PUBLISHED`) y pronóstico | [M07_RACE_MODEL.md](M07_RACE_MODEL.md) |
 | Publicación | Paquete inmutable y verificable de una versión registrada | modelo + artefactos M6 → `published-models/…` con manifiesto y `PUBLISHED` | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
 | M8 | Serving FastAPI (`/live`, `/health`, `/model-info`, `/predict`) | paquete publicado (o URIs de MLflow) → predicciones | §19 |
 
@@ -120,7 +121,9 @@ terminan en `NotifyPipelineFailure`. Ver
 | M4: consolidación | §11 |
 | M5: features y target | §12 |
 | M6: dataset de modelado y guardas anti-leakage | §13 |
-| M7: entrenamiento y MLflow | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| M7 (tabular): entrenamiento y MLflow | [M07_TRAINING_MLFLOW.md](M07_TRAINING_MLFLOW.md) |
+| M7 (carrera): modelo tradicional jerárquico y contrato unificado | [M07_RACE_MODEL.md](M07_RACE_MODEL.md) |
+| M7 (comparación): Modelo 1 (`race_model`) vs Ganador Modelo 2 (`mlp_deeper_reg`) | [M07_MODEL_COMPARISON.md](M07_MODEL_COMPARISON.md) |
 | Publicación de modelos | [M07_MODEL_PUBLISHING.md](M07_MODEL_PUBLISHING.md) |
 | M8: serving | §19 de este README |
 | Preparación para la nube y Docker | §14 |
@@ -1256,10 +1259,10 @@ Glue Data Catalog / Athena (opcional, partition projection)
 Dado todo lo observado hasta el final de la vuelta *k*, el modelo entrega la
 matriz N×N `P[i, j] = Pr(piloto i termina j-ésimo)` más `Pr(DNF)` por piloto. Los
 coches retirados ocupan las últimas posiciones, así que la matriz es doblemente
-estocástica por construcción. La matemática y cada decisión están en
-`docs/f1-model-math.md`; el alcance, en `docs/f1-model-scope.md`; la
-especificación implementada (formulación, supuestos, censura y DNF, priors,
-alcance y protocolo anti-leakage), en `docs/m7-model-spec.md`.
+estocástica por construcción. La especificación académica y de contratos
+unificados (en paridad con el resto de M7) vive en [M07_RACE_MODEL.md](M07_RACE_MODEL.md);
+la matemática, en `docs/f1-model-math.md`; el alcance, en `docs/f1-model-scope.md`;
+la especificación técnica concisa, en `docs/m7-model-spec.md`.
 
 | Módulo (`race_model/`) | Qué hace |
 |---|---|
@@ -1270,13 +1273,16 @@ alcance y protocolo anti-leakage), en `docs/m7-model-spec.md`.
 | `events` | Riesgos de SC/VSC/roja y de abandono por vuelta (pooling por circuito), pérdida en boxes, momento de parada |
 | `forecast` | Posterior del ritmo con las vueltas 1..*k* y Monte Carlo vectorizado → matriz |
 | `scoring`, `baselines` | RPS, log-loss por pares, calibración; baselines "orden persiste + parada" y matriz de transición |
-| `artifact`, `runner` | Versiones inmutables en `models/m7/`, puntero `latest.json`, etapas `m7-*` |
-| `lambda_handler` | Entrada de la Lambda de pronóstico (bajo demanda o en vivo) |
+| `contracts` | Procedencia y `input_fingerprint`, `manifest.json` + `PUBLISHED` (SHA-256), `generalization_diagnosis`, interpretabilidad estructural, reporte `.md`, validación de contrato de serving y MLflow perezoso |
+| `artifact`, `runner` | Versiones inmutables en `models/m7/`, puntero `latest.json`, etapas `m7-*` y `verify-m7` |
+| `lambda_handler` | Entrada de la Lambda de pronóstico (bajo demanda o en vivo) con validación de contrato |
 
 ```bash
-python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote     # entrenar y promover si supera al baseline
+python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote                  # entrenar y promover si supera al baseline
+python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote --log-mlflow     # igual, registrando también en MLflow local
+python -m f1_race_intelligence --stage verify-m7                                       # verificar SHA-256 (PUBLISHED + manifest.json)
 python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
-python -m f1_race_intelligence --stage m7-update                          # tras cada GP: estado de temporada al día
+python -m f1_race_intelligence --stage m7-update                                       # tras cada GP: estado de temporada al día
 ```
 
 Split por fechas fijas: 2023–24 entrenamiento; 2025 hasta Spa validación; de

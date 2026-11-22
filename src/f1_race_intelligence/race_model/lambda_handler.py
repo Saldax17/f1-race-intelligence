@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Mapping, Optional
 
 from f1_race_intelligence.config.settings import load_settings
+from f1_race_intelligence.race_model.contracts import validate_forecast_request
 from f1_race_intelligence.storage.backends.base import join_key
 from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
@@ -62,7 +63,7 @@ def live_race(client: Any, now: Optional[datetime] = None) -> Optional[Mapping[s
 
 
 def handler(event: Optional[Mapping[str, Any]], context: Any = None) -> Dict[str, Any]:
-    event = dict(event or {})
+    event = validate_forecast_request(dict(event or {}))
     runner = _runner()
     if event.get("mode") == "live":
         client = runner.client_factory()

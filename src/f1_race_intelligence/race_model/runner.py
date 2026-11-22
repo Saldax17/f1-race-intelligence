@@ -33,6 +33,14 @@ from f1_race_intelligence.race_model.artifact import (
     reports_prefix,
 )
 from f1_race_intelligence.race_model.baselines import TransitionBaseline, order_at_k, persist_baseline, ahead_from_matrix
+from f1_race_intelligence.race_model.contracts import (
+    build_provenance,
+    diagnose_race_model_generalization,
+    extract_interpretability,
+    log_race_model_to_mlflow,
+    render_evaluation_markdown,
+    validate_forecast_response,
+)
 from f1_race_intelligence.race_model.events import EventModel, fit_events
 from f1_race_intelligence.race_model.forecast import ForecastConfig, ForecastResult, car_states, forecast
 from f1_race_intelligence.race_model.pace import Level1Config, TyreModel, fit_level1
@@ -356,6 +364,14 @@ class RaceModelRunner:
             events = fit_events(train_races, l1.tyres)
 
         settings_dump = cfg.model_dump() if hasattr(cfg, "model_dump") else dict(cfg)
+        val_count = sum(1 for r in races if splits.get(r.ref.session_key) == VALIDATION)
+        provenance = build_provenance(
+            settings_dump,
+            train_races,
+            validation_races_count=val_count,
+            test_sealed=cfg.test_sealed,
+            random_seed=cfg.random_seed,
+        )
         artifact = ModelArtifact(
             version=new_version(),
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -379,6 +395,7 @@ class RaceModelRunner:
             },
             transition=(transition or TransitionBaseline()).to_dict(),
             races=[{**r.ref.to_dict(), "split": splits.get(r.ref.session_key)} for r in races],
+            provenance=provenance,
         )
         prior_check = self._prior_check(l1.obs, priors, splits)
         metrics = {
@@ -499,11 +516,27 @@ class RaceModelRunner:
         artifact.forecast["noise_scale"] = scale
         artifact.forecast["noise_scale_by_fraction"] = scores.get("chosen_by_fraction")
         artifact.metrics["noise_scale_rps"] = scores
+        interpretability = extract_interpretability(artifact)
         uri = self.registry.save(artifact)
-        report = {"stage": "m7-train", "version": artifact.version, "model_uri": uri, **artifact.metrics}
+        verification = self.registry.verify(artifact.version)
+        report = {
+            "stage": "m7-train",
+            "version": artifact.version,
+            "model_uri": uri,
+            "provenance": artifact.provenance,
+            "interpretability": interpretability,
+            "package_verification": verification,
+            **artifact.metrics,
+        }
         self._report("train", report)
-        return StageResult(True, {"version": artifact.version, "model_uri": uri, "noise_scale": scale,
-                                  "prior_check": metrics["prior_check"]})
+        return StageResult(True, {
+            "version": artifact.version,
+            "model_uri": uri,
+            "noise_scale": scale,
+            "prior_check": metrics["prior_check"],
+            "input_fingerprint": artifact.provenance.get("input_fingerprint"),
+            "manifest_sha256": verification.get("manifest_sha256"),
+        })
 
     # -- the sealed test set ----------------------------------------------------------
 
@@ -554,7 +587,7 @@ class RaceModelRunner:
 
     def evaluate(self, version: Optional[str] = None, split: str = "validation", promote: bool = False,
                  scenarios: Optional[int] = None, unseal_test: bool = False,
-                 allow_repeat_test: bool = False) -> StageResult:
+                 allow_repeat_test: bool = False, log_mlflow: bool = False) -> StageResult:
         artifact = self.registry.load(version) if version else self._newest()
         if split == TEST:
             if promote:
@@ -589,22 +622,97 @@ class RaceModelRunner:
                     continue
                 rows.append(score_forecast(result, race, model, bucket))
         summary = aggregate(rows, self.cfg.promote_requires_beating)
-        report = {"stage": "m7-evaluate", "version": artifact.version, "split": split, **summary,
-                  "rows_detail": [{k: v for k, v in r.items() if k not in ("events", "dnf")} for r in rows]}
-        report_uri = self._report(f"evaluate_{split}", report)
+        interpretability = extract_interpretability(artifact)
+        verification = self.registry.verify(artifact.version)
+        # Generalization diagnosis is strictly train + validation (never test).
+        diagnosis = (
+            diagnose_race_model_generalization(
+                prior_check=(artifact.metrics or {}).get("prior_check") or {},
+                validation_summary=summary,
+                noise_scale_rps=(artifact.metrics or {}).get("noise_scale_rps"),
+                baseline_key=self.cfg.promote_requires_beating,
+            )
+            if split == VALIDATION
+            else None
+        )
         promoted = False
         if promote:
             if summary.get(f"beats_{self.cfg.promote_requires_beating}"):
-                self.registry.promote(artifact.version, {"reason": "evaluation", "report": report_uri,
-                                                         "delta_rps": summary["by_bucket"]["all"]})
                 promoted = True
+        report: Dict[str, Any] = {
+            "stage": "m7-evaluate",
+            "version": artifact.version,
+            "split": split,
+            "provenance": artifact.provenance,
+            "generalization_diagnosis": diagnosis,
+            "interpretability": interpretability,
+            "package_verification": verification,
+            **summary,
+            "rows_detail": [{k: v for k, v in r.items() if k not in ("events", "dnf")} for r in rows],
+        }
+        report_uri = self._report(f"evaluate_{split}", report)
+        if promoted:
+            self.registry.promote(artifact.version, {"reason": "evaluation", "report": report_uri,
+                                                     "delta_rps": summary["by_bucket"]["all"]})
+        md_text = render_evaluation_markdown(
+            report=report,
+            artifact=artifact,
+            promoted=promoted,
+            verification=verification,
+            mlflow_info=None,
+        )
+        mlflow_info = None
+        if log_mlflow:
+            mlflow_info = log_race_model_to_mlflow(
+                settings=self.settings,
+                artifact=artifact,
+                evaluation_report=report,
+                markdown_report=md_text,
+                model_bytes=self.registry.read_model_bytes(artifact.version),
+                promoted=promoted,
+                verification=verification,
+                register_model=(split == VALIDATION),
+            )
+            md_text = render_evaluation_markdown(
+                report=report,
+                artifact=artifact,
+                promoted=promoted,
+                verification=verification,
+                mlflow_info=mlflow_info,
+            )
+        md_key = join_key(reports_prefix(self.output_store, self.cfg.output_path), f"evaluate_{split}.md")
+        markdown_uri = self.output_store.backend.write_bytes(
+            md_key, md_text.encode("utf-8"), content_type="text/markdown; charset=utf-8"
+        )
         overall = summary.get("by_bucket", {}).get("all", {})
-        out = {"version": artifact.version, "split": split, "races": summary.get("races"), "promoted": promoted,
-               "model_rps": overall.get("model_rps"), "persist_rps": overall.get("persist_rps"),
-               "transition_rps": overall.get("transition_rps"), "report": report_uri}
+        out: Dict[str, Any] = {
+            "version": artifact.version,
+            "split": split,
+            "races": summary.get("races"),
+            "promoted": promoted,
+            "model_rps": overall.get("model_rps"),
+            "persist_rps": overall.get("persist_rps"),
+            "transition_rps": overall.get("transition_rps"),
+            "generalization_status": diagnosis.get("status") if diagnosis else None,
+            "package_verified": verification.get("ok"),
+            "report": report_uri,
+            "markdown_report": markdown_uri,
+        }
+        if mlflow_info:
+            out["mlflow"] = mlflow_info
         if promote and not promoted:
             return StageResult(False, out, reason=f"version does not beat the {self.cfg.promote_requires_beating} baseline; latest unchanged")
         return StageResult(True, out)
+
+    def verify(self, version: Optional[str] = None) -> StageResult:
+        """Read-only SHA-256 verification of a saved race-model version package."""
+        target = version or self.registry.latest_version()
+        if target is None:
+            versions = self.registry.versions()
+            target = versions[-1] if versions else None
+        result = self.registry.verify(target)
+        reason = None if result["ok"] else "; ".join(result["errors"])
+        return StageResult(result["ok"], result, reason=reason)
 
     def update(self) -> StageResult:
         """Refresh level 1 and the filter state with frozen hyperparameters."""
@@ -656,6 +764,7 @@ class RaceModelRunner:
         race_k = truncate_at_lap(race, k)
         result = model.run(race_k, model.prior_for(race), model.total_laps(race, total_laps), seed=self.cfg.random_seed)
         payload = result.to_dict()
+        validate_forecast_response(payload)
         prefix = join_key(forecasts_prefix(self.output_store, self.cfg.output_path),
                           f"year={race.ref.year}", f"session={race.ref.session_key}")
         key = join_key(prefix, f"lap={k:03d}.json")
