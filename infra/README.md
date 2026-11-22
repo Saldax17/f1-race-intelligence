@@ -397,12 +397,14 @@ sesiones reales 7953 y 9472) el comportamiento no cambia: M3 termina con código
 plan vuelve a incluir la sesión. Las reglas de M3 y el tratamiento de `n_gear`
 no se tocan.
 
-*Estado:* definido en `infra/statemachine/pipeline.asl.json` y cubierto por
+*Estado:* definido en `infra/statemachine/pipeline.asl.json`, cubierto por
 tests locales (`tests/infra/test_state_machine.py` y
 `tests/unit/test_incremental_e2e.py`, que ejecuta los comandos derivados del
-ASL con la CLI real). **No desplegado ni probado en AWS**: aplicarlo requiere un
-change set que actualiza la definición de la state machine (`DefinitionUri`,
-que `sam deploy` empaqueta y sube) y no toca la Task Definition.
+ASL con la CLI real) y **desplegado en `dev` el 2026-11-21**: la definición
+activa de la state machine ya pasa `--meeting-key` en M2–M5 (ver «Despliegue de
+la corrección de `meeting_key`»). **No se ha ejecutado la state machine** con esa
+definición, así que el registro de procedencia a través de ella sigue validado
+solo en local.
 
 **Resultado de ECS y códigos de salida (R3).** Ningún estado desreferencia
 `Containers[0].ExitCode` al terminar la tarea: el resultado completo de
@@ -645,6 +647,35 @@ temporal, ya eliminada).
 | `copy-raw`, M3, M4 y M5 leyendo y escribiendo S3 | La state machine real: exit codes vía `runTask.sync`, `listExecutions` y el ámbito IAM de `DescribeTasks`/`StopTask` |
 | Logs en CloudWatch | Escrituras reales en las raíces operativas del rol de datos (solo se simularon con el simulador de IAM) |
 | Retirada del permiso temporal (simulador de IAM) | Activación del pipeline y del calendario |
+| Definición activa de la state machine con `--meeting-key` en M2–M5 (leída de Step Functions) | Una ejecución real de la state machine con esa definición (no se ha iniciado ninguna) |
+
+## Despliegue de la corrección de `meeting_key` (2026-11-21)
+
+**Procedencia:** medido con la AWS CLI durante el despliegue (lecturas de
+CloudFormation, Step Functions, ECS e IAM); no se puede comprobar desde el
+repositorio (AGENTS.md §6). `aws_status.json` no se ha modificado. Los ARN
+completos contienen el ID de cuenta y no se versionan.
+
+| Elemento | Resultado |
+|---|---|
+| Change set | `update-state-machine-meeting-key-20261121` (`d731a3d2-f46c-498c-a625-36e044a76ecd`), ejecutado el 2026-11-21 a las 20:08 hora local (UTC−5), es decir, 2026-11-22 01:08 UTC |
+| Contenido | un único cambio: `Modify` de `PipelineStateMachine`, sin reemplazo, solo `DefinitionS3Location` y sin recursos dependientes |
+| Resultado | stack `f1-race-intelligence-dev` en `UPDATE_COMPLETE`; solo `PipelineStateMachine` registró eventos de actualización |
+| Definición activa | M2, M3, M4 y M5 incluyen `--meeting-key` con `$.session.meeting_key`; sus comandos son idénticos a los del ASL de `master`. Frente a la definición anterior hay 6 diferencias (3 comandos y 3 comentarios); estados, transiciones y el comando de M6 no cambian |
+| Sin cambios | Task definition (revisión 1, la única `ACTIVE`, digest `sha256:b4c0f5012acd02062d0bb236e99b4cd55ecc4545fe4054a35618ca0a80cd5fdf`), imagen (`PipelineImageUri`), los 5 roles IAM (políticas inline, relación de confianza y ARN, comparados con una línea base tomada antes del cambio) y los 13 parámetros (`UsePreviousValue`) |
+| Siguen deshabilitados | `PipelineEnabled=false`, `AvailabilityScheduleState=DISABLED` y la regla de calendario de EventBridge `DISABLED` |
+| Actividad | 0 tareas ECS; ninguna ejecución nueva de Step Functions (la última es la del 2026-10-23); 6 de 6 alarmas en `OK` |
+
+**Cómo se aplicó.** El change set se preparó a partir de la plantilla ya
+desplegada, cambiando solo la clave `DefinitionS3Location` (el ASL corregido se
+subió como artefacto de despliegue de SAM), y no desde la plantilla completa de
+`master`, porque esta incluye M7 (ver «Pendientes abiertos», punto 2). No se usó
+`sam deploy`.
+
+**Alcance.** La definición está actualizada; no se ejecutó la state machine, no se
+iniciaron tareas ECS ni se llamó a OpenF1. Esta corrección solo transmite el
+ámbito completo de sesión: no convierte una validación `FAIL` en una sesión
+completada (ver punto 3 de «Pendientes abiertos»).
 
 ## Validar (sin tocar AWS)
 
@@ -979,3 +1010,61 @@ que el reintento no choque con sus nombres fijos.
   chequeo daría 404 → `openf1_error`. Cambiarlo es editar
   `OPENF1_PROBE_PATH`.
 - El rol de datos da `ListBucket` sobre todo el bucket (ver arriba).
+
+## Pendientes abiertos (2026-11-21)
+
+Tres asuntos independientes entre sí. Ninguno se resuelve en este cambio.
+
+### 1. Aviso W3005 en `ForecastFunctionLogGroup`
+
+`sam validate --lint` sobre la plantilla de `master` (`800931b`) termina con
+código 1 por un único aviso, `W3005`: `ForecastFunctionLogGroup` figura en
+`DependsOn` de `ForecastFunction`, pero esa dependencia ya la impone el `Ref` de
+`LoggingConfig.LogGroup`. Lo introdujo el PR #22 (M7); la plantilla anterior
+pasaba el lint. No tiene efecto funcional, pero DEFINITION_OF_DONE exige que el
+lint pase, así que la plantilla de `master` no puede darse por validada con él.
+Pendiente: retirar ese `DependsOn` en un cambio aparte.
+
+### 2. Divergencia entre la plantilla desplegada y `master` (M7)
+
+- **Desplegado:** 44 recursos y 13 parámetros (la plantilla enviada al stack).
+- **`master`:** el PR #22 añade 19 recursos, 3 salidas y 5 parámetros
+  (`ModelTrainingSchedule`, `ModelUpdateSchedule`, `ModelScheduleState`,
+  `LiveForecastScheduleState`, `ForecastImageUri`).
+- **Con los parámetros actuales** (`PipelineImageUri` no vacío,
+  `ForecastImageUri` vacío), un despliegue de `master` crearía 14 de esos
+  recursos: 7 incondicionales (repositorio ECR del pronóstico, 3 log groups y
+  3 roles) y 7 por `HasPipelineImage` (task definition, rol y state machine del
+  modelo, rol de calendario, 2 reglas de calendario y una alarma). Los 5 de la
+  Lambda de pronóstico requieren `ForecastImageUri`. Las reglas de calendario del
+  modelo y del pronóstico se crean con estado `DISABLED` por defecto. Este
+  recuento sale de leer la plantilla y sus condiciones, **no de un change set**.
+- **Imagen:** la desplegada (`sha256:b4c0f501…5fdf`) es anterior al PR #22
+  (registrada como construida desde `3d3b4e6`, dato reportado del registro de
+  imágenes del ROADMAP externo), así que no incluye las etapas de M7 ni los
+  endpoints nuevos de M2 descritos en «Modelo de carrera (M7)».
+- **Mientras tanto:** los cambios a la state machine se aplican con change sets
+  mínimos sobre la plantilla desplegada, como el del 2026-11-21; un `sam deploy`
+  directo desde `master` no debe usarse sin revisar antes su change set.
+  Alinear el stack con `master` (o no) es decisión del responsable humano.
+
+### 3. Sesiones reales 7953 y 9472: M3 en `FAIL` por `n_gear`
+
+| Sesión | M3 | Hallazgos | Evidencia |
+|---|---|---|---|
+| 2023 / meeting 1141 / **7953** | `FAIL` | 2 errores `values`: `n_gear` fuera de 0–8 en los pilotos 4 (32 registros) y 81 (31) | Fargate (2026-11-21): 113 reglas, informe `validated/year=2023/session=7953/validation_report_20261121T232645786678Z.json`; local con el código actual: 120 reglas |
+| 2024 / meeting 1229 / **9472** | `FAIL` | 1 error `values`: `n_gear` en el piloto 2 (54 registros); 1 aviso `missing_values`: `pit.stop_duration` nulo al 100 % | Local con el código actual: 120 reglas (no está en S3) |
+
+Los hallazgos de ambas sesiones coinciden con los del informe local del
+2026-09-09. Los valores fuera de rango son ráfagas de 8 a 13 segundos antes de la
+salida, con el coche parado (velocidad 0, rpm ≈ 4000) y marchas crecientes de 9
+a 75, en el 0,09–0,16 % de las filas de cada piloto afectado. M4 enmascara esas
+muestras (`n_gear <= MAX_GEAR`).
+
+Consecuencia: con M3 en `FAIL` no se registra procedencia, no se escribe
+`state.json` y la sesión no se completa, de modo que el plan la reincluye y
+`--require-complete-history` de M6 la ve incompleta. Ni las reglas de M3 ni el
+tratamiento de `n_gear` se han modificado. En AWS no se ha ejecutado M4 ni M5
+sobre estas sesiones (solo M2 y M3 sobre la 7953); en local, M4 y M5 sí corrieron
+el 2026-09-09 sobre las dos con M3 en `FAIL`, sin perder filas. Pendiente de
+decisión: si el glitch debe seguir siendo un error de M3.
