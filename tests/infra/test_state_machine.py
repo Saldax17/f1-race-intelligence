@@ -15,6 +15,7 @@ import pytest
 
 from f1_race_intelligence import cli
 from f1_race_intelligence.config.settings import DEFAULT_CONFIG_PATH, load_settings
+from f1_race_intelligence.scope import SessionScope
 
 SUBSTITUTIONS = {
     "Environment": "dev",
@@ -421,12 +422,57 @@ def test_stages_run_in_order_with_the_scope_of_each_session(asl_text) -> None:
         year, meeting, key = str(session["year"]), str(session["meeting_key"]), str(session["session_key"])
         expected += [
             ("M2_Extraction", ["--stage", "m2", "--year", year, "--meeting-key", meeting, "--session-key", key]),
-            ("M3_Validation", ["--stage", "m3", "--year", year, "--session-key", key]),
-            ("M4_Consolidation", ["--stage", "m4", "--year", year, "--session-key", key, "--overwrite-derived"]),
-            ("M5_Features", ["--stage", "m5", "--year", year, "--session-key", key, "--overwrite-derived"]),
+            ("M3_Validation", ["--stage", "m3", "--year", year, "--meeting-key", meeting, "--session-key", key]),
+            ("M4_Consolidation", ["--stage", "m4", "--year", year, "--meeting-key", meeting, "--session-key", key, "--overwrite-derived"]),
+            ("M5_Features", ["--stage", "m5", "--year", year, "--meeting-key", meeting, "--session-key", key, "--overwrite-derived"]),
         ]
     expected.append(("M6_ModelingDataset", ["--stage", "m6", "--require-complete-history"]))
     assert commands == expected
+
+
+PER_SESSION_STAGES = ["M2_Extraction", "M3_Validation", "M4_Consolidation", "M5_Features"]
+
+
+def test_m2_to_m5_receive_year_meeting_and_session_of_the_same_session(asl_text) -> None:
+    """The incremental provenance and completion records need the whole scope, so
+    every per-session stage must be given the same year, meeting and session."""
+    _, _, _, world = execute(asl_text, availability(True))
+    per_session = [(name, command) for name, command in task_commands(world) if name in PER_SESSION_STAGES]
+    assert len(per_session) == len(SESSIONS) * len(PER_SESSION_STAGES)
+
+    for index, session in enumerate(SESSIONS):
+        chunk = per_session[index * len(PER_SESSION_STAGES) : (index + 1) * len(PER_SESSION_STAGES)]
+        assert [name for name, _ in chunk] == PER_SESSION_STAGES
+        expected = SessionScope(year=session["year"], meeting_key=session["meeting_key"], session_key=session["session_key"])
+        for name, command in chunk:
+            args = cli.build_parser().parse_args(command)
+            scope = SessionScope(year=args.year, meeting_key=args.meeting_key, session_key=args.session_key)
+            assert scope == expected, f"{name} got {scope}, expected the scope of session {session['session_key']}"
+            assert None not in (scope.year, scope.meeting_key, scope.session_key), f"{name} has an incomplete scope"
+
+
+def test_the_effective_arguments_are_exactly_the_options_the_cli_defines(asl_text) -> None:
+    """argparse accepts abbreviations (``--meeting`` for ``--meeting-key``) and would hide a
+    typo, so every option the definition emits must be one the CLI registers verbatim."""
+    _, _, _, world = execute(asl_text, availability(True))
+    registered = set(cli.build_parser()._option_string_actions)  # noqa: SLF001 - exact option names
+
+    for name, command in task_commands(world):
+        options = [part for part in command if part.startswith("--")]
+        assert options, name
+        assert set(options) <= registered, f"{name}: {sorted(set(options) - registered)} are not CLI options"
+        assert len(options) == len(set(options)), f"{name} repeats an option"
+
+    effective = dict(task_commands(world)[1:5])  # the first session: M2..M5
+    expected_flags = {
+        "M2_Extraction": {"overwrite": False, "overwrite_derived": False, "strict": False},
+        "M3_Validation": {"overwrite": False, "overwrite_derived": False, "strict": False},
+        "M4_Consolidation": {"overwrite": False, "overwrite_derived": True, "strict": False},
+        "M5_Features": {"overwrite": False, "overwrite_derived": True, "strict": False},
+    }
+    for name, flags in expected_flags.items():
+        args = cli.build_parser().parse_args(effective[name])
+        assert {key: getattr(args, key) for key in flags} == flags, name
 
 
 def test_the_plan_is_read_back_from_where_the_plan_task_wrote_it(asl_text, template) -> None:

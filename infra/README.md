@@ -370,13 +370,39 @@ que ninguna tarea depende del disco de otra.
 |---|---|---|---|
 | `PlanSessions` | `--stage plan --plan-output s3://<bucket>/manifests/plan/<ejecución>.json` | Catálogos guardados; OpenF1 solo si faltan o requieren refresco (`meetings`, `sessions`) | `raw/…/endpoint=meetings|sessions/`, `manifests/extraction/`, decisiones del plan |
 | `M2_Extraction` | `--stage m2 --year Y --meeting-key M --session-key S` | OpenF1 | `raw/year=Y/meeting=M/session=S/…`, `manifests/extraction/year=Y/session=S/` |
-| `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
-| `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
-| `M5_Features` | `--stage m5 --year Y --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
+| `M3_Validation` | `--stage m3 --year Y --meeting-key M --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
+| `M4_Consolidation` | `--stage m4 --year Y --meeting-key M --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
+| `M5_Features` | `--stage m5 --year Y --meeting-key M --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
 | `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/runs/<run_id>/`, `modeling/preprocessing/runs/<run_id>/`, `manifests/modeling/` |
 
 Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
 generan esos comandos y los pasan por el parser real de la CLI.
+
+**Ámbito completo de sesión (`--meeting-key`).** M2, M3, M4 y M5 reciben el mismo
+`year`, `meeting_key` y `session_key`, tomados de la unidad de trabajo del plan
+(`$.session.*`, la que el Map reparte desde `manifests/plan/`). M3, M4 y M5 no
+lo recibían: sin el `meeting_key`, la CLI no puede registrar la procedencia de
+etapa ni la finalización de la sesión (R1, «session scope is incomplete», solo
+un aviso en el log), el reporte M3 queda archivado con `meeting_key` nulo y la
+búsqueda por ámbito completo no lo encuentra. Consecuencia: ninguna sesión
+procesada por la state machine podía quedar completa, el plan la reincluía en
+cada ejecución y `--require-complete-history` de M6 la veía siempre incompleta.
+
+La corrección solo **transmite el ámbito completo**. **No convierte una
+validación FAIL en una sesión completada**: la procedencia de M3 se registra
+únicamente con veredicto `PASS` o `WARNING`, y M4 y M5 exigen la de la etapa
+anterior. Con M3 en `FAIL` (por ejemplo, los `n_gear` fuera de rango de las
+sesiones reales 7953 y 9472) el comportamiento no cambia: M3 termina con código
+0 (sin `--strict`), M4 y M5 pueden ejecutarse, no se escribe `state.json` y el
+plan vuelve a incluir la sesión. Las reglas de M3 y el tratamiento de `n_gear`
+no se tocan.
+
+*Estado:* definido en `infra/statemachine/pipeline.asl.json` y cubierto por
+tests locales (`tests/infra/test_state_machine.py` y
+`tests/unit/test_incremental_e2e.py`, que ejecuta los comandos derivados del
+ASL con la CLI real). **No desplegado ni probado en AWS**: aplicarlo requiere un
+change set que actualiza la definición de la state machine (`DefinitionUri`,
+que `sam deploy` empaqueta y sube) y no toca la Task Definition.
 
 **Resultado de ECS y códigos de salida (R3).** Ningún estado desreferencia
 `Containers[0].ExitCode` al terminar la tarea: el resultado completo de
@@ -495,8 +521,11 @@ y CloudWatch Logs. Se descartó NAT Gateway y VPC endpoints de interfaz porque
 facturan por hora aunque no se ejecute nada. La VPC, subredes, tabla de rutas,
 gateway y cluster no tienen coste propio; sí lo tienen la **IPv4 pública** de
 cada tarea mientras corre, el cómputo Fargate (0,5 vCPU / 1 GB, mínimo de un
-minuto por tarea), los logs y la transferencia de datos. La conectividad real
-no se ha probado: se verifica en la primera ejecución controlada.
+minuto por tarea), los logs y la transferencia de datos. El smoke del
+2026-11-21 (ver «Validación de runtime AWS») comprobó que las tareas obtienen la
+imagen de ECR, escriben en CloudWatch Logs y leen y escriben en S3. La
+conectividad con OpenF1 no se ha probado; se verifica en la primera ejecución
+controlada.
 
 **Publicar y activar (fase posterior, con aprobación)**
 
@@ -515,6 +544,107 @@ no se ha probado: se verifica en la primera ejecución controlada.
    `DescribeTasks`/`StopTask` basta.
 4. Solo después, `PipelineEnabled=true`; el calendario sigue siendo una
    decisión aparte.
+
+## Validación de runtime AWS (smoke del 2026-11-21)
+
+Smoke sintético de las tareas Fargate en `dev` (`us-east-1`), ejecutado el
+2026-11-21 con autorización explícita, operación por operación. **Procedencia:**
+resultados medidos durante esa sesión con la AWS CLI y los logs de las tareas;
+no se pueden comprobar desde el repositorio (AGENTS.md §6). Los ARN completos
+contienen el ID de cuenta y no se versionan: las tareas se identifican por su ID.
+
+Alcance: una tarea por prueba, lanzadas fuera de la state machine, con datos
+**sintéticos** y un prefijo S3 aislado. No hubo llamadas a OpenF1, ni M2, ni
+ejecuciones de Step Functions.
+
+### A. Runtime de Fargate
+
+| Elemento | Resultado |
+|---|---|
+| Task definition | revisión 1 |
+| Imagen | por digest, `sha256:b4c0f5012acd02062d0bb236e99b4cd55ecc4545fe4054a35618ca0a80cd5fdf` |
+| Prueba | una tarea con el comando `--help` |
+| Resultado | exit code 0; la tarea terminó correctamente |
+| Logs | 64 eventos recibidos en CloudWatch Logs |
+| Endurecimiento observado | UID 10001, sistema de ficheros raíz de solo lectura y capacidades eliminadas |
+
+### B. S3 y procesamiento sintético
+
+| Tarea (ID) | Etapa | Resultado |
+|---|---|---|
+| `e11a42719ed045efac53cc14a1b5ce0a` | `copy-raw` | 12 archivos, 10.208 bytes, cero fallos; exit code 0 |
+| `c71137e1ebea484ba8baec2e9b72eacd` | M3, M4 y M5 en una sola tarea | exit code 0 en las tres etapas |
+
+- **M3:** 81 reglas, 78 superadas, 3 advertencias, cero errores. Conservó su
+  estado `PARTIAL` (`WARNING`).
+- **M4:** 6 filas de entrada y 6 de salida, cero pérdidas, 2 pilotos; 32.910 bytes.
+- **M5:** 6 filas, 4 con objetivo (target), 51 features; 35.608 bytes.
+
+### C. Evidencia en S3
+
+- Prefijo: `smoke-tests/fargate-synthetic/20261121-856868e1/` del bucket de datos.
+- 29 objetos, 127.361 bytes: 12 de entrada, 12 copias `raw` y 5 resultados derivados.
+- Ningún objeto fuera de ese prefijo.
+- El tamaño del resultado de M5 (35.608 bytes) coincide con el de la línea base
+  local. **No se compararon hashes ni el contenido binario de los Parquet**: la
+  coincidencia de tamaño no prueba que el contenido sea idéntico.
+- Los 29 objetos se conservan; no se borró nada.
+
+### D. Advertencias y limitaciones
+
+- `incremental_stage_provenance_not_recorded`: esperada, porque no había un
+  reporte histórico de M2 verificable.
+- `consolidating_without_validation_pass`: M4 recibió una M3 con estado `WARNING`.
+- Advertencia de NumPy por desviación cero en los datos sintéticos; no afectó a
+  los resultados.
+- No se ejecutó M2 ni hubo llamadas a OpenF1.
+- No se probó la state machine real.
+
+### E. Retirada del permiso temporal
+
+Para el smoke se añadió al rol de tarea `…-data-processing` una declaración
+`TemporarySyntheticFargateSmokeTest`: `s3:GetObject` y `s3:PutObject` solo sobre
+el prefijo temporal. Se desplegó y después se retiró mediante un change set de
+CloudFormation. Esa declaración nunca estuvo en `master` (vivió en una rama
+temporal, ya eliminada).
+
+- El change set se ejecutó tras aceptar expresamente tres cambios dependientes
+  que CloudFormation marcó como dinámicos (`PipelineStateMachineRole`,
+  `PipelineStateMachine` y `PipelineTaskDefinition`, que referencian el ARN del
+  rol). Como el rol tiene `RoleName` fijo, su ARN no cambió y solo se actualizó
+  `DataProcessingTaskRole`.
+- El simulador de políticas de identidad confirmó `implicitDeny` para
+  `GetObject` y `PutObject` en el prefijo temporal tras la retirada, y que las
+  declaraciones originales no cambiaron: `GetObject`/`PutObject` siguen
+  permitidos en las raíces operativas y `DeleteObject` sigue denegado.
+- La task definition (revisión 1) y el digest de imagen no cambiaron. La
+  definición de la state machine es idéntica byte a byte.
+- **Límites de esta verificación:** se usó el simulador de políticas de
+  identidad; no se hizo una prueba real de acceso tras la retirada ni se volvió a
+  consultar la política del bucket.
+
+### F. Estado final de AWS
+
+| Elemento | Estado |
+|---|---|
+| Stack `f1-race-intelligence-dev` | `UPDATE_COMPLETE` |
+| Task definition | revisión 1, `ACTIVE` |
+| Alarmas | 6 de 6 en `OK` |
+| Tareas ECS activas | 0 |
+| Ejecuciones de Step Functions nuevas | ninguna |
+| `PipelineEnabled` | `false` |
+| `AvailabilityScheduleState` | `DISABLED` |
+| Regla de calendario de EventBridge | `DISABLED` |
+
+### Probado en AWS y solo validado en local
+
+| Probado en AWS (con datos sintéticos) | Solo validado en local, no probado en AWS |
+|---|---|
+| Arranque de la imagen y task definition revisión 1 en Fargate | M2 y cualquier llamada a OpenF1 |
+| Usuario 10001, raíz de solo lectura y capacidades eliminadas | `plan` y M6 (no se ejecutaron en Fargate) |
+| `copy-raw`, M3, M4 y M5 leyendo y escribiendo S3 | La state machine real: exit codes vía `runTask.sync`, `listExecutions` y el ámbito IAM de `DescribeTasks`/`StopTask` |
+| Logs en CloudWatch | Escrituras reales en las raíces operativas del rol de datos (solo se simularon con el simulador de IAM) |
+| Retirada del permiso temporal (simulador de IAM) | Activación del pipeline y del calendario |
 
 ## Validar (sin tocar AWS)
 
@@ -587,7 +717,15 @@ else
     --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
     --build-arg F1_GIT_DIRTY=false \
     -t "$REPO:$TAG" . &&
-  docker push "$REPO:$TAG"
+  docker push "$REPO:$TAG" &&
+  # Imagen de la Lambda de pronóstico (M7): mismo código y commit.
+  FORECAST_REPO=$(aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev \
+    --query "Stacks[0].Outputs[?OutputKey=='ForecastImageRepositoryUri'].OutputValue" --output text) &&
+  docker build --platform linux/amd64 \
+    --build-arg F1_GIT_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg F1_GIT_DIRTY=false \
+    -f Dockerfile.forecast -t "$FORECAST_REPO:$TAG" . &&
+  docker push "$FORECAST_REPO:$TAG"
 fi
 ```
 
@@ -699,6 +837,122 @@ aws sns list-subscriptions-by-topic --topic-arn $topic --query "Subscriptions[].
 Activar el calendario (`AvailabilityScheduleState=ENABLED`) no forma parte de
 ningún ejemplo de este documento: es una decisión explícita y revisada, que se
 toma sustituyendo `DISABLED` en el despliegue correspondiente.
+
+## Modelo de carrera (M7): desplegar y mantener
+
+El modelo (`src/f1_race_intelligence/race_model/`, matemática en
+`docs/f1-model-math.md`) se despliega en dos piezas, cada una creada **solo cuando su
+imagen ya está en ECR** (parámetros vacíos ⇒ el stack no crea nada de M7 salvo el
+repositorio ECR del pronóstico, los roles y los log groups):
+
+| Pieza | Recurso | Se crea si | Qué hace |
+|---|---|---|---|
+| Entrenamiento / actualización | ECS Fargate (`RaceModelTaskDefinition`, imagen batch, `PipelineCluster`) + Step Functions `…-race-model` | `PipelineImageUri` no vacío | `{"action":"train"}`: `m7-train` → `m7-evaluate --promote`. `{"action":"update"}`: `m7-update` |
+| Pronóstico | Lambda imagen `…-race-forecast` (`Dockerfile.forecast`) | `ForecastImageUri` no vacío | `{"session_key":…, "lap":…}` o `{"mode":"live"}` → `forecasts/m7/…` |
+
+Datos en el lake (contrato, ver `storage/layout.py`):
+
+```
+models/m7/version=<v>/model.json        versión inmutable (JSON: parámetros + estado del filtro)
+models/m7/latest.json                   puntero a la versión promovida (lo único que leen los pronósticos)
+manifests/models/m7/*.json              reportes de train / evaluate / update
+forecasts/m7/year=<y>/session=<s>/lap=<k>.json   y latest.json por carrera
+```
+
+IAM: `…-race-model` lee `raw/` y escribe solo `models/m7/` y
+`manifests/models/m7/`; `…-race-forecast` lee `raw/` y `models/m7/` y escribe
+solo `forecasts/m7/`. Ninguno puede borrar.
+
+### Ciclo de vida
+
+1. **Datos.** M2 ahora también extrae `session_result` (etiqueta) y
+   `starting_grid` (prior de clasificación, pedido por `meeting_key`).
+2. **Entrenar** (mensual o a mano): ajusta nivel 1 en todas las carreras, el filtro
+   de temporada, eventos y baselines en las de entrenamiento, y escribe una versión
+   nueva. `m7-evaluate --promote` la puntúa en validación y **solo** mueve
+   `latest.json` si mejora el RPS medio del baseline `persist`; si no, la tarea sale
+   con código 1, la ejecución falla y llega una alerta, y `latest` no cambia.
+3. **Actualizar** (lunes tras cada GP): `m7-update` vuelve a correr el filtro con
+   los hiperparámetros congelados para que la próxima carrera use el último
+   resultado; promueve automáticamente (la versión padre ya estaba aprobada).
+4. **Pronosticar**: invocación bajo demanda o la regla `…-race-forecast-live`
+   (cada minuto; fuera de carrera responde `idle`).
+5. **Revertir**: escribir la versión anterior en `models/m7/latest.json`
+   (`aws s3 cp` de un `latest.json` con `{"version": "<v>"}`); las versiones nunca
+   se sobrescriben.
+
+### Publicar imágenes y desplegar
+
+Las dos imágenes (batch y pronóstico) se construyen y publican con el bloque
+protegido de "Para publicar la imagen batch en ECR": solo desde un árbol limpio
+y con el SHA completo del commit. Las tareas del modelo usan **la misma imagen
+batch** (`PipelineImageUri`), el mismo cluster, las mismas subredes y el mismo
+security group que M2-M6; la Lambda usa `ForecastImageUri`. Ambas van **por
+digest** (el que devuelve `docker push`), nunca por tag.
+
+```bash
+: "${ALERT_EMAIL:?Define ALERT_EMAIL con la dirección real del destinatario}"
+: "${PIPELINE_IMAGE:?Define PIPELINE_IMAGE=<repositorio>@sha256:<digest> de la imagen batch}"
+: "${FORECAST_IMAGE:?Define FORECAST_IMAGE=<repositorio>@sha256:<digest> de la imagen de pronóstico}"
+cd infra && sam build
+sam deploy --config-env dev --parameter-overrides \
+  ParameterKey=ProjectName,ParameterValue=f1-race-intelligence \
+  ParameterKey=Environment,ParameterValue=dev \
+  'ParameterKey=AvailabilitySchedule,ParameterValue="rate(15 minutes)"' \
+  ParameterKey=AvailabilityScheduleState,ParameterValue=DISABLED \
+  ParameterKey=PipelineIntervalHours,ParameterValue=24 \
+  ParameterKey=PipelineEnabled,ParameterValue=false \
+  ParameterKey=LogRetentionDays,ParameterValue=30 \
+  "ParameterKey=AlertEmail,ParameterValue=${ALERT_EMAIL}" \
+  "ParameterKey=PipelineImageUri,ParameterValue=${PIPELINE_IMAGE}" \
+  "ParameterKey=ForecastImageUri,ParameterValue=${FORECAST_IMAGE}" \
+  ParameterKey=ModelScheduleState,ParameterValue=DISABLED \
+  ParameterKey=LiveForecastScheduleState,ParameterValue=DISABLED
+```
+
+`PipelineEnabled=false` sigue apagando M2-M6: el modelo corre con su propia
+state machine, que solo arranca a mano o con sus calendarios (`DISABLED`). En
+PowerShell, el mismo despliegue sigue el patrón protegido de "Alertas por
+correo" añadiendo `PipelineImageUri`, `ForecastImageUri`, `ModelScheduleState`
+y `LiveForecastScheduleState`.
+
+Primera carga del modelo y pruebas (los datos `raw/` deben estar en el bucket):
+
+```bash
+out() { aws cloudformation describe-stacks --stack-name f1-race-intelligence-dev --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+SM=$(out RaceModelStateMachineArn)
+aws stepfunctions start-execution --state-machine-arn "$SM" --input '{"action": "train"}'
+FN=$(out ForecastFunctionName)
+aws lambda invoke --function-name "$FN" --cli-binary-format raw-in-base64-out \
+  --payload '{"session_key": 9998, "lap": 30}' forecast.json && cat forecast.json
+```
+
+Local, sin AWS (mismos comandos que ejecutan las tareas):
+
+```bash
+python -m f1_race_intelligence --stage m7-train,m7-evaluate --promote
+python -m f1_race_intelligence --stage m7-forecast --year 2025 --session-key 9998 --lap 30
+python -m f1_race_intelligence --stage m7-evaluate --split test --unseal-test   # una sola vez, informe final
+```
+
+### Riesgos del modelo en producción
+
+- **Datos en vivo.** Durante una sesión OpenF1 sirve datos en vivo solo a usuarios
+  autenticados; sin esa credencial el modo `live` falla o ve datos atrasados. Por
+  eso `LiveForecastScheduleState` es `DISABLED` y el cliente aún no envía token.
+- **Puerta de promoción.** Promueve contra `persist`. En la validación de
+  2025 el modelo supera claramente a `persist` y queda por delante de la
+  matriz de transición (`transition`) sin diferencia significativa (IC 95%
+  del ΔRPS que incluye 0); si se quiere exigir ambos, cambiar
+  `race_model.promote_requires_beating`.
+- **Test sellado.** Mientras `race_model.test_sealed` sea `true`, ni el entrenamiento, ni
+  `m7-update`, ni los pronósticos leen carreras de test. `--split test --unseal-test` es
+  la única entrada: no promueve, queda en `manifests/models/m7/test_ledger.json` y se
+  rechaza la segunda vez. Con el test sellado, `m7-update` salta esas carreras; pasar
+  `test_sealed: false` solo tras el informe final.
+- El reinicio reglamentario de 2026 deja el filtro sin historia útil: tras
+  `m7-update`, revisar `prior_check` en el reporte antes de confiar en las
+  primeras carreras.
 
 ## Eliminar
 

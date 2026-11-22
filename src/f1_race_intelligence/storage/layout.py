@@ -26,7 +26,10 @@ given piece of data gets. Two layouts exist:
         modeling/split=<train|validation|test>/{dataset,features}.parquet
         modeling/preprocessing/preprocessor.joblib
         manifests/<stage>/[year=<y>/session=<s>/]<record>_<ts>.json
-        models/   (reserved for training)
+        models/m7/version=<v>/model.json            race model versions (M7)
+        models/m7/latest.json                       pointer to the promoted version
+        manifests/models/m7/<record>_<ts>.json      training/evaluation reports
+        forecasts/m7/year=<y>/session=<s>/lap=<k>.json   in-race forecasts
         logs/     (reserved)
 
     The lake layout ignores the per-stage paths: its layer names are the
@@ -66,6 +69,8 @@ class Layer(str, Enum):
     MODELING = "modeling"
     MODELING_REPORTS = "modeling_reports"
     MODELS = "models"
+    MODEL_REPORTS = "model_reports"
+    FORECASTS = "forecasts"
     LOGS = "logs"
 
 
@@ -82,6 +87,8 @@ LAKE_ROOTS: Dict[Layer, str] = {
     Layer.MODELING: "modeling",
     Layer.MODELING_REPORTS: "manifests/modeling",
     Layer.MODELS: "models",
+    Layer.MODEL_REPORTS: "manifests/models",
+    Layer.FORECASTS: "forecasts",
     Layer.LOGS: "logs",
 }
 

@@ -401,6 +401,59 @@ RACE_CONTROL = EndpointSpec(
 )
 
 
+LOCATION = EndpointSpec(
+    name="location",
+    natural_key=("session_key", "driver_number", "date"),
+    natural_key_note="Position samples (~3.7 Hz), one file per driver like car_data.",
+    timestamp_fields=("date",),
+    order_field="date",
+    fields={
+        "session_key": _SESSION_KEY,
+        "meeting_key": _MEETING_KEY,
+        "driver_number": _DRIVER_NUMBER,
+        "date": _timestamp(),
+        # Circuit coordinates in OpenF1's own units (about decimetres); circuits span ~±20 000.
+        "x": FieldSpec(types=(int, float), minimum=-100000, maximum=100000),
+        "y": FieldSpec(types=(int, float), minimum=-100000, maximum=100000),
+        "z": FieldSpec(types=(int, float), minimum=-100000, maximum=100000),
+    },
+)
+
+SESSION_RESULT = EndpointSpec(
+    name="session_result",
+    natural_key=("session_key", "driver_number"),
+    natural_key_note="One classification row per driver (19-22 per race on 2023-25).",
+    fields={
+        "session_key": _SESSION_KEY,
+        "meeting_key": _MEETING_KEY,
+        "driver_number": _DRIVER_NUMBER,
+        "position": FieldSpec(types=(int,), minimum=1, maximum=30, sparse=True,
+                              note="Null for unclassified cars and DSQs (convention (a) in the race model)."),
+        "number_of_laps": FieldSpec(types=(int,), minimum=0, maximum=100),
+        "dnf": FieldSpec(types=(bool,), sparse=True),
+        "dns": FieldSpec(types=(bool,), sparse=True),
+        "dsq": FieldSpec(types=(bool,), sparse=True),
+    },
+)
+
+STARTING_GRID = EndpointSpec(
+    name="starting_grid",
+    natural_key=("session_key", "driver_number"),
+    natural_key_note=(
+        "Keyed by the qualifying session (fetched by meeting and stored with the race); "
+        "sprint weekends add the sprint grid under its own session_key."
+    ),
+    fields={
+        "session_key": _SESSION_KEY,
+        "meeting_key": _MEETING_KEY,
+        "driver_number": _DRIVER_NUMBER,
+        "position": FieldSpec(types=(int,), minimum=1, maximum=30, sparse=True),
+        "lap_duration": FieldSpec(minimum=0, exclusive_minimum=True, plausible=(50.0, 200.0), sparse=True,
+                                  note="Qualifying lap; null for cars that set no time."),
+    },
+)
+
+
 ENDPOINT_SPECS: Dict[str, EndpointSpec] = {
     spec.name: spec
     for spec in (
@@ -415,6 +468,9 @@ ENDPOINT_SPECS: Dict[str, EndpointSpec] = {
         PIT,
         WEATHER,
         RACE_CONTROL,
+        LOCATION,
+        SESSION_RESULT,
+        STARTING_GRID,
     )
 }
 

@@ -64,6 +64,10 @@ historical_extraction:
     - pit
     - weather
     - race_control
+    # Labels and pace prior for the race model (M7). starting_grid is
+    # fetched by meeting and stored with the race session.
+    - session_result
+    - starting_grid
 
   output_path: "data/raw"
   manifest_path: "data/manifests"
@@ -232,3 +236,50 @@ training:
     compute_permutation_importance: true
     permutation_importance_repeats: 5
     permutation_importance_top_k: 10
+
+# The in-race position forecaster (M7): from lap k, the N x N matrix of
+# finishing positions. The math is in docs/f1-model-math.md; every value here is
+# recorded in the training report.
+race_model:
+  raw_path: "data/raw"
+  output_path: "data/models/m7"
+  years: [2023, 2024, 2025]
+  train_years: [2023, 2024]
+  # Fixed windows: 2025 up to Spa is validation, Budapest to Abu Dhabi is test.
+  validation_until: "2025-08-01"
+  test_until: "2026-01-01"
+  # Test races are never read while sealed; see m7-evaluate --unseal-test.
+  test_sealed: true
+  # Laps 2-25 are missing at source.
+  exclude_races: ["2025 Miami Gardens"]
+  burn_in_races: 6
+
+  # Level 1: clean-lap pace per race (% of the race's median clean lap).
+  free_air_seconds: 1.5
+  slow_lap_factor: 1.04
+  min_clean_laps: 5
+  ridge_sigma: 0.4
+  compound_offset_prior_sd: 1.0
+  compound_slope_prior_sd: 0.1
+
+  # Level 2: car/driver form across races. rho = 1 (random walk) unless fit_rho.
+  fit_rho: false
+  initial_team_variance: 0.25
+  initial_driver_variance: 0.05
+  quali_max_abs_pct: 4.0
+
+  # Forecast and evaluation.
+  k_fractions: [0.1, 0.25, 0.5, 0.75, 0.9]
+  scenarios: 4000
+  restart_gap_seconds: 0.8
+  pit_under_sc_probability: 0.7
+  pit_under_vsc_probability: 0.4
+  noise_scales: [1.0, 1.5, 2.0, 3.0]
+  # One multiplier per k-bucket (experiment 1 in docs/m7-experiments.md).
+  noise_scale_per_phase: true
+  calibration_races: 16
+  random_seed: 42
+
+  # A new version becomes "latest" only if it beats this baseline on
+  # validation mean RPS.
+  promote_requires_beating: "persist"
