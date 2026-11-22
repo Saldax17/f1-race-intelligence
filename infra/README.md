@@ -370,13 +370,39 @@ que ninguna tarea depende del disco de otra.
 |---|---|---|---|
 | `PlanSessions` | `--stage plan --plan-output s3://<bucket>/manifests/plan/<ejecución>.json` | Catálogos guardados; OpenF1 solo si faltan o requieren refresco (`meetings`, `sessions`) | `raw/…/endpoint=meetings|sessions/`, `manifests/extraction/`, decisiones del plan |
 | `M2_Extraction` | `--stage m2 --year Y --meeting-key M --session-key S` | OpenF1 | `raw/year=Y/meeting=M/session=S/…`, `manifests/extraction/year=Y/session=S/` |
-| `M3_Validation` | `--stage m3 --year Y --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
-| `M4_Consolidation` | `--stage m4 --year Y --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
-| `M5_Features` | `--stage m5 --year Y --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
+| `M3_Validation` | `--stage m3 --year Y --meeting-key M --session-key S` | `raw/`, `manifests/extraction/` | `validated/year=Y/session=S/` |
+| `M4_Consolidation` | `--stage m4 --year Y --meeting-key M --session-key S` | `raw/`, `validated/` | `consolidated/year=Y/session=S/`, `manifests/consolidation/` |
+| `M5_Features` | `--stage m5 --year Y --meeting-key M --session-key S` | `consolidated/` | `features/year=Y/session=S/`, `manifests/features/` |
 | `M6_ModelingDataset` | `--stage m6` | `features/` | `modeling/split=…/runs/<run_id>/`, `modeling/preprocessing/runs/<run_id>/`, `manifests/modeling/` |
 
 Las pruebas de `tests/infra/test_state_machine.py` recorren la definición,
 generan esos comandos y los pasan por el parser real de la CLI.
+
+**Ámbito completo de sesión (`--meeting-key`).** M2, M3, M4 y M5 reciben el mismo
+`year`, `meeting_key` y `session_key`, tomados de la unidad de trabajo del plan
+(`$.session.*`, la que el Map reparte desde `manifests/plan/`). M3, M4 y M5 no
+lo recibían: sin el `meeting_key`, la CLI no puede registrar la procedencia de
+etapa ni la finalización de la sesión (R1, «session scope is incomplete», solo
+un aviso en el log), el reporte M3 queda archivado con `meeting_key` nulo y la
+búsqueda por ámbito completo no lo encuentra. Consecuencia: ninguna sesión
+procesada por la state machine podía quedar completa, el plan la reincluía en
+cada ejecución y `--require-complete-history` de M6 la veía siempre incompleta.
+
+La corrección solo **transmite el ámbito completo**. **No convierte una
+validación FAIL en una sesión completada**: la procedencia de M3 se registra
+únicamente con veredicto `PASS` o `WARNING`, y M4 y M5 exigen la de la etapa
+anterior. Con M3 en `FAIL` (por ejemplo, los `n_gear` fuera de rango de las
+sesiones reales 7953 y 9472) el comportamiento no cambia: M3 termina con código
+0 (sin `--strict`), M4 y M5 pueden ejecutarse, no se escribe `state.json` y el
+plan vuelve a incluir la sesión. Las reglas de M3 y el tratamiento de `n_gear`
+no se tocan.
+
+*Estado:* definido en `infra/statemachine/pipeline.asl.json` y cubierto por
+tests locales (`tests/infra/test_state_machine.py` y
+`tests/unit/test_incremental_e2e.py`, que ejecuta los comandos derivados del
+ASL con la CLI real). **No desplegado ni probado en AWS**: aplicarlo requiere un
+change set que actualiza la definición de la state machine (`DefinitionUri`,
+que `sam deploy` empaqueta y sube) y no toca la Task Definition.
 
 **Resultado de ECS y códigos de salida (R3).** Ningún estado desreferencia
 `Containers[0].ExitCode` al terminar la tarea: el resultado completo de

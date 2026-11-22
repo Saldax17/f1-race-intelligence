@@ -5,6 +5,7 @@ reports, and the planner is asked afterwards whether the session may be omitted.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from f1_race_intelligence.scope import SessionScope
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
 from factories import MEETING_KEY, SESSION_KEY, YEAR, car_data_record
-from test_consolidation import build_raw  # noqa: F401 - fixture
+from test_consolidation import DRIVERS, build_raw  # noqa: F401 - fixture
 from test_historical_extraction import make_client
 
 DEFAULT_ENDPOINTS = ["drivers", "laps", "car_data", "position", "intervals", "stints", "pit", "weather", "race_control"]
@@ -283,4 +284,124 @@ def test_a_different_configuration_does_not_reuse_the_decision(build_raw, raw_ro
     data = yaml.safe_load(config.read_text(encoding="utf-8"))
     data["features"]["rolling_windows"] = [2]
     config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    assert reusable(config)[0] is False
+
+
+# -- the commands the state machine really sends ------------------------------------------------
+#
+# The tests above call the CLI with a hand-written scope. These run the stages with the
+# argument lists the state machine builds from a planned work unit, so the definition, the
+# planner's output and the incremental provenance are exercised together.
+
+ASL_PATH = Path(__file__).resolve().parents[2] / "infra" / "statemachine" / "pipeline.asl.json"
+STATE_MACHINE_SESSION_STAGES = (
+    ("M2_Extraction", "m2"),
+    ("M3_Validation", "m3"),
+    ("M4_Consolidation", "m4"),
+    ("M5_Features", "m5"),
+)
+_ARGUMENT = re.compile(r"States\.Format\('\{\}',\s*\$\.session\.(\w+)\)|'([^']*)'")
+
+
+def state_machine_session_commands(unit):
+    """The per-session ECS commands for one plan work unit: ``{stage: argv}``.
+
+    Evaluates only what the definition uses there: ``States.Array`` of string literals and
+    ``States.Format('{}', $.session.<field>)``, with ``$.session`` being the plan unit.
+    """
+    states = json.loads(ASL_PATH.read_text(encoding="utf-8"))["States"]["PerSessionPipeline"]["ItemProcessor"]["States"]
+    commands = {}
+    for state_name, stage in STATE_MACHINE_SESSION_STAGES:
+        expression = states[state_name]["Parameters"]["Overrides"]["ContainerOverrides"][0]["Command.$"]
+        assert expression.startswith("States.Array(") and expression.endswith(")"), expression
+        argv = [
+            str(unit[match.group(1)]) if match.group(1) else match.group(2)
+            for match in _ARGUMENT.finditer(expression[len("States.Array(") :])
+        ]
+        assert argv[:2] == ["--stage", stage]
+        commands[stage] = argv
+    return commands
+
+
+def run_commands(config: Path, commands, client):
+    codes = []
+    for stage, argv in commands.items():
+        kwargs = {"client_factory": lambda settings: client} if stage == "m2" else {}
+        codes.append(cli.main([*argv, "--config", str(config)], **kwargs))
+    return codes
+
+
+def incremental_files(tmp_path: Path, name: str):
+    return list((tmp_path / "manifests_m2" / "incremental").rglob(name))
+
+
+def m3_verdict(config: Path) -> str:
+    store, settings, scope = context(config)
+    _, report = inc._latest_session_report(
+        store, store.root(Layer.VALIDATION_REPORTS, settings.validation.report_path), scope, "data_validation"
+    )
+    return report["global_status"]
+
+
+def test_state_machine_commands_carry_the_scope_that_registers_provenance_and_completion(build_raw, raw_root, tmp_path):
+    build_raw(car_data=None, pit=[])
+    config = write_config(tmp_path, raw_root, DEFAULT_ENDPOINTS)
+    units, _ = plan(config)
+    assert [u["session_key"] for u in units] == [SESSION_KEY]
+    commands = state_machine_session_commands(units[0])
+    for stage, argv in commands.items():
+        parsed = cli.build_parser().parse_args(argv)
+        assert (parsed.year, parsed.meeting_key, parsed.session_key) == (YEAR, MEETING_KEY, SESSION_KEY), stage
+
+    assert run_commands(config, commands, fake_client()) == [0, 0, 0, 0]
+
+    assert m3_verdict(config) in {"PASS", "WARNING"}
+    stages = json.loads(incremental_files(tmp_path, "stages.json")[0].read_text(encoding="utf-8"))["stages"]
+    assert set(stages) == {"m3", "m4", "m5"}  # per-stage provenance, each bound to the previous one
+    assert len(incremental_files(tmp_path, "state.json")) == 1
+    assert reusable(config) == (True, "all M2-M5 artifacts and provenance match")
+    assert plan(config)[0] == []  # the next plan omits it
+
+
+def test_a_failed_validation_keeps_its_behaviour_and_never_completes_the_session(build_raw, raw_root, tmp_path):
+    """The full scope is a precondition for recording provenance, not a way around M3 FAIL."""
+    bad_gear = {
+        driver: [car_data_record(driver, 10.0, n_gear=20), car_data_record(driver, 20.0)] for driver in DRIVERS
+    }
+    build_raw(car_data=bad_gear, pit=[])
+    config = write_config(tmp_path, raw_root, DEFAULT_ENDPOINTS)
+    commands = state_machine_session_commands(plan(config)[0][0])
+
+    # Same exit codes as before: M3 is not run with --strict, so FAIL is recorded, not a task failure.
+    assert run_commands(config, commands, fake_client()) == [0, 0, 0, 0]
+
+    assert m3_verdict(config) == "FAIL"
+    assert incremental_files(tmp_path, "state.json") == []
+    stages = incremental_files(tmp_path, "stages.json")
+    assert not stages or "m3" not in json.loads(stages[0].read_text(encoding="utf-8"))["stages"]
+    assert reusable(config)[0] is False
+    units, decisions = plan(config)
+    assert [u["session_key"] for u in units] == [SESSION_KEY]
+    assert [d["decision"] for d in decisions] == ["include"]
+
+
+def test_stages_started_without_the_meeting_key_cannot_record_the_session(build_raw, raw_root, tmp_path):
+    """What the state machine did before it passed --meeting-key to M3-M5."""
+    build_raw(car_data=None, pit=[])
+    config = write_config(tmp_path, raw_root, DEFAULT_ENDPOINTS)
+    commands = state_machine_session_commands(plan(config)[0][0])
+    for stage in ("m3", "m4", "m5"):
+        at = commands[stage].index("--meeting-key")
+        del commands[stage][at : at + 2]
+
+    assert run_commands(config, commands, fake_client()) == [0, 0, 0, 0]
+
+    # The data is fine (M3 does not fail); the scope is what is missing. The report is filed
+    # under a scope without the meeting, which the full-scope lookup can no longer find.
+    report = json.loads(next((tmp_path / "validation").rglob("*.json")).read_text(encoding="utf-8"))
+    assert report["global_status"] in {"PASS", "WARNING"}
+    assert report["source"]["filter"]["meeting_key"] is None
+    with pytest.raises(inc.SessionStateError):
+        m3_verdict(config)
+    assert incremental_files(tmp_path, "state.json") == []
     assert reusable(config)[0] is False
