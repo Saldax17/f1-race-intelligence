@@ -2,8 +2,10 @@
 
 > **Estado:** `aws_status.json` es la fuente única de verdad versionada. La
 > arquitectura y su código están definidos, y la validación local está
-> registrada allí. El estado de despliegue y las pruebas en AWS real son
-> **NO VERIFICABLES** en ausencia de comprobación humana; este documento no
+> registrada allí. El runtime desplegado en `dev` (sin M7) se verificó con evidencia
+> humana el 2026-11-22 (ver «Despliegue de la imagen `800931b`»); las pruebas
+> funcionales en AWS real de M2–M6 con la imagen vigente siguen
+> **NO VERIFICABLES** hasta que se ejecuten; este documento no
 > reemplaza esa evidencia. No entrena ni publica modelos (sin M7, sin SageMaker).
 
 ## Estructura
@@ -397,12 +399,14 @@ sesiones reales 7953 y 9472) el comportamiento no cambia: M3 termina con código
 plan vuelve a incluir la sesión. Las reglas de M3 y el tratamiento de `n_gear`
 no se tocan.
 
-*Estado:* definido en `infra/statemachine/pipeline.asl.json` y cubierto por
+*Estado:* definido en `infra/statemachine/pipeline.asl.json`, cubierto por
 tests locales (`tests/infra/test_state_machine.py` y
 `tests/unit/test_incremental_e2e.py`, que ejecuta los comandos derivados del
-ASL con la CLI real). **No desplegado ni probado en AWS**: aplicarlo requiere un
-change set que actualiza la definición de la state machine (`DefinitionUri`,
-que `sam deploy` empaqueta y sube) y no toca la Task Definition.
+ASL con la CLI real) y **desplegado en `dev` el 2026-11-21**: la definición
+activa de la state machine ya pasa `--meeting-key` en M2–M5 (ver «Despliegue de
+la corrección de `meeting_key`»). **No se ha ejecutado la state machine** con esa
+definición, así que el registro de procedencia a través de ella sigue validado
+solo en local.
 
 **Resultado de ECS y códigos de salida (R3).** Ningún estado desreferencia
 `Containers[0].ExitCode` al terminar la tarea: el resultado completo de
@@ -485,6 +489,18 @@ la aceptación formal debe registrarla el responsable humano.
 | CVE-2026-119373, -119374, -119379 | sqlite3 3.40.1-2+deb12u2 | sin parche en Bookworm ni en Trixie | **Requieren aceptación** (3) |
 | CVE-2026-85091 | zlib 1:1.2.13.dfsg-1 | corregido solo en Trixie | **Pendiente: evidencia incompleta**; requiere aceptación mientras tanto |
 
+*Imagen `800931b` (2026-11-22).* Commit `800931b5d8011fa94ac82e0cac90805adf5f100e`,
+digest `sha256:8e0f4dfac71aeb1a8a6d9c565395354b2ed9c6b4869b744a7bd7c64eee9fba47`.
+La etiqueta `800931b` apunta a ese digest (verificado en ECR el 2026-11-22). El
+escaneo terminó `COMPLETE` con **15 HIGH, 25 MEDIUM y 5 LOW** (45); esas cifras
+las comunicó el responsable humano y no se volvieron a medir al documentarlas.
+Frente a `3d3b4e6` (15 / 25 / 6) solo cambia LOW: de 6 a 5. Solo se registran los
+resultados medidos: no se comparó hallazgo por hallazgo y no se afirma ninguna
+causa de esa diferencia. `Dockerfile` y `requirements/runtime-lock.txt` son
+idénticos entre `3d3b4e6` y `800931b` (verificado en el repositorio). La tabla de
+CVE anterior y el tratamiento de los 12 riesgos sin aceptar corresponden a
+`3d3b4e6` y **no se han revalidado** para `800931b`; la aceptación sigue pendiente.
+
 *Mitigaciones de configuración (verificadas en la imagen y en la ejecución de la
 tarea).* CVE-2026-53613 y -78410 exigen un `mount` setuid con una entrada
 `fstab` de usuario: la imagen no tiene ningún fichero setuid/setgid (el build lo
@@ -528,6 +544,10 @@ conectividad con OpenF1 no se ha probado; se verifica en la primera ejecución
 controlada.
 
 **Publicar y activar (fase posterior, con aprobación)**
+
+*Estado (2026-11-22):* los pasos 1 y 2 están hechos para la imagen `800931b`
+(ver «Despliegue de la imagen `800931b`»). El 3 (primera ejecución controlada) y
+el 4 siguen pendientes.
 
 1. Publicar la imagen y anotar su **digest de manifiesto**.
 2. Desplegar con `PipelineImageUri=<repositorio>@sha256:<digest>` (añadirlo a
@@ -623,7 +643,7 @@ temporal, ya eliminada).
   identidad; no se hizo una prueba real de acceso tras la retirada ni se volvió a
   consultar la política del bucket.
 
-### F. Estado final de AWS
+### F. Estado final de AWS (al cierre del smoke, 2026-11-21)
 
 | Elemento | Estado |
 |---|---|
@@ -636,7 +656,7 @@ temporal, ya eliminada).
 | `AvailabilityScheduleState` | `DISABLED` |
 | Regla de calendario de EventBridge | `DISABLED` |
 
-### Probado en AWS y solo validado en local
+### Probado en AWS y solo validado en local (al 2026-11-21, imagen `3d3b4e6`)
 
 | Probado en AWS (con datos sintéticos) | Solo validado en local, no probado en AWS |
 |---|---|
@@ -645,6 +665,81 @@ temporal, ya eliminada).
 | `copy-raw`, M3, M4 y M5 leyendo y escribiendo S3 | La state machine real: exit codes vía `runTask.sync`, `listExecutions` y el ámbito IAM de `DescribeTasks`/`StopTask` |
 | Logs en CloudWatch | Escrituras reales en las raíces operativas del rol de datos (solo se simularon con el simulador de IAM) |
 | Retirada del permiso temporal (simulador de IAM) | Activación del pipeline y del calendario |
+| Definición activa de la state machine con `--meeting-key` en M2–M5 (leída de Step Functions) | Una ejecución real de la state machine con esa definición (no se ha iniciado ninguna) |
+
+## Despliegue de la corrección de `meeting_key` (2026-11-21)
+
+**Procedencia:** medido con la AWS CLI durante el despliegue (lecturas de
+CloudFormation, Step Functions, ECS e IAM); no se puede comprobar desde el
+repositorio (AGENTS.md §6). `aws_status.json` no se modificó en esa fecha (se actualizó el 2026-11-22). Los ARN
+completos contienen el ID de cuenta y no se versionan.
+
+| Elemento | Resultado |
+|---|---|
+| Change set | `update-state-machine-meeting-key-20261121` (`d731a3d2-f46c-498c-a625-36e044a76ecd`), ejecutado el 2026-11-21 a las 20:08 hora local (UTC−5), es decir, 2026-11-22 01:08 UTC |
+| Contenido | un único cambio: `Modify` de `PipelineStateMachine`, sin reemplazo, solo `DefinitionS3Location` y sin recursos dependientes |
+| Resultado | stack `f1-race-intelligence-dev` en `UPDATE_COMPLETE`; solo `PipelineStateMachine` registró eventos de actualización |
+| Definición activa | M2, M3, M4 y M5 incluyen `--meeting-key` con `$.session.meeting_key`; sus comandos son idénticos a los del ASL de `master`. Frente a la definición anterior hay 6 diferencias (3 comandos y 3 comentarios); estados, transiciones y el comando de M6 no cambian |
+| Sin cambios | Task definition (revisión 1, la única `ACTIVE`, digest `sha256:b4c0f5012acd02062d0bb236e99b4cd55ecc4545fe4054a35618ca0a80cd5fdf`), imagen (`PipelineImageUri`), los 5 roles IAM (políticas inline, relación de confianza y ARN, comparados con una línea base tomada antes del cambio) y los 13 parámetros (`UsePreviousValue`) |
+| Siguen deshabilitados | `PipelineEnabled=false`, `AvailabilityScheduleState=DISABLED` y la regla de calendario de EventBridge `DISABLED` |
+| Actividad | 0 tareas ECS; ninguna ejecución nueva de Step Functions (la última es la del 2026-10-23); 6 de 6 alarmas en `OK` |
+
+**Cómo se aplicó.** El change set se preparó a partir de la plantilla ya
+desplegada, cambiando solo la clave `DefinitionS3Location` (el ASL corregido se
+subió como artefacto de despliegue de SAM), y no desde la plantilla completa de
+`master`, porque esta incluye M7 (ver «Pendientes abiertos», punto 2). No se usó
+`sam deploy`.
+
+**Alcance.** La definición está actualizada; no se ejecutó la state machine, no se
+iniciaron tareas ECS ni se llamó a OpenF1. Esta corrección solo transmite el
+ámbito completo de sesión: no convierte una validación `FAIL` en una sesión
+completada (ver punto 3 de «Pendientes abiertos»).
+
+## Despliegue de la imagen `800931b` (2026-11-22)
+
+**Procedencia:** medido con la AWS CLI durante el despliegue (lecturas de
+CloudFormation, ECR, ECS, Step Functions, SNS, IAM y CloudWatch); no se puede
+comprobar desde el repositorio. Los ARN completos contienen el ID
+de cuenta y no se versionan; tampoco el correo de alertas ni el detalle de las
+políticas IAM. Los resultados del escaneo y el commit de origen de la imagen los
+comunicó el responsable humano.
+
+| Elemento | Resultado |
+|---|---|
+| Change set | `update-pipeline-image-800931b-20261122-v2`, ejecutado el 2026-11-22 (≈22:00 UTC) sobre la plantilla ya desplegada (`--use-previous-template`), tipo UPDATE |
+| Parámetros | solo cambió `PipelineImageUri`; los otros 12, incluido `AlertEmail`, se conservaron con `UsePreviousValue` |
+| Contenido | exactamente dos cambios: `PipelineTaskDefinition` (`Modify`, con reemplazo) y `PipelineStateMachine` (`Modify`, sin reemplazo, por `DefinitionSubstitutions`). Sin cambios IAM, de red, bucket, alarmas, Lambdas ni recursos de M7; `AlertEmailSubscription` no figuraba |
+| Resultado | stack `f1-race-intelligence-dev` en `UPDATE_COMPLETE`, sin errores |
+| Imagen | etiqueta `800931b`, digest `sha256:8e0f4dfac71aeb1a8a6d9c565395354b2ed9c6b4869b744a7bd7c64eee9fba47` (antes `sha256:b4c0f501…5fdf`); escaneo `COMPLETE`: 15 HIGH, 25 MEDIUM, 5 LOW |
+| Task definition | **revisión 2**, `ACTIVE`, con ese digest; la revisión 1 quedó `INACTIVE`. Fuera de la imagen, las propiedades son idénticas a las de la revisión 1 (512 CPU, 1024 MB, `awsvpc`, Fargate `X86_64`, usuario, raíz de solo lectura, capacidades y logging) |
+| State machine | `f1-race-intelligence-dev-pipeline`, `ACTIVE`; su definición referencia la revisión 2 y ya no la 1 (la definición ASL es la del 2026-11-21, con `--meeting-key`) |
+| Alertas | `AlertEmailSubscription` conservada con la misma `PhysicalResourceId`; `PendingConfirmation=false` en SNS |
+| IAM | los 5 roles sin cambios (relación de confianza, políticas inline y adjuntas idénticas a la línea base previa) |
+| Siguen deshabilitados | `PipelineEnabled=false`, `AvailabilityScheduleState=DISABLED` y la regla de calendario de EventBridge `DISABLED` |
+| Actividad | 6 de 6 alarmas en `OK`; 0 tareas ECS; ninguna ejecución nueva de Step Functions (la última es la del 2026-10-23) |
+
+**Alcance.** Se actualizó el runtime (imagen, task definition y referencia de la
+state machine). **No se ejecutó M2–M6 con esta imagen**: no se lanzó ninguna tarea
+ECS ni la state machine, no se llamó a OpenF1 y no se activó el pipeline ni el
+calendario. El smoke sintético del 2026-11-21 («Validación de runtime AWS») se
+hizo con la revisión 1 y la imagen `3d3b4e6`, y por tanto **no es evidencia de
+`800931b`**. La plantilla desplegada es la anterior a M7 (ver «Pendientes
+abiertos», punto 2): M7 no está desplegado.
+
+**Código nuevo sin probar en Fargate.** `800931b` desciende de `3d3b4e6` y entre
+ambos hay 40 archivos cambiados, entre ellos el PR #22 (`git diff --stat`,
+verificado en el repositorio). Que esa imagen arranque y ejecute M2–M6 en Fargate
+está sin probar; se verifica en la primera ejecución controlada («Publicar y
+activar», paso 3).
+
+**Lección sobre los change sets.** Un primer change set
+(`update-pipeline-image-800931b-20261122`) omitió `AlertEmail` de los parámetros:
+el valor tomó el `Default` vacío, `HasAlertEmail` pasó a falso y CloudFormation
+planificó eliminar `AlertEmailSubscription`. Nunca se ejecutó y se eliminó. Al
+crear un change set sobre la plantilla desplegada hay que pasar los 13 parámetros,
+con `UsePreviousValue=true` en los que no cambian, y revisar con
+`describe-change-set --include-property-values` que la lista de cambios sea
+exactamente la esperada antes de ejecutarlo.
 
 ## Validar (sin tocar AWS)
 
@@ -979,3 +1074,64 @@ que el reintento no choque con sus nombres fijos.
   chequeo daría 404 → `openf1_error`. Cambiarlo es editar
   `OPENF1_PROBE_PATH`.
 - El rol de datos da `ListBucket` sobre todo el bucket (ver arriba).
+
+## Pendientes abiertos (actualizado el 2026-11-22)
+
+Tres asuntos independientes entre sí. Ninguno se resuelve en este cambio.
+
+### 1. Aviso W3005 en `ForecastFunctionLogGroup`
+
+`sam validate --lint` sobre la plantilla de `master` (`800931b`) termina con
+código 1 por un único aviso, `W3005`: `ForecastFunctionLogGroup` figura en
+`DependsOn` de `ForecastFunction`, pero esa dependencia ya la impone el `Ref` de
+`LoggingConfig.LogGroup`. Lo introdujo el PR #22 (M7); la plantilla anterior
+pasaba el lint. No tiene efecto funcional, pero DEFINITION_OF_DONE exige que el
+lint pase, así que la plantilla de `master` no puede darse por validada con él.
+Pendiente: retirar ese `DependsOn` en un cambio aparte.
+
+### 2. Divergencia entre la plantilla desplegada y `master` (M7)
+
+- **Desplegado:** 44 recursos y 13 parámetros (la plantilla enviada al stack).
+- **`master`:** el PR #22 añade 19 recursos, 3 salidas y 5 parámetros
+  (`ModelTrainingSchedule`, `ModelUpdateSchedule`, `ModelScheduleState`,
+  `LiveForecastScheduleState`, `ForecastImageUri`).
+- **Con los parámetros actuales** (`PipelineImageUri` no vacío,
+  `ForecastImageUri` vacío), un despliegue de `master` crearía 14 de esos
+  recursos: 7 incondicionales (repositorio ECR del pronóstico, 3 log groups y
+  3 roles) y 7 por `HasPipelineImage` (task definition, rol y state machine del
+  modelo, rol de calendario, 2 reglas de calendario y una alarma). Los 5 de la
+  Lambda de pronóstico requieren `ForecastImageUri`. Las reglas de calendario del
+  modelo y del pronóstico se crean con estado `DISABLED` por defecto. Este
+  recuento sale de leer la plantilla y sus condiciones, **no de un change set**.
+- **Imagen:** desde el 2026-11-22 la desplegada es `800931b`
+  (`sha256:8e0f4dfa…ba47`), comunicada como construida desde el commit
+  `800931b5d8011fa94ac82e0cac90805adf5f100e` (dato reportado), que incluye el PR
+  #22. El código de ese commit contiene las etapas de M7 y los endpoints nuevos de
+  M2 descritos en «Modelo de carrera (M7)»; la **plantilla** desplegada sigue sin
+  los recursos de M7 y esa imagen no se ha ejecutado todavía. La imagen anterior
+  (`sha256:b4c0f501…5fdf`, de `3d3b4e6`) era anterior al PR #22.
+- **Mientras tanto:** los cambios a la state machine se aplican con change sets
+  mínimos sobre la plantilla desplegada, como los del 2026-11-21 y 2026-11-22; un `sam deploy`
+  directo desde `master` no debe usarse sin revisar antes su change set.
+  Alinear el stack con `master` (o no) es decisión del responsable humano.
+
+### 3. Sesiones reales 7953 y 9472: M3 en `FAIL` por `n_gear`
+
+| Sesión | M3 | Hallazgos | Evidencia |
+|---|---|---|---|
+| 2023 / meeting 1141 / **7953** | `FAIL` | 2 errores `values`: `n_gear` fuera de 0–8 en los pilotos 4 (32 registros) y 81 (31) | Fargate (2026-11-21): 113 reglas, informe `validated/year=2023/session=7953/validation_report_20261121T232645786678Z.json`; local con el código actual: 120 reglas |
+| 2024 / meeting 1229 / **9472** | `FAIL` | 1 error `values`: `n_gear` en el piloto 2 (54 registros); 1 aviso `missing_values`: `pit.stop_duration` nulo al 100 % | Local con el código actual: 120 reglas (no está en S3) |
+
+Los hallazgos de ambas sesiones coinciden con los del informe local del
+2026-09-09. Los valores fuera de rango son ráfagas de 8 a 13 segundos antes de la
+salida, con el coche parado (velocidad 0, rpm ≈ 4000) y marchas crecientes de 9
+a 75, en el 0,09–0,16 % de las filas de cada piloto afectado. M4 enmascara esas
+muestras (`n_gear <= MAX_GEAR`).
+
+Consecuencia: con M3 en `FAIL` no se registra procedencia, no se escribe
+`state.json` y la sesión no se completa, de modo que el plan la reincluye y
+`--require-complete-history` de M6 la ve incompleta. Ni las reglas de M3 ni el
+tratamiento de `n_gear` se han modificado. En AWS no se ha ejecutado M4 ni M5
+sobre estas sesiones (solo M2 y M3 sobre la 7953); en local, M4 y M5 sí corrieron
+el 2026-09-09 sobre las dos con M3 en `FAIL`, sin perder filas. Pendiente de
+decisión: si el glitch debe seguir siendo un error de M3.

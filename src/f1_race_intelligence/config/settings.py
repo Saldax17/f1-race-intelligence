@@ -327,6 +327,43 @@ class ModelingSettings(BaseModel):
     """Refuse to write anything when a blocking guard fails."""
 
 
+DEFAULT_LINEAR_REGISTERED_MODEL_NAME = "f1-next-lap-linear-regression"
+DEFAULT_MLP_REGISTERED_MODEL_NAME = "f1-next-lap-mlp"
+
+
+class MLPSettings(BaseModel):
+    """Hyperparameters for the M7 PyTorch CPU-only tabular MLP."""
+
+    registered_model_name: Optional[str] = None
+    hidden_dims: List[int] = Field(default_factory=lambda: [64, 32])
+    dropout: float = Field(default=0.1, ge=0.0, lt=1.0, allow_inf_nan=False)
+    learning_rate: float = Field(default=1e-3, gt=0.0, allow_inf_nan=False)
+    weight_decay: float = Field(default=1e-4, ge=0.0, allow_inf_nan=False)
+    batch_size: int = Field(default=64, ge=1)
+    max_epochs: int = Field(default=100, ge=1)
+    early_stopping_patience: int = Field(default=10, ge=1)
+    min_delta: float = Field(default=1e-4, ge=0.0, allow_inf_nan=False)
+    loss: Literal["huber", "mse"] = "huber"
+    scale_target: bool = True
+    lr_scheduler: Literal["none", "reduce_on_plateau"] = "reduce_on_plateau"
+    lr_scheduler_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
+    lr_scheduler_patience: int = Field(default=5, ge=1)
+    lr_scheduler_min_lr: float = Field(default=1e-6, ge=0.0, allow_inf_nan=False)
+    compute_permutation_importance: bool = True
+    permutation_importance_repeats: int = Field(default=5, ge=1)
+    permutation_importance_top_k: int = Field(default=10, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_mlp_settings(self) -> "MLPSettings":
+        if not self.hidden_dims or any(dim <= 0 for dim in self.hidden_dims):
+            raise ValueError(
+                f"training.mlp.hidden_dims must contain at least one positive integer, got {self.hidden_dims!r}"
+            )
+        if self.registered_model_name is not None and not self.registered_model_name.strip():
+            raise ValueError("training.mlp.registered_model_name must be a non-empty string when set")
+        return self
+
+
 class TrainingSettings(BaseModel):
     """Local tracking and report locations for M7 training runs."""
 
@@ -335,7 +372,32 @@ class TrainingSettings(BaseModel):
     artifact_path: str = "data/mlflow/artifacts"
     output_path: str = "data/modeling/training/reports"
     experiment_name: str = "f1-race-intelligence"
-    registered_model_name: str = "f1-next-lap-linear-regression"
+    model_type: Literal["linear_regression", "mlp"] = "linear_regression"
+    registered_model_name: str = DEFAULT_LINEAR_REGISTERED_MODEL_NAME
+    mlp: MLPSettings = Field(default_factory=MLPSettings)
+
+    @model_validator(mode="after")
+    def _validate_registered_model_name(self) -> "TrainingSettings":
+        if not self.registered_model_name.strip():
+            raise ValueError("training.registered_model_name must be a non-empty string")
+        return self
+
+    def effective_registered_model_name(self, model_type: Optional[str] = None) -> str:
+        """Resolve the MLflow registered model name for ``model_type``."""
+        selected = self.model_type if model_type is None else model_type
+        if selected == "linear_regression":
+            return self.registered_model_name
+        if selected == "mlp":
+            if self.mlp.registered_model_name is not None:
+                return self.mlp.registered_model_name
+            if self.registered_model_name != DEFAULT_LINEAR_REGISTERED_MODEL_NAME:
+                return self.registered_model_name
+            return DEFAULT_MLP_REGISTERED_MODEL_NAME
+        raise ValueError(
+            f"Unsupported training model_type {selected!r}; expected 'linear_regression' or 'mlp'"
+        )
+
+
 class RaceModelSettings(BaseModel):
     """The in-race position forecaster (M7): what it trains on and how it is scored.
 

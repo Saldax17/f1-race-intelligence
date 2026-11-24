@@ -40,6 +40,8 @@ data/mlflow/
 # Local rehearsal of the S3 data lake layout, and ad-hoc run outputs
 data/lake/
 data/smoke/
+# Local MLflow tracking database and artifact store (M7)
+data/mlflow/
 
 # Development log files (logs always go to stdout as well)
 logs/
