@@ -26,6 +26,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
+from f1_race_intelligence.race_model.contracts import (
+    verify_version_package,
+    write_version_manifest,
+)
 from f1_race_intelligence.storage.backends.base import join_key
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
@@ -69,6 +73,7 @@ class ModelArtifact:
     transition: Dict[str, Any]
     races: List[Dict[str, Any]]
     metrics: Dict[str, Any] = field(default_factory=dict)
+    provenance: Dict[str, Any] = field(default_factory=dict)
     parent_version: Optional[str] = None
     format: str = FORMAT
 
@@ -79,18 +84,26 @@ class ModelArtifact:
     def from_dict(cls, data: Mapping[str, Any]) -> "ModelArtifact":
         if data.get("format") != FORMAT:
             raise ValueError(f"unsupported model format {data.get('format')!r} (expected {FORMAT})")
-        return cls(**{k: data.get(k) for k in cls.__dataclass_fields__})
+        kwargs = {k: data.get(k) for k in cls.__dataclass_fields__}
+        if kwargs.get("metrics") is None:
+            kwargs["metrics"] = {}
+        if kwargs.get("provenance") is None:
+            kwargs["provenance"] = {}
+        return cls(**kwargs)
 
 
 class ModelRegistry:
-    """Reads and writes model versions and the ``latest`` pointer."""
+    """Reads and writes immutable model versions, SHA-256 manifests and ``latest``."""
 
     def __init__(self, store: DataStore, output_path: str) -> None:
         self.store = store
         self.prefix = models_prefix(store, output_path)
 
+    def version_prefix(self, version: str) -> str:
+        return join_key(self.prefix, f"version={version}")
+
     def version_key(self, version: str) -> str:
-        return join_key(self.prefix, f"version={version}", "model.json")
+        return join_key(self.version_prefix(version), "model.json")
 
     @property
     def latest_key(self) -> str:
@@ -101,7 +114,39 @@ class ModelRegistry:
         data = json.dumps(artifact.to_dict(), separators=(",", ":"), default=float).encode("utf-8")
         if not self.store.backend.write_bytes_if_absent(key, data, content_type="application/json"):
             raise FileExistsError(f"model version {artifact.version} already exists at {self.store.backend.uri(key)}")
+        write_version_manifest(
+            self.store.backend,
+            self.version_prefix(artifact.version),
+            version=artifact.version,
+            created_at=artifact.created_at,
+            model_format=artifact.format,
+            model_bytes=data,
+            provenance=artifact.provenance,
+            parent_version=artifact.parent_version,
+        )
         return self.store.backend.uri(key)
+
+    def read_model_bytes(self, version: Optional[str] = None) -> bytes:
+        version = version or self.latest_version()
+        if version is None:
+            raise LookupError(f"no promoted model at {self.store.backend.uri(self.latest_key)}; run m7-train and m7-evaluate --promote")
+        return self.store.backend.read_bytes(self.version_key(version))
+
+    def verify(self, version: Optional[str] = None) -> Dict[str, Any]:
+        version = version or self.latest_version()
+        if version is None:
+            return {
+                "ok": False,
+                "version": None,
+                "files_checked": 0,
+                "errors": [f"no promoted model at {self.store.backend.uri(self.latest_key)}"],
+            }
+        return verify_version_package(
+            self.store.backend,
+            self.version_prefix(version),
+            version,
+            expected_format=FORMAT,
+        )
 
     def load(self, version: Optional[str] = None) -> ModelArtifact:
         version = version or self.latest_version()

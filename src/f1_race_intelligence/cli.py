@@ -66,7 +66,7 @@ EXIT_DEFERRED = 3
 
 STAGES = (
     "plan", "m2", "m3", "m4", "m5", "m6", "verify-m6", "m7", "m7-compare", "copy-raw",
-    "m7-train", "m7-evaluate", "m7-update", "m7-forecast",
+    "m7-train", "m7-evaluate", "m7-update", "m7-forecast", "verify-m7",
 )
 
 
@@ -168,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="m7-evaluate --split test: the final, recorded look at the sealed test races")
     model.add_argument("--allow-repeat-test", action="store_true",
                        help="m7-evaluate --split test: allow a second look (the ledger counts it)")
+    model.add_argument("--log-mlflow", action="store_true",
+                       help="m7-evaluate: log metrics, reports and pyfunc artifact to local MLflow (requires training extra)")
 
     storage = parser.add_argument_group("storage")
     storage.add_argument("--storage-backend", choices=["local", "s3"])
@@ -567,8 +569,13 @@ def run_m7_evaluate(ctx: RunContext) -> StageOutcome:
         _race_model(ctx).evaluate(
             version=args.model_version, split=args.split, promote=args.promote, scenarios=args.scenarios,
             unseal_test=args.unseal_test, allow_repeat_test=args.allow_repeat_test,
+            log_mlflow=bool(args.log_mlflow or ctx.settings.race_model.log_mlflow),
         )
     )
+
+
+def run_verify_m7(ctx: RunContext) -> StageOutcome:
+    return _outcome(_race_model(ctx).verify(version=ctx.args.model_version))
 
 
 def run_m7_update(ctx: RunContext) -> StageOutcome:
@@ -596,6 +603,7 @@ STAGE_RUNNERS: Dict[str, Callable[[RunContext], StageOutcome]] = {
     "m7-evaluate": run_m7_evaluate,
     "m7-update": run_m7_update,
     "m7-forecast": run_m7_forecast,
+    "verify-m7": run_verify_m7,
     "plan": run_plan,
     "m2": run_m2,
     "m3": run_m3,
@@ -710,6 +718,8 @@ def main(
             raise ValueError("--registered-model-name is only valid with --stage m7 or m7-compare")
         if args.register_best and "m7-compare" not in stages:
             raise ValueError("--register-best is only valid with --stage m7-compare")
+        if args.log_mlflow and "m7-evaluate" not in stages:
+            raise ValueError("--log-mlflow is only valid with --stage m7-evaluate")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
         if args.plan_output:

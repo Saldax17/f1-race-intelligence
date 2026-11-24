@@ -35,6 +35,8 @@ data/consolidation/*
 !data/consolidation/.gitkeep
 data/modeling/*
 !data/modeling/.gitkeep
+data/models/
+data/mlflow/
 # Local rehearsal of the S3 data lake layout, and ad-hoc run outputs
 data/lake/
 data/smoke/

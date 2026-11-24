@@ -470,9 +470,13 @@ class RaceModelSettings(BaseModel):
     """Training races (the latest ones) used to pick the noise multiplier."""
     random_seed: int = 42
 
-    # promotion
+    # promotion & optional local MLflow tracking
     promote_requires_beating: str = "persist"
     """Baseline the candidate must beat on validation mean RPS before it becomes ``latest``."""
+    log_mlflow: bool = False
+    """Log evaluation metrics, artifacts and pyfunc version to local MLflow (requires ``training`` extra)."""
+    registered_model_name: str = "f1-race-position-model"
+    """Model Registry name used when ``log_mlflow`` or ``--log-mlflow`` is enabled."""
 
 
 class AppSettings(BaseModel):

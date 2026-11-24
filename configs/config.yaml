@@ -283,3 +283,7 @@ race_model:
   # A new version becomes "latest" only if it beats this baseline on
   # validation mean RPS.
   promote_requires_beating: "persist"
+  # Optional local MLflow tracking & Model Registry logging (requires the
+  # optional "training" extra; always false in AWS Fargate batch containers).
+  log_mlflow: false
+  registered_model_name: "f1-race-position-model"
