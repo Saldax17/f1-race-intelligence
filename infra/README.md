@@ -829,6 +829,38 @@ etiqueta corta solo nombra la imagen; el commit exacto queda en la imagen y
 en los reportes de M6. El digest que se pasa en `PipelineImageUri` es el que
 devuelve `docker push`.
 
+### PyArrow sin zstd (CVE-2026-124851)
+
+**Estado: definido en `Dockerfile` y `Dockerfile.forecast`; construido y probado
+solo en local. No se ha publicado en ECR ni desplegado.**
+
+CVE-2026-124851 (divulgación de memoria al descomprimir; zstd 1.5.1–1.5.7, corregido
+en 1.6.0) tenía dos copias en las imágenes y parchear una no elimina la otra:
+
+| Copia | Imagen batch (Debian trixie) | Imagen Lambda (Amazon Linux 2023) |
+|---|---|---|
+| `libzstd` del sistema | `libzstd1=1.5.7+dfsg-1+deb13u1` (DSA-6657-1), fijada y comprobada en el build | Sin paquete corregido: los repositorios de AL2023 no ofrecen nada posterior a 1.5.5. Se retira con `rpm --erase` (lo usan solo rpm/microdnf/libarchive) y el build falla si queda algún `libzstd*` |
+| zstd 1.5.7 enlazado estáticamente en `libarrow` | PyArrow 25.0.1 compilado sin zstd | PyArrow 25.0.1 compilado en su propia base AL2023 |
+
+Todos los wheels de PyPI de PyArrow (25.0.x y 26.0.1) incluyen ese zstd 1.5.7, así
+que cambiar de versión no lo arregla. Por eso `docker/build-pyarrow-without-zstd.sh`
+compila Arrow C++ 25.0.1 desde la versión oficial de Apache (SHA-256 fijado) con
+`ARROW_WITH_ZSTD=OFF`, y luego PyArrow contra él (`PYARROW_BUNDLE_ARROW_CPP=ON`).
+Las herramientas de compilación están fijadas en `requirements/arrow-build-lock.txt`.
+`PYARROW_WITH_ZSTD` no existe: la opción está solo en Arrow C++.
+
+- **Se conserva:** Parquet con SNAPPY (también gzip), `pandas.read_parquet(engine="pyarrow")`,
+  `requirements/runtime-lock.txt` sin cambios (las imágenes lo instalan salvo la línea
+  de `pyarrow`, y fallan si deja de fijar exactamente `pyarrow==25.0.1`).
+- **Se pierde a propósito:** los códecs zstd, lz4, brotli y bz2 de PyArrow. Un Parquet o
+  Feather comprimido con ellos se rechaza con `ArrowNotImplementedError`. El pipeline
+  escribe SNAPPY.
+- **Coste:** la primera compilación tarda unos 15 minutos (se recomiendan ≥ 8 GB de RAM)
+  y se reutiliza de la caché de capas mientras no cambien el script, el lock de
+  herramientas ni el digest de la base.
+- **Al subir PyArrow:** hay que actualizar a la vez la línea del lock, `ARROW_VERSION` y
+  `ARROW_SHA256` del script y las comprobaciones de los Dockerfiles; si no, el build falla.
+
 ## Alertas por correo (`AlertEmail`)
 
 El topic `…-critical-alerts` recibe las alarmas de CloudWatch y los fallos de la
