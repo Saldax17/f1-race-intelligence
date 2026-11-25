@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 
 from f1_race_intelligence.consolidation.runner import ConsolidationRunner
+from f1_race_intelligence.validation.gate import ValidationGateBlocked
 from factories import (
     MEETING_KEY,
     MEETING_RECORD,
@@ -507,29 +508,42 @@ def test_an_already_consolidated_session_is_skipped(build_raw, consolidation_set
 def write_validation_report(directory: Path, status: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "validation_report_20230305T120000000000Z.json").write_text(
-        json.dumps({"global_status": status, "summary": {"errors": 0}}), encoding="utf-8"
+        json.dumps({"global_status": status, "summary": {"errors": 0}, "source": {"filter": None}}), encoding="utf-8"
     )
 
 
-def test_a_failing_validation_does_not_block_but_is_recorded(build_raw, consolidation_settings, tmp_path) -> None:
+def test_a_failing_validation_blocks_before_anything_is_written(build_raw, consolidation_settings, tmp_path) -> None:
     build_raw()
     write_validation_report(tmp_path / "validation", "FAIL")
+
+    for settings in (consolidation_settings(), consolidation_settings(require_validation_pass=True)):
+        with pytest.raises(ValidationGateBlocked, match="FAIL"):
+            ConsolidationRunner(settings).run()
+
+    assert not list((tmp_path / "processed").rglob("*"))
+    assert not list((tmp_path / "consolidation").rglob("*"))
+
+
+def test_a_warning_validation_does_not_block_but_is_recorded(build_raw, consolidation_settings, tmp_path) -> None:
+    build_raw()
+    write_validation_report(tmp_path / "validation", "WARNING")
 
     report = ConsolidationRunner(consolidation_settings()).run()
 
     assert report.summary()["sessions_processed"] == 1
-    assert report.source_validation["status"] == "FAIL"
+    assert report.source_validation["status"] == "WARNING"
     assert "consolidated anyway" in report.source_validation["note"].lower()
 
 
 def test_require_validation_pass_stops_the_run(build_raw, consolidation_settings, tmp_path) -> None:
+    """The stricter, optional setting still demands PASS: a WARNING stops it."""
     build_raw()
-    write_validation_report(tmp_path / "validation", "FAIL")
+    write_validation_report(tmp_path / "validation", "WARNING")
 
     report = ConsolidationRunner(consolidation_settings(require_validation_pass=True)).run()
 
     assert report.aborted is not None
-    assert "FAIL" in report.aborted
+    assert "WARNING" in report.aborted
     assert report.summary()["sessions_processed"] == 0
     assert not list((tmp_path / "processed").rglob("*.parquet"))
 

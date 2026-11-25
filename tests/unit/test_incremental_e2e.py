@@ -372,8 +372,10 @@ def test_a_failed_validation_keeps_its_behaviour_and_never_completes_the_session
     config = write_config(tmp_path, raw_root, DEFAULT_ENDPOINTS)
     commands = state_machine_session_commands(plan(config)[0][0])
 
-    # Same exit codes as before: M3 is not run with --strict, so FAIL is recorded, not a task failure.
-    assert run_commands(config, commands, fake_client()) == [0, 0, 0, 0]
+    # M3 runs with --strict (as in the state machine): FAIL is a task failure, and M4/M5 refuse to
+    # build on it even when launched directly.
+    assert run_commands(config, commands, fake_client()) == [0, 1, 1, 1]
+    assert not list(tmp_path.rglob("*.parquet"))
 
     assert m3_verdict(config) == "FAIL"
     assert incremental_files(tmp_path, "state.json") == []

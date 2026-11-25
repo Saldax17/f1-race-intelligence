@@ -268,8 +268,18 @@ def run_plan(ctx: RunContext) -> StageOutcome:
     years = [ctx.scope.year] if ctx.scope.year is not None else None
     client = ctx.client_factory(ctx.settings)
     with HistoricalExtractionPipeline(ctx.settings, client=client, store=ctx.output_store) as pipeline:
-        units = pipeline.plan(years, refresh_catalogs=ctx.args.refresh_catalogs)
+        units = pipeline.plan(
+            years,
+            refresh_catalogs=ctx.args.refresh_catalogs,
+            meeting_key=ctx.scope.meeting_key,
+            session_key=ctx.scope.session_key,
+        )
         plan = {"sessions": units, "decisions": pipeline.plan_decisions}
+    if not ctx.scope.is_empty and ctx.scope.meeting_key is not None and not pipeline.plan_decisions:
+        return StageOutcome(
+            ok=False,
+            reason=f"the requested scope {ctx.scope.log_fields()} matches no configured session in the catalogue",
+        )
 
     if ctx.args.plan_output:
         location = write_plan(ctx.args.plan_output, plan, ctx.settings.storage)
@@ -371,10 +381,34 @@ def run_m3(ctx: RunContext) -> StageOutcome:
     )
 
 
+def m3_gate_outcome(
+    ctx: RunContext,
+    stage: str,
+    scope: SessionScope,
+    years: Optional[Sequence[int]] = None,
+    report_path: Optional[str] = None,
+) -> Optional[StageOutcome]:
+    """A failed outcome when the stored M3 verdict forbids ``stage``.
+
+    The runners enforce the same policy (``validation.gate``) themselves; this early
+    check only keeps the CLI from capturing stage inputs, or reading anything else, first.
+    """
+    from f1_race_intelligence.validation.gate import check_validation_gate
+
+    reason = check_validation_gate(ctx.input_store, ctx.settings, scope, years=years, report_path=report_path)
+    if reason is None:
+        return None
+    logger.error("m3_gate_blocked", extra={"stage": stage, "reason": reason})
+    return StageOutcome(ok=False, reason=f"M3 gate blocks {stage}: {reason}")
+
+
 def run_m4(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.consolidation.runner import ConsolidationRunner
     from f1_race_intelligence.pipelines.incremental import capture_stage_inputs, record_stage_provenance
 
+    blocked = m3_gate_outcome(ctx, "m4", ctx.scope, report_path=ctx.settings.consolidation.validation_path)
+    if blocked is not None:
+        return blocked
     stage_inputs, capture_reason = (
         capture_stage_inputs(ctx.output_store, ctx.settings, ctx.scope, "m4")
         if ctx.scope.is_session
@@ -411,6 +445,9 @@ def run_m5(ctx: RunContext) -> StageOutcome:
     from f1_race_intelligence.features.runner import FeatureRunner
     from f1_race_intelligence.pipelines.incremental import capture_stage_inputs, record_session_completion, record_stage_provenance
 
+    blocked = m3_gate_outcome(ctx, "m5", ctx.scope)
+    if blocked is not None:
+        return blocked
     stage_inputs, capture_reason = (
         capture_stage_inputs(ctx.output_store, ctx.settings, ctx.scope, "m5")
         if ctx.scope.is_session
@@ -458,6 +495,11 @@ def run_m6(ctx: RunContext) -> StageOutcome:
 
     if not ctx.scope.is_empty:
         logger.warning("m6_ignores_scope", extra={"reason": "the split needs the whole history; use modeling.years"})
+    from f1_race_intelligence.validation.gate import modeling_gate_years
+
+    blocked = m3_gate_outcome(ctx, "m6", SessionScope(), modeling_gate_years(ctx.settings))
+    if blocked is not None:
+        return blocked
     if ctx.args.require_complete_history:
         from f1_race_intelligence.pipelines.incremental import history_completeness
 
@@ -722,6 +764,11 @@ def main(
             raise ValueError("--log-mlflow is only valid with --stage m7-evaluate")
         if "m2" in stages and args.session_key is not None and args.year is None:
             raise ValueError("m2 for one session needs --year as well as --session-key")
+        if "plan" in stages and (args.meeting_key is not None or args.session_key is not None):
+            if args.year is None or args.meeting_key is None:
+                raise ValueError("plan for a meeting or session needs --year and --meeting-key (and --session-key for one session)")
+            if len(stages) != 1:
+                raise ValueError("plan with --meeting-key/--session-key must run alone")
         if args.plan_output:
             parse_plan_destination(args.plan_output)  # fail before any OpenF1 call
         settings = load_settings(args.config, overrides=settings_overrides(args))

@@ -1216,6 +1216,22 @@ idempotente) · `2` argumentos o configuración inválidos. Un `404` de OpenF1
 (dato inexistente en la fuente) no hace fallar M2; un 5xx/timeout sí.
 `--strict` hace que un M3 con estado `FAIL` devuelva `1`.
 
+**Compuerta M3.** M4, M5 y M6 consultan los informes de validación guardados
+antes de escribir nada. `PASS` y `WARNING` continúan; `FAIL` los bloquea (código
+`1`), y para una sesión también los bloquea la ausencia de un informe M3 que la
+cubra. Las ejecuciones de temporada o de toda la historia siguen sin exigir
+informe, pero se bloquean si lo que cubren termina en `FAIL`. `--stage plan`
+acepta además `--year` + `--meeting-key` (+ `--session-key`) para planificar
+solo esa reunión o sesión (p. ej. 2025/1276/9839).
+
+La política vive en `validation/gate.py` y la aplican también `ConsolidationRunner`,
+`FeatureRunner` y `ModelingRunner` (lanzan `ValidationGateBlocked` antes de leer o
+escribir), de modo que invocarlos directamente no la esquiva. Un informe M3
+ilegible, sin `source.filter` completo o con `year`/`meeting_key`/`session_key` que no sean enteros o `null` bloquea (no cuenta como ausente) y, si es más
+reciente, no se recurre a un `PASS` anterior. Para M6 el gate mira solo
+`modeling.years` (vacío = todas las temporadas); un historial incompleto sigue
+siendo `DEFERRED` (código 3), distinto de un `FAIL` de M3 (código 1).
+
 Con jobs por sesión, cada stage elige los registros correctos: M3 usa el
 manifest más reciente que procesó esa sesión (o combina los manifests por
 sesión si no hay una ejecución global), y M4 solo acepta reportes de

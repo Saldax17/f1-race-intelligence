@@ -38,6 +38,7 @@ from f1_race_intelligence.features.temporal import add_temporal_features, window
 from f1_race_intelligence.scope import SessionScope
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
+from f1_race_intelligence.validation.gate import enforce_validation_gate
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -88,7 +89,12 @@ class FeatureRunner:
         self._windows = tuple(self._config.rolling_windows)
 
     def run(self) -> FeatureReport:
-        """Build features for every selected session and return the report."""
+        """Build features for every selected session and return the report.
+
+        Raises:
+            ValidationGateBlocked: M3 does not allow this scope (checked before any artifact is read or written).
+        """
+        enforce_validation_gate(self._store, self._settings, self._scope)
         report = FeatureReport(
             pipeline_name=PIPELINE_NAME,
             pipeline_version=PIPELINE_VERSION,

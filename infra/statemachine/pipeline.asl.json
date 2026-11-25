@@ -103,7 +103,7 @@
     },
     "PlanSessions": {
       "Type": "Task",
-      "Comment": "Plan only sessions whose M2-M5 artifacts are missing, changed or unverifiable. Current-season metadata is refreshed only when its saved catalog is stale; a task's stdout cannot be read by Step Functions. F1_EXTRACTION_YEARS limits planning to the seasons of this backfill phase (empty keeps the configured seasons).",
+      "Comment": "Plan only sessions whose M2-M5 artifacts are missing, changed or unverifiable. Current-season metadata is refreshed only when its saved catalog is stale; a task's stdout cannot be read by Step Functions. F1_EXTRACTION_YEARS limits planning to the seasons of this backfill phase (empty keeps the configured seasons). The command comes from BuildPlanCommand (every session of those seasons) or BuildSessionPlanCommand (exactly one session).",
       "Resource": "arn:aws:states:::ecs:runTask.sync",
       "Parameters": {
         "LaunchType": "FARGATE",
@@ -121,7 +121,7 @@
           "ContainerOverrides": [
             {
               "Name": "pipeline",
-              "Command.$": "States.Array('--stage', 'plan', '--plan-output', States.Format('s3://${DataBucketName}/manifests/plan/{}.json', $$.Execution.Name))",
+              "Command.$": "$.plan_command.command",
               "Environment": [
                 {
                   "Name": "F1_PIPELINE_EXECUTION_ID",
@@ -334,7 +334,7 @@
           },
           "M3_Validation": {
             "Type": "Task",
-            "Comment": "--stage m3 for the same session, with its full scope (--year, --meeting-key, --session-key; the incremental provenance and completion records need the meeting key): reads raw/ and manifests/extraction/, writes the validation report to validated/. A FAIL verdict is recorded, not a task failure (no --strict), as in the CLI. The full scope does not turn a FAIL into a completed session: provenance is recorded only when M3 ends PASS or WARNING.",
+            "Comment": "--stage m3 for the same session, with its full scope (--year, --meeting-key, --session-key; the incremental provenance and completion records need the meeting key): reads raw/ and manifests/extraction/, writes the validation report to validated/. --strict makes a FAIL verdict a non-zero exit: M3ExitedNonZero ends the Map iteration, the Map Catch alerts through SNS and the execution ends in PipelineFailed, so M4, M5 and M6 never run. PASS and WARNING exit 0 and continue; provenance is recorded only for those two verdicts.",
             "Resource": "arn:aws:states:::ecs:runTask.sync",
             "Parameters": {
               "LaunchType": "FARGATE",
@@ -352,7 +352,7 @@
                 "ContainerOverrides": [
                   {
                     "Name": "pipeline",
-                    "Command.$": "States.Array('--stage', 'm3', '--year', States.Format('{}', $.session.year), '--meeting-key', States.Format('{}', $.session.meeting_key), '--session-key', States.Format('{}', $.session.session_key))",
+                    "Command.$": "States.Array('--stage', 'm3', '--year', States.Format('{}', $.session.year), '--meeting-key', States.Format('{}', $.session.meeting_key), '--session-key', States.Format('{}', $.session.session_key), '--strict')",
                     "Environment": [
                       {
                         "Name": "F1_PIPELINE_EXECUTION_ID",
@@ -806,7 +806,7 @@
         "value.$": "$.availability.extraction_years"
       },
       "ResultPath": "$.scope",
-      "Next": "PlanSessions"
+      "Next": "ResolveSessionScope"
     },
     "UseConfiguredYears": {
       "Type": "Pass",
@@ -814,7 +814,86 @@
         "value": "${DefaultExtractionYears}"
       },
       "ResultPath": "$.scope",
+      "Next": "ResolveSessionScope"
+    },
+    "ResolveSessionScope": {
+      "Type": "Choice",
+      "Comment": "Exclusive one-session runs: availability.year, availability.meeting_key and availability.session_key (all integers) restrict the plan to that session. None of the three (the absence of all of them, year included) keeps the multi-session, multi-season plan. Any partial or non-numeric combination is rejected before any task.",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.availability.year", "IsPresent": true},
+            {"Variable": "$.availability.year", "IsNumeric": true},
+            {"Variable": "$.availability.meeting_key", "IsPresent": true},
+            {"Variable": "$.availability.meeting_key", "IsNumeric": true},
+            {"Variable": "$.availability.session_key", "IsPresent": true},
+            {"Variable": "$.availability.session_key", "IsNumeric": true}
+          ],
+          "Next": "FormatSessionScope"
+        },
+        {
+          "And": [
+            {"Variable": "$.availability.year", "IsPresent": false},
+            {"Variable": "$.availability.meeting_key", "IsPresent": false},
+            {"Variable": "$.availability.session_key", "IsPresent": false}
+          ],
+          "Next": "BuildPlanCommand"
+        }
+      ],
+      "Default": "InvalidSessionScope"
+    },
+    "FormatSessionScope": {
+      "Type": "Pass",
+      "Comment": "IsNumeric also accepts decimals (2025.5), which the CLI rejects only after a Fargate task started. Render each value as text so IsSessionScopeIntegral can refuse a decimal point or an exponent first.",
+      "Parameters": {
+        "year.$": "States.Format('{}', $.availability.year)",
+        "meeting_key.$": "States.Format('{}', $.availability.meeting_key)",
+        "session_key.$": "States.Format('{}', $.availability.session_key)"
+      },
+      "ResultPath": "$.scope_text",
+      "Next": "IsSessionScopeIntegral"
+    },
+    "IsSessionScopeIntegral": {
+      "Type": "Choice",
+      "Comment": "Reject a rendered value with a decimal point or an exponent (2025.5, 2025.0, 2.025e3) before PlanSessions; whole numbers continue.",
+      "Choices": [
+        {
+          "Or": [
+            {"Variable": "$.scope_text.year", "StringMatches": "*.*"},
+            {"Variable": "$.scope_text.year", "StringMatches": "*e*"},
+            {"Variable": "$.scope_text.year", "StringMatches": "*E*"},
+            {"Variable": "$.scope_text.meeting_key", "StringMatches": "*.*"},
+            {"Variable": "$.scope_text.meeting_key", "StringMatches": "*e*"},
+            {"Variable": "$.scope_text.meeting_key", "StringMatches": "*E*"},
+            {"Variable": "$.scope_text.session_key", "StringMatches": "*.*"},
+            {"Variable": "$.scope_text.session_key", "StringMatches": "*e*"},
+            {"Variable": "$.scope_text.session_key", "StringMatches": "*E*"}
+          ],
+          "Next": "InvalidSessionScope"
+        }
+      ],
+      "Default": "BuildSessionPlanCommand"
+    },
+    "BuildPlanCommand": {
+      "Type": "Pass",
+      "Parameters": {
+        "command.$": "States.Array('--stage', 'plan', '--plan-output', States.Format('s3://${DataBucketName}/manifests/plan/{}.json', $$.Execution.Name))"
+      },
+      "ResultPath": "$.plan_command",
       "Next": "PlanSessions"
+    },
+    "BuildSessionPlanCommand": {
+      "Type": "Pass",
+      "Parameters": {
+        "command.$": "States.Array('--stage', 'plan', '--plan-output', States.Format('s3://${DataBucketName}/manifests/plan/{}.json', $$.Execution.Name), '--year', States.Format('{}', $.availability.year), '--meeting-key', States.Format('{}', $.availability.meeting_key), '--session-key', States.Format('{}', $.availability.session_key))"
+      },
+      "ResultPath": "$.plan_command",
+      "Next": "PlanSessions"
+    },
+    "InvalidSessionScope": {
+      "Type": "Fail",
+      "Error": "InvalidSessionScope",
+      "Cause": "A one-session run needs integer availability.year, availability.meeting_key and availability.session_key together; give all three or none."
     },
     "InvalidExtractionScope": {
       "Type": "Fail",

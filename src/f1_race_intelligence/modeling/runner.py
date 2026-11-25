@@ -49,6 +49,8 @@ from f1_race_intelligence.storage.backends.base import StorageError, join_key
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.store import DataStore
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
+from f1_race_intelligence.scope import SessionScope
+from f1_race_intelligence.validation.gate import enforce_validation_gate, modeling_gate_years
 from f1_race_intelligence.validation.states import CheckStatus, RunVerdict
 
 logger = get_logger(__name__)
@@ -93,8 +95,12 @@ class ModelingRunner:
         self._output_store = output_store or self._store
         self._loader = loader or FeatureDatasetLoader(input_path=self._config.input_path, store=self._store)
 
+    def _enforce_validation_gate(self) -> None:
+        enforce_validation_gate(self._store, self._settings, SessionScope(), years=modeling_gate_years(self._settings))
+
     def reusable_report(self) -> Optional[Dict[str, Any]]:
         """Return the latest verified VALID M6 report if its inputs and runtime match."""
+        self._enforce_validation_gate()
         backend = self._output_store.backend
         report_root = self._output_store.root(Layer.MODELING_REPORTS, self._config.report_path)
         report_keys = [
@@ -153,7 +159,12 @@ class ModelingRunner:
         return report
 
     def run(self) -> ModelingReport:
-        """Build the modelling datasets and return the run's report."""
+        """Build the modelling datasets and return the run's report.
+
+        Raises:
+            ValidationGateBlocked: M3 does not allow the modelled seasons (checked before any artifact is read or written).
+        """
+        self._enforce_validation_gate()
         started = time.monotonic()
         report = ModelingReport(
             pipeline_name=PIPELINE_NAME,
