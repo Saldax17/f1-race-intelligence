@@ -22,16 +22,26 @@ DOCKERFILE = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
 DOCKERIGNORE = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
 
 
-def instructions(name):
-    """Arguments of every ``name`` instruction, with ``\\`` continuations joined."""
-    joined = re.sub(r"\\\n\s*", " ", DOCKERFILE)
+# The image is built in two stages: a throwaway one that compiles pyarrow
+# without zstd (CVE-2026-124851) and the runtime one. What the runtime image
+# does (user, entrypoint, hardening, ...) is asserted on the last stage only.
+STAGES = [stage for stage in re.split(r"(?m)^(?=FROM\s)", DOCKERFILE) if stage.startswith("FROM")]
+BUILD_STAGE, FINAL_STAGE = STAGES[0], STAGES[-1]
+
+
+def instructions(name, text=None):
+    """Arguments of every ``name`` instruction of the runtime stage (or of ``text``), ``\\`` continuations joined."""
+    joined = re.sub(r"\\\n\s*", " ", FINAL_STAGE if text is None else text)
     return re.findall(rf"^{name}\s+(.+)$", joined, flags=re.M)
 
 
-def test_the_base_image_is_pinned_by_a_full_digest() -> None:
-    (base,) = instructions("FROM")
+def test_both_stages_are_pinned_to_the_same_full_digest() -> None:
+    assert len(STAGES) == 2
+    bases = [arguments.split()[0] for arguments in instructions("FROM", DOCKERFILE)]
     # An immutable ECR tag must always mean the same image.
-    assert re.fullmatch(r"python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}", base), base
+    for base in bases:
+        assert re.fullmatch(r"python:3\.12-slim-trixie@sha256:[0-9a-f]{64}", base), base
+    assert len(set(bases)) == 1, "the build stage and the runtime stage must start from the same base"
 
 
 def test_the_config_the_code_needs_is_copied_where_f1_config_path_points() -> None:
@@ -44,7 +54,13 @@ def test_the_config_the_code_needs_is_copied_where_f1_config_path_points() -> No
 
 def test_dependencies_come_only_from_the_lock() -> None:
     runs = " ".join(instructions("RUN"))
-    assert "pip install --requirement requirements/runtime-lock.txt" in runs
+    # The lock is installed whole except its pyarrow line, which the zstd-free
+    # wheel replaces at the very same version (see the CVE-2026-124851 tests).
+    # (tolerant of CRLF: a Windows checkout of the lock ends its lines with \r)
+    assert "grep -v -E '^pyarrow==25\\.0\\.1[[:space:]]*$' requirements/runtime-lock.txt > /tmp/runtime-lock-without-pyarrow.txt" in runs
+    assert "pip install --requirement /tmp/runtime-lock-without-pyarrow.txt" in runs
+    assert "pip install --no-deps /wheelhouse/pyarrow-25.0.1-*.whl" in runs
+    assert re.search(r"^pyarrow==25\.0\.1$", (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8"), flags=re.M)
     assert "pip install --no-deps ." in runs and "pip check" in runs
     # The S3 backend's optional dependency must be in the image anyway.
     assert re.search(r"^boto3==", (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8"), flags=re.M)
@@ -217,7 +233,13 @@ def test_what_the_image_copies_still_reaches_the_build_context(path) -> None:
 
 def copied_sources():
     """Source paths of the Dockerfile's COPY instructions (every argument but the destination)."""
-    return [source for arguments in instructions("COPY") for source in arguments.split()[:-1]]
+    # Every stage's COPY from the build context; ``COPY --from=<stage>`` copies from another stage, not from the context.
+    return [
+        source
+        for arguments in instructions("COPY", DOCKERFILE)
+        if not arguments.startswith("--from=")
+        for source in arguments.split()[:-1]
+    ]
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -559,3 +581,101 @@ def test_the_injected_values_are_what_the_m6_reports_record(monkeypatch) -> None
     # Why the recipe uses the full SHA: a short one is not recorded at all.
     monkeypatch.setenv("F1_GIT_COMMIT", full_sha[:7])
     assert source_revision() == (None, None)
+
+
+# -- CVE-2026-124851: no vulnerable zstd (1.5.1-1.5.7) in either image
+#
+# Two copies hid in the old image: the operating system's libzstd and the zstd
+# 1.5.7 that every pyarrow wheel on PyPI links statically into libarrow. These
+# tests pin the decisions that remove both; the images are verified by building
+# them (the Dockerfiles also assert it at build time).
+
+FORECAST_DOCKERFILE = (REPO_ROOT / "Dockerfile.forecast").read_text(encoding="utf-8")
+PYARROW_BUILD_SCRIPT = (REPO_ROOT / "docker" / "build-pyarrow-without-zstd.sh").read_text(encoding="utf-8")
+# SHA-256 of apache-arrow-25.0.1.tar.gz; its SHA-512 matches the one Apache publishes.
+ARROW_25_0_1_SHA256 = "43d5de0a581f43cf63a2c06b4dcf13b9ff6fcd800f023324596e5781093bc500"
+
+
+def test_the_batch_image_installs_the_fixed_debian_libzstd_and_checks_it() -> None:
+    runs = " ".join(instructions("RUN"))
+    # 1.5.7+dfsg-1 (what the base ships) is still vulnerable; the fix is the +deb13u1 build.
+    assert "apt-get install --yes --no-install-recommends libzstd1=1.5.7+dfsg-1+deb13u1" in runs
+    assert "dpkg-query --show --showformat='${Version}' libzstd1" in runs
+    assert '= "1.5.7+dfsg-1+deb13u1"' in runs
+
+
+def test_pyarrow_is_built_from_the_pinned_arrow_release_with_zstd_off() -> None:
+    assert 'ARROW_VERSION="25.0.1"' in PYARROW_BUILD_SCRIPT
+    assert f'ARROW_SHA256="{ARROW_25_0_1_SHA256}"' in PYARROW_BUILD_SCRIPT
+    assert 'sha256sum --check' in PYARROW_BUILD_SCRIPT
+    assert "-DARROW_WITH_ZSTD=OFF" in PYARROW_BUILD_SCRIPT
+    assert "ARROW_WITH_ZSTD=ON" not in PYARROW_BUILD_SCRIPT
+    # What the pipeline needs stays: Parquet with SNAPPY, and the bundled libraries in the wheel.
+    for flag in ("-DARROW_PARQUET=ON", "-DARROW_WITH_SNAPPY=ON", "-DARROW_DATASET=ON", "-DARROW_COMPUTE=ON"):
+        assert flag in PYARROW_BUILD_SCRIPT, flag
+    assert "export PYARROW_BUNDLE_ARROW_CPP=ON" in PYARROW_BUILD_SCRIPT
+    # Nothing that would pull zstd back in through another feature (ORC links it).
+    for flag in ("-DARROW_ORC=ON", "-DARROW_FLIGHT=ON", "-DARROW_S3=ON"):
+        assert flag not in PYARROW_BUILD_SCRIPT, flag
+
+
+def test_the_pyarrow_build_toolchain_is_fully_pinned() -> None:
+    lines = [
+        line.strip()
+        for line in (REPO_ROOT / "requirements" / "arrow-build-lock.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert lines and all(re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][^ ;]*", line) for line in lines), lines
+    # Arrow 25 needs CMake >= 3.25; CMake 4 breaks the policies of some bundled dependencies.
+    assert any(re.fullmatch(r"cmake==3\.(2[5-9]|3\d)\.\d+", line) for line in lines)
+    # Built against the NumPy the image runs with.
+    numpy = re.search(r"^numpy==(\S+)$", (REPO_ROOT / "requirements" / "runtime-lock.txt").read_text(encoding="utf-8"), flags=re.M)
+    assert numpy and f"numpy=={numpy.group(1)}" in lines
+
+
+def test_the_batch_build_fails_if_pyarrow_keeps_zstd_or_loses_snappy() -> None:
+    runs = " ".join(instructions("RUN"))
+    assert "assert not pa.Codec.is_available('zstd')" in runs
+    assert "assert pa.Codec.is_available('snappy')" in runs
+    assert "ZSTD_decompressStream" in runs and "--include='*.so*'" in runs
+    # The wheel comes from the build stage, not from PyPI.
+    assert "--from=pyarrow-build /wheelhouse/ /wheelhouse/" in instructions("COPY")
+    assert "build-pyarrow-without-zstd.sh" in " ".join(instructions("RUN", BUILD_STAGE))
+
+
+def forecast_stages():
+    return [stage for stage in re.split(r"(?m)^(?=FROM\s)", FORECAST_DOCKERFILE) if stage.startswith("FROM")]
+
+
+def test_the_forecast_image_builds_its_own_pyarrow_on_its_own_base() -> None:
+    stages = forecast_stages()
+    assert len(stages) == 2
+    bases = [arguments.split()[0] for arguments in instructions("FROM", FORECAST_DOCKERFILE)]
+    for base in bases:
+        assert re.fullmatch(r"public\.ecr\.aws/lambda/python:3\.12@sha256:[0-9a-f]{64}", base), base
+    assert len(set(bases)) == 1
+    # The wheel is compiled on Amazon Linux 2023 itself; the Debian one is never reused (glibc/libstdc++ ABI).
+    assert "trixie" not in " ".join(instructions("FROM", FORECAST_DOCKERFILE))
+    build_runs = " ".join(instructions("RUN", stages[0]))
+    assert "build-pyarrow-without-zstd.sh" in build_runs and "gcc-c++" in build_runs
+    final_runs = " ".join(instructions("RUN", stages[-1]))
+    assert "pip install --no-deps /wheelhouse/pyarrow-25.0.1-*.whl" in final_runs
+    assert r"grep -v -E '^pyarrow==25\.0\.1[[:space:]]*$' requirements/runtime-lock.txt" in final_runs
+    assert "--from=pyarrow-build" in " ".join(instructions("COPY", stages[-1]))
+
+
+def test_the_forecast_build_removes_amazon_linuxs_libzstd_and_proves_no_zstd_is_left() -> None:
+    # AL2023's repositories stop at libzstd 1.5.5 (no fixed package exists), and nothing the Lambda runs links it.
+    final_runs = " ".join(instructions("RUN", forecast_stages()[-1]))
+    assert "assert not pa.Codec.is_available('zstd')" in final_runs
+    assert "assert pa.Codec.is_available('snappy')" in final_runs
+    assert "rpm --erase --nodeps libzstd" in final_runs
+    # The Lambda base has no ``find``: the file check walks the tree with Python.
+    assert "f.startswith('libzstd')" in final_runs and "sys.exit(1 if hits else 0)" in final_runs
+    # pyarrow built on this base links libatomic, absent from the Lambda image; it must be
+    # installed while the package manager still works, i.e. before libzstd is removed.
+    assert "microdnf install --assumeyes --setopt=install_weak_deps=0 libatomic" in final_runs
+    assert final_runs.index("libatomic") < final_runs.index("rpm --erase")
+    assert "'Src size is incorrect'" in final_runs
+    # The removal is the last step that can run a package manager.
+    assert final_runs.index("rpm --erase") > final_runs.index("pip install --no-deps .")

@@ -7,10 +7,44 @@
 #
 # Same code, configuration and dependency lock as the batch image (Dockerfile);
 # only the base differs, because Lambda needs its runtime interface client.
-# Pin the base by digest before the first production deploy, as the batch
-# image does:
+#
+# Base pinned by digest (public.ecr.aws/lambda/python:3.12, Amazon Linux 2023,
+# Python 3.12.16, published 2026-11-24), so a rebuild of the same commit gets the
+# same base. The tag is kept for readers; the digest decides. To take base-image
+# fixes, bump it on purpose:
 #   docker buildx imagetools inspect public.ecr.aws/lambda/python:3.12   (Digest: line)
-FROM public.ecr.aws/lambda/python:3.12
+#
+# CVE-2026-124851 (zstd 1.5.1-1.5.7, fixed upstream in 1.6.0) has two copies to
+# remove from this image:
+#   1. The zstd 1.5.7 that every pyarrow wheel on PyPI links statically into
+#      libarrow. Stage 1 builds pyarrow from the official Arrow source release
+#      with ARROW_WITH_ZSTD=OFF, on this same Amazon Linux 2023 base (glibc 2.34,
+#      its own libstdc++), so the wheel is built for the ABI it runs on: the
+#      wheel of the batch image (Debian trixie) is never reused here.
+#   2. Amazon Linux 2023's libzstd 1.5.5. Its repositories offer nothing newer
+#      than 1.5.5, so there is no fixed package to install. Nothing this image
+#      runs links it (only rpm/microdnf/libarchive, which are package-management
+#      tools), so the last build step removes the package and the build fails if
+#      any zstd implementation is left.
+# Parquet keeps SNAPPY, which the pipeline uses.
+
+# Stage 1 (discarded): pyarrow without zstd. Build-only toolchain.
+FROM public.ecr.aws/lambda/python:3.12@sha256:ad2f55fe2cf91a997bc986410cab85a41b7c7bae65ba881e69173a76d022133e AS pyarrow-build
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN microdnf install --assumeyes --setopt=install_weak_deps=0 gcc gcc-c++ make tar gzip findutils \
+    && microdnf clean all
+
+COPY requirements/arrow-build-lock.txt requirements/arrow-build-lock.txt
+RUN pip install --requirement requirements/arrow-build-lock.txt
+
+COPY docker/build-pyarrow-without-zstd.sh /usr/local/bin/build-pyarrow-without-zstd.sh
+RUN bash /usr/local/bin/build-pyarrow-without-zstd.sh
+
+# Stage 2: the Lambda image.
+FROM public.ecr.aws/lambda/python:3.12@sha256:ad2f55fe2cf91a997bc986410cab85a41b7c7bae65ba881e69173a76d022133e
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -21,13 +55,39 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ARG F1_GIT_COMMIT
 ARG F1_GIT_DIRTY
 
+# The pyarrow built in stage 1 links gcc's libatomic, which the Lambda base does
+# not ship (the official manylinux wheels bundle it; this one is built for this
+# base). Installed from Amazon Linux's own repository, before libzstd is removed
+# at the end: microdnf needs it to run.
+RUN microdnf install --assumeyes --setopt=install_weak_deps=0 libatomic \
+    && microdnf clean all
+
+# pyarrow is the one entry left out of the lock install: it comes from the
+# zstd-free wheel built in stage 1, at the same version. The lock file itself
+# stays untouched, and the build fails if it stops pinning exactly pyarrow==25.0.1.
 COPY requirements/runtime-lock.txt requirements/runtime-lock.txt
-RUN pip install --requirement requirements/runtime-lock.txt
+COPY --from=pyarrow-build /wheelhouse/ /wheelhouse/
+RUN grep -v -E '^pyarrow==25\.0\.1[[:space:]]*$' requirements/runtime-lock.txt > /tmp/runtime-lock-without-pyarrow.txt \
+    && ! grep -q '^pyarrow' /tmp/runtime-lock-without-pyarrow.txt \
+    && pip install --requirement /tmp/runtime-lock-without-pyarrow.txt \
+    && pip install --no-deps /wheelhouse/pyarrow-25.0.1-*.whl \
+    && rm -rf /wheelhouse /tmp/runtime-lock-without-pyarrow.txt
 
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY configs ./configs
 RUN pip install --no-deps . && pip check
+
+# Surface 2 of CVE-2026-124851, last because it removes the package manager's
+# own libzstd: rpm and microdnf cannot run afterwards, and nothing after this
+# point needs them. The checks fail the build if pyarrow kept zstd or Parquet
+# lost SNAPPY, if a libzstd file remains, or if any file in the image still
+# carries zstd's own error table ("Src size is incorrect" is text that only a
+# zstd implementation holds, not the programs that merely import it).
+RUN python -c "import pyarrow as pa, pyarrow.parquet; assert pa.__version__ == '25.0.1'; assert not pa.Codec.is_available('zstd'); assert pa.Codec.is_available('snappy')" \
+    && rpm --erase --nodeps libzstd \
+    && python -c "import os, sys; hits = [os.path.join(d, f) for d, _, files in os.walk('/') if not d.startswith(('/proc', '/sys', '/dev')) for f in files if f.startswith('libzstd')]; print('libzstd files left:', hits); sys.exit(1 if hits else 0)" \
+    && ! grep -rlaF --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev 'Src size is incorrect' / 2>/dev/null
 
 # Lambda's file system is read-only except /tmp; nothing here writes locally.
 ENV F1_CONFIG_PATH=${LAMBDA_TASK_ROOT}/configs/config.yaml \
