@@ -1129,10 +1129,20 @@ s3://<bucket>/<prefix>/
 ├── modeling/split=<train|validation|test>/runs/<run_id>/{dataset,features}.parquet (M6)
 ├── modeling/preprocessing/runs/<run_id>/{preprocessor.joblib,feature_schema.json}
 ├── manifests/extraction/[year=<y>/session=<s>/]manifest_<ts>.json
-├── manifests/{consolidation,features,modeling}/<stage>_report_<ts>.json
+├── manifests/{consolidation,features}/[year=<y>/session=<s>/]<stage>_report_<ts>.json
+├── manifests/modeling/<stage>_report_<ts>.json
+├── manifests/incremental/config=<huella>/year=<y>/session=<s>/{stages,state}.json
 ├── models/   (reservado para M7)
 └── logs/     (reservado; los logs van a stdout)
 ```
+
+Los informes de una ejecución acotada a una sesión (manifiesto de M2, informe de
+M3, de M4 y de M5) se guardan bajo `year=<y>/session=<s>/`; es el prefijo donde
+la procedencia incremental busca «el último informe de esta sesión». Las
+ejecuciones sin sesión única (un año completo, todo el histórico) conservan el
+informe en la raíz de la etapa, y esos informes **no** cuentan como procedencia
+de ninguna sesión. Hasta la corrección de M4/M5, estos dos informes se escribían
+siempre en la raíz y, en `lake`, la procedencia no se registraba.
 
 Todo lo de una sesión comparte un prefijo: es la unidad de trabajo, de
 permisos y de reproceso. `bucket` y `prefix` son configurables; los nombres
