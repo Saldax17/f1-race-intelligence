@@ -25,6 +25,7 @@ from f1_race_intelligence.storage.backends import LocalStorageBackend, S3Storage
 from f1_race_intelligence.storage.layout import LakeLayout
 from f1_race_intelligence.storage.migration import copy_raw
 from f1_race_intelligence.storage.store import DataStore
+from f1_race_intelligence.validation.gate import ValidationGateBlocked
 from f1_race_intelligence.validation.manifest_index import ManifestIndex
 from f1_race_intelligence.validation.runner import ValidationRunner
 from factories import MEETING_KEY, SESSION_KEY, YEAR, car_data_record
@@ -260,6 +261,14 @@ def test_manifest_index_combines_session_jobs_when_no_full_run_exists(lake) -> N
 # -- M4 -------------------------------------------------------------------------
 
 
+def m3_verdict_in_lake(lake: DataStore, status: str = "PASS", stamp: str = "20230101T000000000000Z") -> None:
+    """The stored M3 report that M4 and M5 session jobs require before they run."""
+    lake.backend.write_json(
+        f"validated/year={YEAR}/session={SESSION_KEY}/validation_report_{stamp}.json",
+        {"global_status": status, "source": {"filter": {"year": YEAR, "meeting_key": MEETING_KEY, "session_key": SESSION_KEY}}},
+    )
+
+
 def consolidation_on_disk(tmp_path: Path, raw_root: Path) -> pd.DataFrame:
     settings = AppSettings(
         consolidation={
@@ -275,6 +284,7 @@ def consolidation_on_disk(tmp_path: Path, raw_root: Path) -> pd.DataFrame:
 
 def test_m4_session_job_on_s3_produces_exactly_the_local_dataset(build_raw, raw_root, lake, s3, tmp_path) -> None:
     lake_with_raw(build_raw, raw_root, lake)
+    m3_verdict_in_lake(lake)
     expected = consolidation_on_disk(tmp_path, raw_root)
     scope = SessionScope(year=YEAR, meeting_key=MEETING_KEY, session_key=SESSION_KEY)
 
@@ -292,21 +302,26 @@ def test_m4_session_job_on_s3_produces_exactly_the_local_dataset(build_raw, raw_
 
 def test_m4_session_job_is_idempotent_and_lists_only_its_session(build_raw, raw_root, lake, s3) -> None:
     lake_with_raw(build_raw, raw_root, lake)
+    m3_verdict_in_lake(lake)
     scope = SessionScope(year=YEAR, meeting_key=MEETING_KEY, session_key=SESSION_KEY)
     ConsolidationRunner(AppSettings(), store=lake, scope=scope).run()
-    s3.calls.clear()
+    reads = []
+    original = s3.get_object
+    s3.get_object = lambda **kwargs: (reads.append(kwargs["Key"]), original(**kwargs))[1]
 
     again = ConsolidationRunner(AppSettings(), store=lake, scope=scope).run()
 
     assert again.summary()["sessions_skipped"] == 1
-    assert "GetObject" not in s3.calls, "a skipped session reads no raw data"
+    # The only objects read are the M3 validation reports (the gate and the report note); no raw data.
+    assert reads and all("validated/" in key for key in reads), reads
 
 
 def test_m4_can_read_s3_and_write_local_disk(build_raw, raw_root, lake, tmp_path) -> None:
     lake_with_raw(build_raw, raw_root, lake)
+    m3_verdict_in_lake(lake)
     output = DataStore(backend=LocalStorageBackend(tmp_path / "out"), layout=LakeLayout())
 
-    ConsolidationRunner(AppSettings(), store=lake, output_store=output, scope=SessionScope(session_key=SESSION_KEY)).run()
+    ConsolidationRunner(AppSettings(), store=lake, output_store=output, scope=SessionScope(year=YEAR, meeting_key=MEETING_KEY, session_key=SESSION_KEY)).run()
 
     assert (tmp_path / "out" / "consolidated" / f"year={YEAR}" / f"session={SESSION_KEY}" / f"session_{SESSION_KEY}.parquet").exists()
 
@@ -317,18 +332,14 @@ def test_m4_session_job_only_trusts_validation_that_covered_its_session(build_ra
         "validated/year=2023/session=1/validation_report_20990101T000000000000Z.json",
         {"global_status": "PASS", "source": {"filter": {"session_key": 1}}},
     )
-    lake.backend.write_json(
-        f"validated/year={YEAR}/session={SESSION_KEY}/validation_report_20230101T000000000000Z.json",
-        {"global_status": "FAIL", "source": {"filter": {"session_key": SESSION_KEY}}},
-    )
-    settings = AppSettings(consolidation={"require_validation_pass": True})
+    m3_verdict_in_lake(lake, "FAIL")
+    scope = SessionScope(year=YEAR, meeting_key=MEETING_KEY, session_key=SESSION_KEY)
 
-    report = ConsolidationRunner(
-        settings, store=lake, scope=SessionScope(year=YEAR, session_key=SESSION_KEY)
-    ).run()
-
-    assert report.source_validation["status"] == "FAIL"
-    assert report.aborted is not None
+    # Another session's newer PASS does not vouch for this one; the FAIL blocks before anything is written.
+    for settings in (AppSettings(), AppSettings(consolidation={"require_validation_pass": True})):
+        with pytest.raises(ValidationGateBlocked, match="FAIL"):
+            ConsolidationRunner(settings, store=lake, scope=scope).run()
+    assert not lake.backend.list("consolidated") and not lake.backend.list("manifests/consolidation")
 
 
 # -- M5 -------------------------------------------------------------------------
@@ -336,12 +347,13 @@ def test_m4_session_job_only_trusts_validation_that_covered_its_session(build_ra
 
 def test_m5_session_job_on_s3_produces_exactly_the_local_features(build_raw, raw_root, lake, tmp_path) -> None:
     lake_with_raw(build_raw, raw_root, lake)
+    m3_verdict_in_lake(lake)
     consolidation_on_disk(tmp_path, raw_root)
     FeatureRunner(
         AppSettings(features={"input_path": str(tmp_path / "local_out"), "output_path": str(tmp_path / "feat"), "report_path": str(tmp_path / "fr")})
     ).run()
     expected = pd.read_parquet(tmp_path / "feat" / str(YEAR) / f"session_{SESSION_KEY}.parquet")
-    scope = SessionScope(year=YEAR, session_key=SESSION_KEY)
+    scope = SessionScope(year=YEAR, meeting_key=MEETING_KEY, session_key=SESSION_KEY)
     ConsolidationRunner(AppSettings(), store=lake, scope=scope).run()
 
     report = FeatureRunner(AppSettings(), store=lake, scope=scope).run()

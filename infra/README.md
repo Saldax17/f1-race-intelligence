@@ -316,6 +316,13 @@ disponibilidad; un inicio manual añade `extraction_years` (cadena, p. ej.
 {"available": true, "extraction_years": "2024"}
 ```
 
+Para una ejecución de **una sola sesión** se añaden los tres números juntos
+(`{"available": true, "year": 2025, "meeting_key": 1276, "session_key": 9839}`);
+`ResolveSessionScope` pasa `--year/--meeting-key/--session-key` a `PlanSessions`.
+Una combinación parcial, no numérica o con decimales (`2025.5`) termina en
+`InvalidSessionScope` sin lanzar tareas: `FormatSessionScope` + `IsSessionScopeIntegral`
+rechazan un valor cuyo texto contiene `.` o exponente (`e`/`E`) antes de `PlanSessions`. Sin esos campos el plan cubre todas las sesiones, como antes.
+
 `ResolveExtractionScope` copia ese valor a `$.scope.value` (si falta, usa el
 parámetro de pila `ExtractionYears`, vacío por defecto = las temporadas de
 `configs/config.yaml`; cualquier valor que no sea una cadena termina en
@@ -394,9 +401,11 @@ La corrección solo **transmite el ámbito completo**. **No convierte una
 validación FAIL en una sesión completada**: la procedencia de M3 se registra
 únicamente con veredicto `PASS` o `WARNING`, y M4 y M5 exigen la de la etapa
 anterior. Con M3 en `FAIL` (por ejemplo, los `n_gear` fuera de rango de las
-sesiones reales 7953 y 9472) el comportamiento no cambia: M3 termina con código
-0 (sin `--strict`), M4 y M5 pueden ejecutarse, no se escribe `state.json` y el
-plan vuelve a incluir la sesión. Las reglas de M3 y el tratamiento de `n_gear`
+sesiones reales 7953 y 9472) M3 se ejecuta con `--strict` y termina con código
+1: la iteración del Map falla, se notifica por SNS y la ejecución acaba en
+`PipelineFailed` sin lanzar M4, M5 ni M6 (invocados a mano, también se niegan).
+No se escribe `state.json` y el plan vuelve a incluir la sesión. `WARNING`
+continúa conservando la procedencia. Las reglas de M3 y el tratamiento de `n_gear`
 no se tocan.
 
 *Estado:* definido en `infra/statemachine/pipeline.asl.json`, cubierto por

@@ -353,8 +353,15 @@ class HistoricalExtractionPipeline:
         years: Optional[Sequence[int]] = None,
         *,
         refresh_catalogs: bool = False,
+        meeting_key: Optional[int] = None,
+        session_key: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """List the sessions a run would extract, one work unit per session.
+
+        ``meeting_key`` and ``session_key`` narrow the plan exclusively to that
+        meeting or session (``years`` must then name the season); sessions
+        outside it are neither planned nor recorded as decisions. Without them
+        every meeting and session of ``years`` is planned, as before.
 
         Existing meetings and sessions catalogues are reused. Pass
         ``refresh_catalogs=True`` only when upstream metadata must be refreshed;
@@ -373,6 +380,11 @@ class HistoricalExtractionPipeline:
             config={**self._config_snapshot(), "years": years, "scope": {"mode": "plan"}},
         )
 
+        only_meeting, only_session = meeting_key, session_key
+        if only_session is not None and only_meeting is None:
+            raise ValueError("a session-scoped plan needs meeting_key as well as session_key")
+        if (only_meeting is not None or only_session is not None) and len(years) != 1:
+            raise ValueError("a meeting- or session-scoped plan needs exactly one year")
         units: List[Dict[str, Any]] = []
         decisions: List[Dict[str, Any]] = []
         for year in years:
@@ -382,7 +394,7 @@ class HistoricalExtractionPipeline:
             )
             for meeting in self.discover_meetings(year, manifest, refresh=refresh_year):
                 meeting_key = meeting.get("meeting_key")
-                if meeting_key is None:
+                if meeting_key is None or (only_meeting is not None and meeting_key != only_meeting):
                     continue
                 manifest.record_meeting(meeting_key)
                 session_parameters = {"year": year, "meeting_key": meeting_key}
@@ -393,7 +405,9 @@ class HistoricalExtractionPipeline:
                 for session in self.filter_sessions(
                     self.discover_sessions(year, meeting_key, manifest, refresh=refresh_sessions)
                 ):
-                    if session.get("session_key") is None:
+                    if session.get("session_key") is None or (
+                        only_session is not None and session["session_key"] != only_session
+                    ):
                         continue
                     scope = SessionScope(
                         year=year,

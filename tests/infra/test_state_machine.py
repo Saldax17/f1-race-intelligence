@@ -149,6 +149,8 @@ def set_path(data: Dict[str, Any], path: Optional[str], value: Any) -> Dict[str,
 def matches(rule: Dict[str, Any], data: Any) -> bool:
     if "And" in rule:
         return all(matches(item, data) for item in rule["And"])
+    if "Or" in rule:
+        return any(matches(item, data) for item in rule["Or"])
     value = get_path(data, rule["Variable"])
     if "IsPresent" in rule:
         return (value is not _MISSING) is rule["IsPresent"]
@@ -164,6 +166,9 @@ def matches(rule: Dict[str, Any], data: Any) -> bool:
         return isinstance(value, bool) and value is rule["BooleanEquals"]
     if "StringEquals" in rule:
         return value == rule["StringEquals"]
+    if "StringMatches" in rule:  # only ``*`` is a wildcard
+        pattern = ".*".join(re.escape(part) for part in rule["StringMatches"].split("*"))
+        return isinstance(value, str) and re.fullmatch(pattern, value, re.DOTALL) is not None
     if "NumericEquals" in rule:
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value == rule["NumericEquals"]
     if "NumericGreaterThan" in rule:
@@ -422,7 +427,7 @@ def test_stages_run_in_order_with_the_scope_of_each_session(asl_text) -> None:
         year, meeting, key = str(session["year"]), str(session["meeting_key"]), str(session["session_key"])
         expected += [
             ("M2_Extraction", ["--stage", "m2", "--year", year, "--meeting-key", meeting, "--session-key", key]),
-            ("M3_Validation", ["--stage", "m3", "--year", year, "--meeting-key", meeting, "--session-key", key]),
+            ("M3_Validation", ["--stage", "m3", "--year", year, "--meeting-key", meeting, "--session-key", key, "--strict"]),
             ("M4_Consolidation", ["--stage", "m4", "--year", year, "--meeting-key", meeting, "--session-key", key, "--overwrite-derived"]),
             ("M5_Features", ["--stage", "m5", "--year", year, "--meeting-key", meeting, "--session-key", key, "--overwrite-derived"]),
         ]
@@ -466,7 +471,7 @@ def test_the_effective_arguments_are_exactly_the_options_the_cli_defines(asl_tex
     effective = dict(task_commands(world)[1:5])  # the first session: M2..M5
     expected_flags = {
         "M2_Extraction": {"overwrite": False, "overwrite_derived": False, "strict": False},
-        "M3_Validation": {"overwrite": False, "overwrite_derived": False, "strict": False},
+        "M3_Validation": {"overwrite": False, "overwrite_derived": False, "strict": True},
         "M4_Consolidation": {"overwrite": False, "overwrite_derived": True, "strict": False},
         "M5_Features": {"overwrite": False, "overwrite_derived": True, "strict": False},
     }
@@ -792,3 +797,88 @@ def test_the_state_machine_is_structurally_sound_after_r3(asl_text) -> None:
                 assert not {"Next", "End"} & set(state), name
             elif state["Type"] != "Choice":
                 assert ("Next" in state) != bool(state.get("End")), name
+
+
+# -- exclusive session scope and the M3 gate (orchestration audit T3, T4) -------------------------------
+
+ONE_SESSION = {"year": 2025, "meeting_key": 1276, "session_key": 9839}
+
+
+def test_t3_a_session_scope_reaches_the_plan_command_and_the_cli(asl_text) -> None:
+    session = {**ONE_SESSION, "session_name": "Race"}
+    _, _, _, world = execute(asl_text, {**availability(True), **ONE_SESSION}, world=World(sessions=[session]))
+
+    plan = dict(task_commands(world))["PlanSessions"]
+    assert plan[-6:] == ["--year", "2025", "--meeting-key", "1276", "--session-key", "9839"]
+    args = cli.build_parser().parse_args(plan)
+    assert SessionScope(year=args.year, meeting_key=args.meeting_key, session_key=args.session_key) == SessionScope(**ONE_SESSION)
+    # and every per-session stage runs that one session
+    per_session = [command for name, command in task_commands(world) if name in PER_SESSION_STAGES]
+    assert len(per_session) == len(PER_SESSION_STAGES)
+    assert all(command[2:8] == ["--year", "2025", "--meeting-key", "1276", "--session-key", "9839"] for command in per_session)
+
+
+def test_t3_without_a_session_scope_the_plan_command_is_unchanged(asl_text) -> None:
+    _, _, _, world = execute(asl_text, availability(True))
+    assert dict(task_commands(world))["PlanSessions"] == [
+        "--stage", "plan", "--plan-output", f"s3://{SUBSTITUTIONS['DataBucketName']}/manifests/plan/{EXECUTION_NAME}.json",
+    ]
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"year": 2025},
+        {"session_key": 9839},
+        {"year": 2025, "session_key": 9839},
+        {"meeting_key": 1276},
+        {"year": 2025, "meeting_key": 1276, "session_key": "9839"},
+    ],
+)
+def test_t3_a_partial_or_non_numeric_session_scope_is_rejected_before_any_task(asl_text, scope) -> None:
+    _, terminal, data, world = execute(asl_text, {**availability(True), **scope})
+    assert (terminal, data["Error"]) == ("Fail", "InvalidSessionScope")
+    assert world.tasks == []
+
+
+def test_t4_m3_runs_strict_and_a_fail_stops_m4_m5_m6_and_alerts(asl_text) -> None:
+    _, _, _, world = execute(asl_text, availability(True), world=World())
+    m3 = dict(task_commands(world))["M3_Validation"]
+    assert "--strict" in m3
+
+    visited, terminal, data, world = execute(asl_text, availability(True), world=World(exit_codes={"M3_Validation": 1}))
+    started = [name for name, _ in world.tasks]
+    assert started == ["PlanSessions", "M2_Extraction", "M3_Validation"]
+    assert not {"M4_Consolidation", "M5_Features", "M6_ModelingDataset"} & set(started)
+    assert "NotifyPipelineFailure" in visited and visited[-1] == "PipelineFailed"
+    assert terminal == "Fail" and data["Error"] == "PipelineFailed"
+    assert len(world.alerts) == 1
+
+
+def test_t4_a_passing_m3_continues_to_m6(asl_text) -> None:
+    visited, terminal, _, world = execute(asl_text, availability(True))
+    assert terminal == "Succeed" and visited[-1] == "PipelineSucceeded"
+    assert world.alerts == []
+
+
+@pytest.mark.parametrize("field", ["year", "meeting_key", "session_key"])
+@pytest.mark.parametrize("value", [2025.5, 2025.0, json.loads("2.025e3"), json.loads("1E3")])
+def test_a_decimal_or_exponent_session_scope_is_rejected_before_any_task(asl_text, field, value) -> None:
+    # The emulator renders floats like Python's json (2025.0, 2025.0, 1000.0): with these
+    # values the rendered text carries a decimal point. How Step Functions itself renders a
+    # whole-valued float (2025.0 -> "2025" or "2025.0") is NOT verified here (no AWS access).
+    payload = {**availability(True), **ONE_SESSION, field: value}
+    visited, terminal, data, world = execute(asl_text, payload)
+    assert (terminal, data["Error"]) == ("Fail", "InvalidSessionScope")
+    assert world.tasks == [] and "PlanSessions" not in visited
+
+
+def test_integer_session_scope_still_reaches_the_plan(asl_text) -> None:
+    visited, _, _, world = execute(asl_text, {**availability(True), **ONE_SESSION}, world=World(sessions=[]))
+    assert "IsSessionScopeIntegral" in visited and "InvalidSessionScope" not in visited
+    assert dict(task_commands(world))["PlanSessions"][-6:] == ["--year", "2025", "--meeting-key", "1276", "--session-key", "9839"]
+
+
+def test_no_session_scope_at_all_skips_the_integer_check(asl_text) -> None:
+    visited, _, _, _ = execute(asl_text, availability(True), world=World(sessions=[]))
+    assert "FormatSessionScope" not in visited and "InvalidSessionScope" not in visited

@@ -33,6 +33,7 @@ from f1_race_intelligence.storage.backends.base import key_name
 from f1_race_intelligence.storage.layout import Layer
 from f1_race_intelligence.storage.raw_catalog import RawDataCatalog
 from f1_race_intelligence.storage.store import DataStore
+from f1_race_intelligence.validation.gate import enforce_validation_gate
 from f1_race_intelligence.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -84,7 +85,12 @@ class ConsolidationRunner:
         )
 
     def run(self) -> ConsolidationReport:
-        """Consolidate every selected session and return the run's report."""
+        """Consolidate every selected session and return the run's report.
+
+        Raises:
+            ValidationGateBlocked: M3 does not allow this scope (checked before any artifact is read or written).
+        """
+        enforce_validation_gate(self._store, self._settings, self._scope, report_path=self._config.validation_path)
         report = ConsolidationReport(
             pipeline_name=PIPELINE_NAME,
             pipeline_version=PIPELINE_VERSION,

@@ -188,8 +188,9 @@ def test_m3_fail_never_registers_the_session_as_completed(build_raw, raw_root, t
     bad_gear = {d: [car_data_record(d, 10.0, n_gear=20), car_data_record(d, 20.0)] for d in DRIVERS}
     config = lake_with_raw(build_raw, raw_root, tmp_path, car_data=bad_gear)
 
-    # M3 runs without --strict, so FAIL is recorded and the task exits 0 (unchanged behaviour).
-    assert run_chain(config) == [0, 0, 0, 0]
+    # M3 runs with --strict: FAIL fails the task, and M4/M5 refuse to run on it.
+    assert run_chain(config) == [0, 1, 1, 1]
+    assert not list(tmp_path.rglob("*.parquet"))
 
     assert m3_report(config)["global_status"] == "FAIL"
     assert incremental(tmp_path, "state.json") == []
